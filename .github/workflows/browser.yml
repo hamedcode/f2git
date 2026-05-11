@@ -1,0 +1,190 @@
+name: Browser Downloader
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  browser-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip curl wget
+
+          npm init -y
+          npm install playwright
+
+          npx playwright install chromium
+
+      - name: Prepare folders
+        run: |
+          mkdir -p downloads
+          mkdir -p grabbed
+
+      - name: Create Playwright script
+        run: |
+          cat > browser_dl.js << 'EOF'
+
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+          const { chromium } = require('playwright');
+
+          (async () => {
+
+            const browser = await chromium.launch({
+              headless: true
+            });
+
+            const context = await browser.newContext({
+              userAgent:
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36'
+            });
+
+            const page = await context.newPage();
+
+            const found = new Set();
+
+            page.on('response', async (response) => {
+
+              try {
+
+                const url = response.url().split('?')[0];
+
+                if (
+                  url.includes('.mp4') ||
+                  url.includes('.m3u8') ||
+                  url.includes('.vid')
+                ) {
+
+                  if (found.has(url)) return;
+
+                  found.add(url);
+
+                  console.log('FOUND VIDEO:', url);
+
+                  fs.appendFileSync(
+                    'grabbed/links.txt',
+                    url + '\n'
+                  );
+
+                }
+
+              } catch (e) {}
+
+            });
+
+            const urls = fs
+              .readFileSync('browser.txt', 'utf8')
+              .split('\n')
+              .map(v => v.trim())
+              .filter(Boolean);
+
+            for (const url of urls) {
+
+              console.log('OPENING:', url);
+
+              try {
+
+                await page.goto(url, {
+                  waitUntil: 'networkidle',
+                  timeout: 120000
+                });
+
+                await page.waitForTimeout(15000);
+
+              } catch (e) {
+                console.log('ERROR:', e);
+              }
+
+            }
+
+            await browser.close();
+
+          })();
+
+          EOF
+
+      - name: Run Playwright
+        run: |
+          node browser_dl.js
+
+      - name: Download grabbed videos
+        run: |
+
+          if [ ! -f grabbed/links.txt ]; then
+            echo "No video links found"
+            exit 1
+          fi
+
+          counter=1
+
+          while read url; do
+
+            [ -z "$url" ] && continue
+
+            echo "Downloading: $url"
+
+            ext=$(echo "$url" | grep -oE '\.(mp4|m3u8|vid)' | head -1 | tr -d '.')
+
+            if [[ "$ext" == "m3u8" ]]; then
+
+              ffmpeg \
+                -y \
+                -i "$url" \
+                -c copy \
+                "downloads/${counter}.mp4"
+
+            else
+
+              curl -L \
+                --retry 5 \
+                --connect-timeout 30 \
+                -A "Mozilla/5.0" \
+                -o "downloads/${counter}.${ext:-mp4}" \
+                "$url"
+
+            fi
+
+            counter=$((counter+1))
+
+          done < grabbed/links.txt
+
+      - name: Create ZIP
+        run: |
+          ts=$(date +"%Y%m%d_%H%M%S")
+
+          zip -r \
+            -P "${{ secrets.ZIP_PASSWORD }}" \
+            "browser_media_${ts}.zip" \
+            downloads/
+
+      - name: Delete old releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+
+          releases=$(gh release list --limit 100 | awk '{print $1}')
+
+          for tag in $releases; do
+            gh release delete "$tag" -y || true
+          done
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+
+        with:
+          tag_name: browser-${{ github.run_number }}
+          files: "*.zip"
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
