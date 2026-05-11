@@ -19,7 +19,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zip curl wget
+
+          sudo apt-get install -y \
+            ffmpeg \
+            zip \
+            curl \
+            wget \
+            aria2
 
           npm init -y
           npm install playwright
@@ -36,7 +42,6 @@ jobs:
           cat > browser_dl.js << 'EOF'
 
           const fs = require('fs');
-          const { execSync } = require('child_process');
           const { chromium } = require('playwright');
 
           (async () => {
@@ -58,7 +63,7 @@ jobs:
 
               try {
 
-                const url = response.url().split('?')[0];
+                const url = response.url();
 
                 if (
                   url.includes('.mp4') ||
@@ -66,9 +71,11 @@ jobs:
                   url.includes('.vid')
                 ) {
 
-                  if (found.has(url)) return;
+                  const clean = url.split('?')[0];
 
-                  found.add(url);
+                  if (found.has(clean)) return;
+
+                  found.add(clean);
 
                   console.log('FOUND VIDEO:', url);
 
@@ -118,11 +125,11 @@ jobs:
         run: |
           node browser_dl.js
 
-      - name: Download grabbed videos
+      - name: Download videos
         run: |
 
           if [ ! -f grabbed/links.txt ]; then
-            echo "No video links found"
+            echo "No links found"
             exit 1
           fi
 
@@ -132,26 +139,58 @@ jobs:
 
             [ -z "$url" ] && continue
 
-            echo "Downloading: $url"
+            echo ""
+            echo "=============================="
+            echo "Downloading:"
+            echo "$url"
+            echo "=============================="
 
-            ext=$(echo "$url" | grep -oE '\.(mp4|m3u8|vid)' | head -1 | tr -d '.')
+            clean_url=$(echo "$url" | cut -d'?' -f1)
+
+            ext=$(echo "$clean_url" | grep -oE '\.(mp4|m3u8|vid)' | head -1 | tr -d '.')
 
             if [[ "$ext" == "m3u8" ]]; then
 
+              echo "Using ffmpeg for m3u8..."
+
               ffmpeg \
                 -y \
+                -user_agent "Mozilla/5.0" \
                 -i "$url" \
                 -c copy \
                 "downloads/${counter}.mp4"
 
             else
 
-              curl -L \
-                --retry 5 \
-                --connect-timeout 30 \
-                -A "Mozilla/5.0" \
-                -o "downloads/${counter}.${ext:-mp4}" \
+              echo "Trying aria2c..."
+
+              aria2c \
+                -x 16 \
+                -s 16 \
+                -k 1M \
+                -c \
+                --summary-interval=0 \
+                --download-result=hide \
+                --console-log-level=warn \
+                --dir=downloads \
+                --out="${counter}.${ext:-mp4}" \
                 "$url"
+
+              result=$?
+
+              if [ $result -ne 0 ]; then
+
+                echo "aria2 failed"
+                echo "Trying curl fallback..."
+
+                curl -L \
+                  --retry 5 \
+                  --connect-timeout 30 \
+                  -A "Mozilla/5.0" \
+                  -o "downloads/${counter}.${ext:-mp4}" \
+                  "$url"
+
+              fi
 
             fi
 
@@ -161,6 +200,7 @@ jobs:
 
       - name: Create ZIP
         run: |
+
           ts=$(date +"%Y%m%d_%H%M%S")
 
           zip -r \
@@ -181,7 +221,6 @@ jobs:
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
-
         with:
           tag_name: browser-${{ github.run_number }}
           files: "*.zip"
