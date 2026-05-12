@@ -1,0 +1,336 @@
+name: Browser Downloader To Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      aria2_mode:
+        description: "Download Mode"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - aria2c_only
+          - browser_only
+
+      connections:
+        description: "Aria2 Connections"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+          - "16"
+
+permissions:
+  contents: read
+
+jobs:
+  browser-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y aria2 curl ffmpeg
+          pip install playwright requests
+          playwright install chromium
+
+      - name: Prepare folders
+        run: |
+          mkdir -p downloads
+          mkdir -p grabbed
+
+      - name: Copy links
+        run: |
+          cp browser.txt grabbed/links.txt
+
+      - name: Extract direct links
+        run: |
+          python << 'EOF'
+          from playwright.sync_api import sync_playwright
+          import requests
+          import os
+
+          def bad(url):
+              words = [
+                  "logo",
+                  "banner",
+                  "sprite",
+                  "preview",
+                  "sample",
+                  "promo",
+                  "ads",
+                  "ol_"
+              ]
+
+              u = url.lower()
+
+              for w in words:
+                  if w in u:
+                      return True
+
+              return False
+
+          def size(url):
+              try:
+                  r = requests.head(
+                      url,
+                      allow_redirects=True,
+                      timeout=20
+                  )
+
+                  return int(
+                      r.headers.get("content-length", 0)
+                  )
+
+              except:
+                  return 0
+
+          with open(
+              "grabbed/links.txt",
+              "r",
+              encoding="utf-8"
+          ) as f:
+
+              pages = [
+                  x.strip()
+                  for x in f
+                  if x.strip()
+              ]
+
+          final = []
+
+          with sync_playwright() as p:
+
+              browser = p.chromium.launch(
+                  headless=True
+              )
+
+              for page_url in pages:
+
+                  print(f"\nOPENING: {page_url}")
+
+                  page = browser.new_page()
+
+                  found = []
+
+                  def response(resp):
+
+                      try:
+                          url = resp.url.lower()
+
+                          if any(x in url for x in [
+                              ".mp4",
+                              ".m3u8",
+                              ".vid"
+                          ]):
+
+                              found.append(resp.url)
+
+                      except:
+                          pass
+
+                  page.on("response", response)
+
+                  try:
+                      page.goto(
+                          page_url,
+                          wait_until="networkidle",
+                          timeout=120000
+                      )
+
+                      page.wait_for_timeout(8000)
+
+                  except:
+                      pass
+
+                  page.close()
+
+                  valid = []
+
+                  for u in found:
+
+                      if bad(u):
+                          continue
+
+                      s = size(u)
+
+                      mb = s / 1024 / 1024
+
+                      if mb < 20:
+                          continue
+
+                      valid.append((u, s))
+
+                  if not valid:
+                      print("NO VALID VIDEO")
+                      continue
+
+                  unique = {}
+
+                  for u, s in valid:
+
+                      if s not in unique:
+                          unique[s] = (u, s)
+
+                  valid = list(unique.values())
+
+                  ranked = []
+
+                  for u, s in valid:
+
+                      score = 0
+
+                      low = u.lower()
+
+                      if "480" in low:
+                          score = 100
+
+                      elif "540" in low:
+                          score = 90
+
+                      elif "720" in low:
+                          score = 80
+
+                      elif "1080" in low:
+                          score = 70
+
+                      else:
+                          score = 10
+
+                      ranked.append((score, s, u))
+
+                  ranked.sort(reverse=True)
+
+                  best = ranked[0][2]
+
+                  print(f"SELECTED: {best}")
+
+                  final.append(best)
+
+              browser.close()
+
+          with open(
+              "grabbed/final_links.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              for x in final:
+                  f.write(x + "\n")
+
+          EOF
+
+      - name: Download videos
+        env:
+          MODE: ${{ github.event.inputs.aria2_mode }}
+          CONNECTIONS: ${{ github.event.inputs.connections }}
+        run: |
+
+          COUNT=1
+
+          while read URL; do
+
+            echo "==============================="
+            echo "DOWNLOADING:"
+            echo "$URL"
+            echo "==============================="
+
+            OUTPUT="downloads/video_${COUNT}.mp4"
+
+            SUCCESS=0
+
+            if [[ "$MODE" != "browser_only" ]]; then
+
+              echo "[ARIA2]"
+
+              aria2c \
+                -x ${CONNECTIONS} \
+                -s ${CONNECTIONS} \
+                --file-allocation=none \
+                --summary-interval=1 \
+                --download-result=full \
+                --max-tries=3 \
+                --retry-wait=5 \
+                --auto-file-renaming=false \
+                -o "video_${COUNT}.mp4" \
+                -d downloads \
+                "$URL"
+
+              if [ -f "$OUTPUT" ]; then
+
+                SIZE=$(stat -c%s "$OUTPUT")
+
+                if [ "$SIZE" -gt 20000000 ]; then
+                  SUCCESS=1
+                  echo "ARIA2 SUCCESS"
+                else
+                  rm -f "$OUTPUT"
+                fi
+              fi
+            fi
+
+            if [[ "$SUCCESS" == "0" && "$MODE" != "aria2c_only" ]]; then
+
+              echo "[BROWSER FALLBACK]"
+
+              curl -L \
+                --retry 3 \
+                --retry-delay 5 \
+                -A "Mozilla/5.0" \
+                -o "$OUTPUT" \
+                "$URL"
+
+              if [ -f "$OUTPUT" ]; then
+
+                SIZE=$(stat -c%s "$OUTPUT")
+
+                if [ "$SIZE" -lt 20000000 ]; then
+                  echo "BAD FILE"
+                  rm -f "$OUTPUT"
+                fi
+              fi
+            fi
+
+            COUNT=$((COUNT+1))
+
+          done < grabbed/final_links.txt
+
+      - name: Send to Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+
+          for FILE in downloads/*; do
+
+            if [ -f "$FILE" ]; then
+
+              NAME=$(basename "$FILE")
+
+              SIZE=$(stat -c%s "$FILE")
+
+              MB=$((SIZE / 1024 / 1024))
+
+              echo "Uploading: $NAME"
+
+              curl -s \
+                -X POST \
+                "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendVideo" \
+                -F chat_id="${TG_CHAT_ID}" \
+                -F supports_streaming=true \
+                -F caption="🎬 ${NAME} (${MB} MB)" \
+                -F video=@"$FILE"
+
+            fi
+
+          done
