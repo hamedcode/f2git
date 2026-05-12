@@ -2,6 +2,21 @@ name: Browser Downloader
 
 on:
   workflow_dispatch:
+    inputs:
+      preferred_quality:
+        description: "Preferred quality"
+        required: true
+        default: "480"
+        type: choice
+        options:
+          - "480"
+          - "720"
+          - "1080"
+
+      min_size_mb:
+        description: "Minimum video size in MB"
+        required: true
+        default: "20"
 
 permissions:
   contents: write
@@ -25,7 +40,8 @@ jobs:
             zip \
             curl \
             wget \
-            aria2
+            aria2 \
+            jq
 
           npm init -y
           npm install playwright
@@ -77,10 +93,10 @@ jobs:
 
                   found.add(clean);
 
-                  console.log('FOUND VIDEO:', url);
+                  console.log('FOUND:', url);
 
                   fs.appendFileSync(
-                    'grabbed/links.txt',
+                    'grabbed/raw_links.txt',
                     url + '\n'
                   );
 
@@ -125,10 +141,106 @@ jobs:
         run: |
           node browser_dl.js
 
+      - name: Analyze links
+        env:
+          QUALITY: ${{ github.event.inputs.preferred_quality }}
+          MIN_SIZE: ${{ github.event.inputs.min_size_mb }}
+        run: |
+
+          touch grabbed/final_links.txt
+
+          python3 << 'EOF'
+
+          import requests
+          import re
+          import os
+
+          quality = os.environ["QUALITY"]
+          min_size = int(os.environ["MIN_SIZE"]) * 1024 * 1024
+
+          links = []
+
+          with open("grabbed/raw_links.txt", "r", encoding="utf-8") as f:
+              links = [x.strip() for x in f if x.strip()]
+
+          checked = []
+          seen_sizes = []
+
+          for url in links:
+
+              try:
+
+                  r = requests.head(
+                      url,
+                      allow_redirects=True,
+                      timeout=20,
+                      headers={
+                          "User-Agent": "Mozilla/5.0"
+                      }
+                  )
+
+                  size = int(r.headers.get("content-length", 0))
+
+                  print(f"CHECK: {size/1024/1024:.1f} MB -> {url}")
+
+                  if size < min_size:
+                      print("SKIP: too small")
+                      continue
+
+                  duplicate = False
+
+                  for s in seen_sizes:
+                      diff = abs(size - s)
+
+                      if diff < (s * 0.02):
+                          duplicate = True
+                          break
+
+                  if duplicate:
+                      print("SKIP: duplicate size")
+                      continue
+
+                  seen_sizes.append(size)
+
+                  score = 999
+
+                  url_lower = url.lower()
+
+                  if quality in url_lower:
+                      score = 1
+                  elif "480" in url_lower:
+                      score = 2
+                  elif "720" in url_lower:
+                      score = 3
+                  elif "1080" in url_lower:
+                      score = 4
+                  else:
+                      score = 10
+
+                  checked.append({
+                      "url": url,
+                      "size": size,
+                      "score": score
+                  })
+
+              except Exception as e:
+                  print("ERROR:", e)
+
+          checked.sort(key=lambda x: (x["score"], x["size"]))
+
+          final = checked[:2]
+
+          with open("grabbed/final_links.txt", "w", encoding="utf-8") as f:
+              for item in final:
+                  print("SELECTED:", item["url"])
+                  f.write(item["url"] + "\n")
+
+          EOF
+
       - name: Download videos
         run: |
 
-          if [ ! -f grabbed/links.txt ]; then
+          if [ ! -f grabbed/final_links.txt ]; then
             echo "No links found"
             exit 1
           fi
@@ -140,10 +252,10 @@ jobs:
             [ -z "$url" ] && continue
 
             echo ""
-            echo "=============================="
-            echo "Downloading:"
+            echo "================================"
+            echo "DOWNLOADING:"
             echo "$url"
-            echo "=============================="
+            echo "================================"
 
             clean_url=$(echo "$url" | cut -d'?' -f1)
 
@@ -151,7 +263,7 @@ jobs:
 
             if [[ "$ext" == "m3u8" ]]; then
 
-              echo "Using ffmpeg for m3u8..."
+              echo "[FFMPEG] downloading m3u8"
 
               ffmpeg \
                 -y \
@@ -162,7 +274,7 @@ jobs:
 
             else
 
-              echo "Trying aria2c..."
+              echo "[ARIA2] trying download..."
 
               aria2c \
                 -x 16 \
@@ -180,8 +292,7 @@ jobs:
 
               if [ $result -ne 0 ]; then
 
-                echo "aria2 failed"
-                echo "Trying curl fallback..."
+                echo "[CURL FALLBACK] aria2 failed"
 
                 curl -L \
                   --retry 5 \
@@ -196,7 +307,7 @@ jobs:
 
             counter=$((counter+1))
 
-          done < grabbed/links.txt
+          done < grabbed/final_links.txt
 
       - name: Create ZIP
         run: |
