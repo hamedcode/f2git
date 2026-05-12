@@ -1,22 +1,23 @@
-name: Browser Downloader To Telegram
+name: Browser Downloader + Telegram Upload
 
 on:
   workflow_dispatch:
     inputs:
+
       aria2_mode:
-        description: "Download Mode"
+        description: "Download mode"
         required: true
         default: "auto"
         type: choice
         options:
           - auto
-          - aria2c_only
+          - aria2_only
           - browser_only
 
       connections:
-        description: "Aria2 Connections"
+        description: "aria2 connections"
         required: true
-        default: "2"
+        default: "4"
         type: choice
         options:
           - "1"
@@ -26,208 +27,149 @@ on:
           - "16"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  browser-download:
+  download:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install packages
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y aria2 curl ffmpeg
-          pip install playwright requests
+
+          sudo apt install -y \
+            ffmpeg \
+            aria2 \
+            curl
+
+          pip install \
+            playwright \
+            requests \
+            pyrogram \
+            tgcrypto
+
           playwright install chromium
 
       - name: Prepare folders
         run: |
-          mkdir -p downloads
           mkdir -p grabbed
+          mkdir -p downloads
 
       - name: Copy links
         run: |
           cp browser.txt grabbed/links.txt
 
-      - name: Extract direct links
+      - name: Extract video links
         run: |
           python << 'EOF'
           from playwright.sync_api import sync_playwright
-          import requests
+          import re
+          import time
           import os
 
-          def bad(url):
-              words = [
-                  "logo",
-                  "banner",
-                  "sprite",
-                  "preview",
-                  "sample",
-                  "promo",
-                  "ads",
-                  "ol_"
-              ]
+          os.makedirs("grabbed", exist_ok=True)
 
-              u = url.lower()
+          MIN_SIZE_MB = 20
 
-              for w in words:
-                  if w in u:
-                      return True
-
-              return False
-
-          def size(url):
-              try:
-                  r = requests.head(
-                      url,
-                      allow_redirects=True,
-                      timeout=20
-                  )
-
-                  return int(
-                      r.headers.get("content-length", 0)
-                  )
-
-              except:
-                  return 0
-
-          with open(
-              "grabbed/links.txt",
-              "r",
-              encoding="utf-8"
-          ) as f:
-
-              pages = [
-                  x.strip()
-                  for x in f
-                  if x.strip()
-              ]
-
-          final = []
+          final_links = []
 
           with sync_playwright() as p:
 
-              browser = p.chromium.launch(
-                  headless=True
-              )
+              browser = p.chromium.launch(headless=True)
 
-              for page_url in pages:
+              page = browser.new_page()
 
-                  print(f"\nOPENING: {page_url}")
+              with open("grabbed/links.txt", "r", encoding="utf-8") as f:
+                  urls = [x.strip() for x in f if x.strip()]
 
-                  page = browser.new_page()
+              for url in urls:
+
+                  print(f"\nOPENING: {url}")
 
                   found = []
 
-                  def response(resp):
+                  def handle_response(resp):
 
                       try:
-                          url = resp.url.lower()
 
-                          if any(x in url for x in [
+                          u = resp.url.lower()
+
+                          if any(x in u for x in [
                               ".mp4",
                               ".m3u8",
                               ".vid"
                           ]):
 
-                              found.append(resp.url)
+                              headers = resp.headers
+
+                              size = int(headers.get("content-length", "0"))
+
+                              found.append({
+                                  "url": resp.url,
+                                  "size": size
+                              })
 
                       except:
                           pass
 
-                  page.on("response", response)
+                  page.on("response", handle_response)
 
                   try:
-                      page.goto(
-                          page_url,
-                          wait_until="networkidle",
-                          timeout=120000
-                      )
+                      page.goto(url, wait_until="networkidle", timeout=120000)
+                      time.sleep(15)
+                  except Exception as e:
+                      print(e)
 
-                      page.wait_for_timeout(8000)
+                  filtered = []
 
-                  except:
-                      pass
+                  seen_sizes = set()
 
-                  page.close()
+                  for item in found:
 
-                  valid = []
+                      size_mb = item["size"] / 1024 / 1024
 
-                  for u in found:
-
-                      if bad(u):
+                      if size_mb < MIN_SIZE_MB:
                           continue
 
-                      s = size(u)
-
-                      mb = s / 1024 / 1024
-
-                      if mb < 20:
+                      if item["size"] in seen_sizes:
                           continue
 
-                      valid.append((u, s))
+                      seen_sizes.add(item["size"])
 
-                  if not valid:
-                      print("NO VALID VIDEO")
+                      filtered.append(item)
+
+                  if not filtered:
+                      print("NO VALID VIDEO FOUND")
                       continue
 
-                  unique = {}
+                  selected = None
 
-                  for u, s in valid:
+                  for item in filtered:
 
-                      if s not in unique:
-                          unique[s] = (u, s)
+                      size_mb = item["size"] / 1024 / 1024
 
-                  valid = list(unique.values())
+                      if 150 <= size_mb <= 700:
+                          selected = item
+                          break
 
-                  ranked = []
+                  if not selected:
+                      selected = max(filtered, key=lambda x: x["size"])
 
-                  for u, s in valid:
+                  print(f"SELECTED: {selected['url']}")
 
-                      score = 0
-
-                      low = u.lower()
-
-                      if "480" in low:
-                          score = 100
-
-                      elif "540" in low:
-                          score = 90
-
-                      elif "720" in low:
-                          score = 80
-
-                      elif "1080" in low:
-                          score = 70
-
-                      else:
-                          score = 10
-
-                      ranked.append((score, s, u))
-
-                  ranked.sort(reverse=True)
-
-                  best = ranked[0][2]
-
-                  print(f"SELECTED: {best}")
-
-                  final.append(best)
+                  final_links.append(selected["url"])
 
               browser.close()
 
-          with open(
-              "grabbed/final_links.txt",
-              "w",
-              encoding="utf-8"
-          ) as f:
-
-              for x in final:
+          with open("grabbed/final_links.txt", "w", encoding="utf-8") as f:
+              for x in final_links:
                   f.write(x + "\n")
-
           EOF
 
       - name: Download videos
@@ -236,68 +178,73 @@ jobs:
           CONNECTIONS: ${{ github.event.inputs.connections }}
         run: |
 
+          if [ ! -f grabbed/final_links.txt ]; then
+            echo "No links found"
+            exit 1
+          fi
+
           COUNT=1
 
           while read URL; do
 
-            echo "==============================="
+            echo "================================"
             echo "DOWNLOADING:"
             echo "$URL"
-            echo "==============================="
+            echo "================================"
 
-            OUTPUT="downloads/video_${COUNT}.mp4"
+            OUT="downloads/video_${COUNT}.mp4"
 
             SUCCESS=0
 
-            if [[ "$MODE" != "browser_only" ]]; then
+            if [ "$MODE" != "browser_only" ]; then
 
-              echo "[ARIA2]"
+              echo "[ARIA2] trying download..."
 
               aria2c \
-                -x ${CONNECTIONS} \
-                -s ${CONNECTIONS} \
+                -x $CONNECTIONS \
+                -s $CONNECTIONS \
+                -k 1M \
                 --file-allocation=none \
                 --summary-interval=1 \
-                --download-result=full \
-                --max-tries=3 \
                 --retry-wait=5 \
-                --auto-file-renaming=false \
-                -o "video_${COUNT}.mp4" \
+                --max-tries=3 \
+                --timeout=30 \
+                -o "$(basename "$OUT")" \
                 -d downloads \
                 "$URL"
 
-              if [ -f "$OUTPUT" ]; then
+              if [ -f "$OUT" ]; then
 
-                SIZE=$(stat -c%s "$OUTPUT")
+                SIZE=$(stat -c%s "$OUT")
 
-                if [ "$SIZE" -gt 20000000 ]; then
-                  SUCCESS=1
+                if [ "$SIZE" -gt 50000000 ]; then
                   echo "ARIA2 SUCCESS"
+                  SUCCESS=1
                 else
-                  rm -f "$OUTPUT"
+                  echo "ARIA2 downloaded invalid small file"
+                  rm -f "$OUT"
                 fi
               fi
             fi
 
-            if [[ "$SUCCESS" == "0" && "$MODE" != "aria2c_only" ]]; then
+            if [ "$SUCCESS" = "0" ]; then
 
-              echo "[BROWSER FALLBACK]"
+              if [ "$MODE" != "aria2_only" ]; then
 
-              curl -L \
-                --retry 3 \
-                --retry-delay 5 \
-                -A "Mozilla/5.0" \
-                -o "$OUTPUT" \
-                "$URL"
+                echo "[BROWSER FALLBACK]"
 
-              if [ -f "$OUTPUT" ]; then
+                curl -L \
+                  -A "Mozilla/5.0" \
+                  -o "$OUT" \
+                  "$URL"
 
-                SIZE=$(stat -c%s "$OUTPUT")
+                SIZE=$(stat -c%s "$OUT")
 
-                if [ "$SIZE" -lt 20000000 ]; then
-                  echo "BAD FILE"
-                  rm -f "$OUTPUT"
+                if [ "$SIZE" -lt 50000000 ]; then
+                  echo "Browser fallback failed"
+                  rm -f "$OUT"
                 fi
+
               fi
             fi
 
@@ -305,32 +252,77 @@ jobs:
 
           done < grabbed/final_links.txt
 
-      - name: Send to Telegram
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - name: Show downloaded files
         run: |
+          echo "FILES:"
+          ls -lh downloads || true
 
-          for FILE in downloads/*; do
+      - name: Upload to Telegram via Pyrogram
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          PYROGRAM_SESSION: ${{ secrets.PYROGRAM_SESSION }}
+          TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
+        run: |
+          python << 'EOF'
+          import os
+          import asyncio
+          from pyrogram import Client
 
-            if [ -f "$FILE" ]; then
+          API_ID = int(os.environ["API_ID"])
+          API_HASH = os.environ["API_HASH"]
+          SESSION = os.environ["PYROGRAM_SESSION"]
+          TARGET = os.environ["TARGET_CHAT"]
 
-              NAME=$(basename "$FILE")
+          async def main():
 
-              SIZE=$(stat -c%s "$FILE")
+              app = Client(
+                  "uploader",
+                  api_id=API_ID,
+                  api_hash=API_HASH,
+                  session_string=SESSION
+              )
 
-              MB=$((SIZE / 1024 / 1024))
+              await app.start()
 
-              echo "Uploading: $NAME"
+              files = sorted(os.listdir("downloads"))
 
-              curl -s \
-                -X POST \
-                "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendVideo" \
-                -F chat_id="${TG_CHAT_ID}" \
-                -F supports_streaming=true \
-                -F caption="🎬 ${NAME} (${MB} MB)" \
-                -F video=@"$FILE"
+              for file in files:
 
-            fi
+                  path = os.path.join("downloads", file)
 
-          done
+                  if not os.path.isfile(path):
+                      continue
+
+                  size_mb = os.path.getsize(path) / 1024 / 1024
+
+                  print(f"Uploading: {file} ({size_mb:.1f} MB)")
+
+                  try:
+
+                      await app.send_video(
+                          TARGET,
+                          path,
+                          caption=file,
+                          supports_streaming=True
+                      )
+
+                      print("VIDEO SENT")
+
+                  except Exception as e:
+
+                      print(f"send_video failed: {e}")
+                      print("Trying send_document...")
+
+                      await app.send_document(
+                          TARGET,
+                          path,
+                          caption=file
+                      )
+
+                      print("DOCUMENT SENT")
+
+              await app.stop()
+
+          asyncio.run(main())
+          EOF
