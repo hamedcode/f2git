@@ -3,32 +3,20 @@ name: Browser Downloader
 on:
   workflow_dispatch:
     inputs:
-
-      download_mode:
+      aria2_mode:
         description: "Download Mode"
         required: true
         default: "auto"
         type: choice
         options:
           - auto
+          - aria2c_only
           - browser_only
-          - aria2_only
 
-      preferred_quality:
-        description: "Preferred Quality"
+      connections:
+        description: "Aria2 Connections"
         required: true
-        default: "480"
-        type: choice
-        options:
-          - "480"
-          - "720"
-          - "1080"
-          - "best"
-
-      aria2_connections:
-        description: "ARIA2 Connections"
-        required: true
-        default: "4"
+        default: "2"
         type: choice
         options:
           - "1"
@@ -41,162 +29,188 @@ permissions:
   contents: write
 
 jobs:
-  download:
+  browser-download:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install packages
         run: |
           sudo apt update
-
-          sudo apt install -y \
-            ffmpeg \
-            zip \
-            unzip \
-            wget \
-            curl \
-            jq \
-            aria2
-
+          sudo apt install -y zip unzip p7zip-full aria2 curl
           pip install playwright requests
-
           playwright install chromium
 
       - name: Prepare folders
         run: |
-          mkdir -p grabbed
           mkdir -p downloads
+          mkdir -p grabbed
           mkdir -p zipped
 
-      - name: Read links
+      - name: Copy links
         run: |
           cp browser.txt grabbed/links.txt
 
-      - name: Extract video links with browser
+      - name: Extract direct video links
         run: |
-
           python << 'EOF'
-
-          import asyncio
+          from playwright.sync_api import sync_playwright
           import re
-          from playwright.async_api import async_playwright
+          import requests
+          import os
 
-          QUALITY = "${{ github.event.inputs.preferred_quality }}"
+          os.makedirs("grabbed", exist_ok=True)
 
-          async def main():
+          def is_bad(url):
+              bad_words = [
+                  "logo",
+                  "banner",
+                  "sprite",
+                  "thumb",
+                  "preview",
+                  "sample",
+                  "ads",
+                  "promo",
+                  "ol_"
+              ]
 
-              with open("grabbed/links.txt", "r", encoding="utf-8") as f:
-                  pages = [x.strip() for x in f if x.strip()]
+              u = url.lower()
 
-              found = []
+              for b in bad_words:
+                  if b in u:
+                      return True
 
-              async with async_playwright() as p:
+              return False
 
-                  browser = await p.chromium.launch(
-                      headless=True
-                  )
+          def get_size(url):
+              try:
+                  r = requests.head(url, allow_redirects=True, timeout=20)
 
-                  context = await browser.new_context()
+                  size = int(r.headers.get("content-length", 0))
 
-                  for page_url in pages:
+                  return size
+              except:
+                  return 0
 
-                      print(f"\nOPENING: {page_url}")
+          links = []
 
-                      page = await context.new_page()
+          with open("grabbed/links.txt", "r", encoding="utf-8") as f:
+              links = [x.strip() for x in f if x.strip()]
 
-                      captured = []
+          final_links = []
 
-                      page.on(
-                          "response",
-                          lambda response: captured.append(response.url)
-                      )
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
 
+              for page_url in links:
+
+                  print(f"\nOPENING: {page_url}")
+
+                  page = browser.new_page()
+
+                  found = []
+
+                  def handle_response(resp):
                       try:
-                          await page.goto(
-                              page_url,
-                              timeout=120000,
-                              wait_until="networkidle"
-                          )
+                          url = resp.url
 
-                          await page.wait_for_timeout(10000)
-
-                      except Exception as e:
-                          print(e)
-
-                      video_urls = []
-
-                      for u in captured:
-
-                          low = u.lower()
-
-                          if any(x in low for x in [
+                          if any(x in url.lower() for x in [
                               ".mp4",
                               ".m3u8",
                               ".vid"
                           ]):
+                              found.append(url)
 
-                              if "googleads" in low:
-                                  continue
+                      except:
+                          pass
 
-                              if "doubleclick" in low:
-                                  continue
+                  page.on("response", handle_response)
 
-                              video_urls.append(u)
+                  try:
+                      page.goto(page_url, wait_until="networkidle", timeout=120000)
+                      page.wait_for_timeout(8000)
+                  except:
+                      pass
 
-                      uniq = []
+                  page.close()
 
-                      for v in video_urls:
-                          if v not in uniq:
-                              uniq.append(v)
+                  cleaned = []
 
-                      scored = []
+                  for u in found:
 
-                      for u in uniq:
+                      if is_bad(u):
+                          continue
 
-                          score = 0
+                      size = get_size(u)
 
-                          if "480" in u:
-                              score = 100
+                      mb = size / 1024 / 1024
 
-                          elif "720" in u:
-                              score = 80
+                      if mb < 20:
+                          continue
 
-                          elif "1080" in u:
-                              score = 60
+                      cleaned.append((u, size))
 
-                          else:
-                              score = 10
+                  if not cleaned:
+                      print("NO VALID VIDEO FOUND")
+                      continue
 
-                          scored.append((score, u))
+                  unique = {}
 
-                      scored.sort(reverse=True)
+                  for u, s in cleaned:
 
-                      if scored:
+                      if s not in unique:
+                          unique[s] = (u, s)
 
-                          selected = scored[0][1]
+                  cleaned = list(unique.values())
 
-                          print(f"SELECTED: {selected}")
+                  preferred = []
 
-                          found.append(selected)
+                  for u, s in cleaned:
 
-                      await page.close()
+                      low = u.lower()
 
-                  await browser.close()
+                      score = 0
 
-              with open("grabbed/final_links.txt", "w") as f:
-                  for x in found:
-                      f.write(x + "\n")
+                      if "480" in low:
+                          score += 100
 
-          asyncio.run(main())
+                      elif "540" in low:
+                          score += 90
+
+                      elif "720" in low:
+                          score += 80
+
+                      elif "1080" in low:
+                          score += 70
+
+                      else:
+                          score += 10
+
+                      preferred.append((score, s, u))
+
+                  preferred.sort(reverse=True)
+
+                  best = preferred[0][2]
+
+                  print(f"SELECTED: {best}")
+
+                  final_links.append(best)
+
+              browser.close()
+
+          with open("grabbed/final_links.txt", "w", encoding="utf-8") as f:
+              for x in final_links:
+                  f.write(x + "\n")
 
           EOF
 
-      - name: Download files
+      - name: Download videos
+        env:
+          MODE: ${{ github.event.inputs.aria2_mode }}
+          CONNECTIONS: ${{ github.event.inputs.connections }}
         run: |
 
           if [ ! -f grabbed/final_links.txt ]; then
@@ -204,107 +218,102 @@ jobs:
             exit 1
           fi
 
-          COUNTER=1
+          COUNT=1
 
-          while read url; do
-
-            [ -z "$url" ] && continue
+          while read URL; do
 
             echo "================================"
             echo "DOWNLOADING:"
-            echo "$url"
+            echo "$URL"
             echo "================================"
 
-            filename="video_${COUNTER}.mp4"
+            EXT="mp4"
 
-            MODE="${{ github.event.inputs.download_mode }}"
-            CONN="${{ github.event.inputs.aria2_connections }}"
+            if [[ "$URL" == *.m3u8* ]]; then
+              EXT="mp4"
+            elif [[ "$URL" == *.vid* ]]; then
+              EXT="mp4"
+            fi
+
+            OUTPUT="downloads/video_${COUNT}.${EXT}"
 
             SUCCESS=0
 
-            if [ "$MODE" != "browser_only" ]; then
+            if [[ "$MODE" != "browser_only" ]]; then
 
               echo "[ARIA2] trying download..."
 
               aria2c \
-                -x "$CONN" \
-                -s "$CONN" \
-                -k 1M \
+                -x ${CONNECTIONS} \
+                -s ${CONNECTIONS} \
                 --file-allocation=none \
                 --summary-interval=1 \
-                --retry-wait=3 \
-                --max-tries=5 \
-                --continue=true \
-                --timeout=30 \
-                --connect-timeout=30 \
-                --max-connection-per-server="$CONN" \
-                --split="$CONN" \
-                --min-split-size=1M \
-                --user-agent="Mozilla/5.0" \
-                -o "$filename" \
-                "$url"
+                --download-result=full \
+                --max-tries=3 \
+                --retry-wait=5 \
+                --auto-file-renaming=false \
+                -o "video_${COUNT}.${EXT}" \
+                -d downloads \
+                "$URL"
 
-              if [ -f "$filename" ]; then
+              if [ -f "$OUTPUT" ]; then
 
-                SIZE=$(stat -c%s "$filename")
+                SIZE=$(stat -c%s "$OUTPUT")
 
                 if [ "$SIZE" -gt 20000000 ]; then
                   SUCCESS=1
                   echo "[ARIA2] SUCCESS"
                 else
-                  rm -f "$filename"
+                  rm -f "$OUTPUT"
                 fi
               fi
             fi
 
-            if [ "$SUCCESS" = "0" ] && [ "$MODE" != "aria2_only" ]; then
+            if [[ "$SUCCESS" == "0" && "$MODE" != "aria2c_only" ]]; then
 
               echo "[BROWSER FALLBACK]"
 
               curl -L \
+                --retry 3 \
+                --retry-delay 5 \
                 -A "Mozilla/5.0" \
-                --retry 5 \
-                --retry-delay 3 \
-                -o "$filename" \
-                "$url"
+                -o "$OUTPUT" \
+                "$URL"
 
-              if [ -f "$filename" ]; then
+              if [ -f "$OUTPUT" ]; then
 
-                SIZE=$(stat -c%s "$filename")
+                SIZE=$(stat -c%s "$OUTPUT")
 
-                if [ "$SIZE" -gt 20000000 ]; then
-                  SUCCESS=1
-                  echo "[CURL] SUCCESS"
-                else
-                  rm -f "$filename"
+                if [ "$SIZE" -lt 20000000 ]; then
+                  echo "BAD FILE"
+                  rm -f "$OUTPUT"
                 fi
               fi
             fi
 
-            if [ "$SUCCESS" = "1" ]; then
-              mv "$filename" downloads/
-            fi
-
-            COUNTER=$((COUNTER+1))
+            COUNT=$((COUNT+1))
 
           done < grabbed/final_links.txt
 
       - name: Create zip
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
         run: |
 
           cd downloads
 
-          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          if [ -z "$(ls -A .)" ]; then
+            echo "No downloaded files"
+            exit 1
+          fi
 
-          zip -r \
-            -P "${{ secrets.ZIP_PASSWORD }}" \
-            "../zipped/browser_${TIMESTAMP}.zip" .
+          DATE=$(date +"%Y-%m-%d_%H-%M-%S")
 
-      - name: Upload Release
+          zip -r -P "$ZIP_PASSWORD" \
+            "../zipped/browser_${DATE}.zip" .
+
+      - name: Upload release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: browser-${{ github.run_number }}
-          name: Browser Download
-          files: zipped/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: zipped/*
