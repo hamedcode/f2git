@@ -1,4 +1,4 @@
-name: Upload To Telegram Public Channel
+name: Send To Telegram Pub Channel
 
 on:
   workflow_dispatch:
