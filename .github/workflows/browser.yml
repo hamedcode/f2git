@@ -1,4 +1,4 @@
-name: Browser Downloader
+name: Browser Downloader Debug
 
 on:
   workflow_dispatch:
@@ -37,16 +37,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Switch Ubuntu mirror
+        run: |
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true
+
+      - name: Cache Playwright
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/pip
+          key: playwright-${{ runner.os }}-v1
+
       - name: Install packages
         run: |
           sudo apt update
-          sudo apt install -y zip unzip p7zip-full aria2 curl ffmpeg
+
+          sudo apt install -y \
+            zip \
+            unzip \
+            p7zip-full \
+            aria2 \
+            curl \
+            ffmpeg
+
           pip install playwright requests
-          playwright install chromium
+
+      - name: Install Chromium
+        run: |
+          playwright install chromium --only-shell
 
       - name: Prepare folders
         run: |
           rm -rf downloads grabbed zipped
+
           mkdir -p downloads
           mkdir -p grabbed
           mkdir -p zipped
@@ -59,83 +83,9 @@ jobs:
         run: |
           python << 'EOF'
           from playwright.sync_api import sync_playwright
-          import requests
           import os
-          import re
 
           os.makedirs("grabbed", exist_ok=True)
-
-          BAD_WORDS = [
-              "logo",
-              "banner",
-              "sprite",
-              "thumb",
-              "preview",
-              "sample",
-              "ads",
-              "promo",
-              "doubleclick",
-              "googlesyndication",
-              "popunder",
-              "tracker",
-              "analytics",
-              "favicon",
-              "subtitle",
-              ".jpg",
-              ".jpeg",
-              ".png",
-              ".gif",
-              ".webp"
-          ]
-
-          VIDEO_HINTS = [
-              ".mp4",
-              ".m3u8",
-              ".mkv",
-              ".webm",
-              ".mov",
-              ".vid",
-              "master.m3u8",
-              "video",
-              "/v/",
-              "/mp4/"
-          ]
-
-          def is_bad(url):
-              u = url.lower()
-
-              for b in BAD_WORDS:
-                  if b in u:
-                      return True
-
-              return False
-
-          def looks_like_video(url):
-              u = url.lower()
-
-              for v in VIDEO_HINTS:
-                  if v in u:
-                      return True
-
-              return False
-
-          def get_size(url):
-              try:
-                  r = requests.head(
-                      url,
-                      allow_redirects=True,
-                      timeout=20,
-                      headers={
-                          "User-Agent": "Mozilla/5.0"
-                      }
-                  )
-
-                  size = int(r.headers.get("content-length", 0))
-
-                  return size
-
-              except:
-                  return 0
 
           links = []
 
@@ -165,115 +115,121 @@ jobs:
                       try:
                           url = resp.url
 
-                          if looks_like_video(url):
+                          print("RESPONSE:", url)
 
-                              if not is_bad(url):
+                          if url not in found:
+                              found.append(url)
 
-                                  if url not in found:
-                                      found.append(url)
-
-                                      print("FOUND:", url)
-
-                      except:
-                          pass
+                      except Exception as e:
+                          print("ERROR:", e)
 
                   page.on("response", handle_response)
 
                   try:
+
                       page.goto(
                           page_url,
-                          wait_until="domcontentloaded",
+                          wait_until="load",
                           timeout=120000
                       )
 
-                      page.wait_for_timeout(15000)
+                      page.wait_for_timeout(30000)
 
                   except Exception as e:
+
                       print("PAGE ERROR:", e)
+
+                  # VIDEO TAGS
+                  try:
+
+                      videos = page.locator("video").evaluate_all(
+                          """els => els.map(v => v.src)"""
+                      )
+
+                      for v in videos:
+
+                          if v and v not in found:
+
+                              found.append(v)
+
+                              print("VIDEO TAG:", v)
+
+                  except Exception as e:
+
+                      print("VIDEO TAG ERROR:", e)
+
+                  # SOURCE TAGS
+                  try:
+
+                      sources = page.locator("source").evaluate_all(
+                          """els => els.map(v => v.src)"""
+                      )
+
+                      for s in sources:
+
+                          if s and s not in found:
+
+                              found.append(s)
+
+                              print("SOURCE TAG:", s)
+
+                  except Exception as e:
+
+                      print("SOURCE TAG ERROR:", e)
 
                   page.close()
 
-                  cleaned = []
+                  print("\n========== FOUND LINKS ==========")
 
-                  for u in found:
+                  for x in found:
+                      print(x)
 
-                      if is_bad(u):
+                  print("=================================\n")
+
+                  selected = None
+
+                  for x in found:
+
+                      if not x.startswith("http"):
                           continue
 
-                      size = get_size(u)
+                      low = x.lower()
 
-                      # اگر سایز مشخص نبود
-                      # باز هم نگهش دار
-                      if size == 0:
-                          size = 999999999
+                      if any(v in low for v in [
+                          ".mp4",
+                          ".m3u8",
+                          ".mkv",
+                          ".webm",
+                          ".mov",
+                          ".vid",
+                          "video",
+                          "master.m3u8"
+                      ]):
 
-                      cleaned.append((u, size))
+                          selected = x
+                          break
 
-                  if not cleaned:
+                  # اگر چیزی پیدا نشد
+                  # اولین لینک http رو بردار
 
-                      print("NO VALID VIDEO FOUND")
-                      continue
+                  if selected is None:
 
-                  # حذف لینک‌های تکراری بر اساس حجم
-                  # فقط یکی از هر سایز نگه داشته میشه
+                      for x in found:
 
-                  unique_by_size = {}
+                          if x.startswith("http"):
+                              selected = x
+                              break
 
-                  for u, s in cleaned:
+                  if selected:
 
-                      # اولویت با mp4
-                      score = 0
+                      print("SELECTED:")
+                      print(selected)
 
-                      low = u.lower()
+                      final_links.append(selected)
 
-                      if ".mp4" in low:
-                          score += 1000
+                  else:
 
-                      if ".m3u8" in low:
-                          score += 900
-
-                      if "720" in low:
-                          score += 700
-
-                      elif "480" in low:
-                          score += 600
-
-                      elif "1080" in low:
-                          score += 500
-
-                      elif "360" in low:
-                          score += 400
-
-                      else:
-                          score += 100
-
-                      current = unique_by_size.get(s)
-
-                      if current is None:
-                          unique_by_size[s] = (score, u)
-
-                      else:
-                          old_score = current[0]
-
-                          if score > old_score:
-                              unique_by_size[s] = (score, u)
-
-                  candidates = []
-
-                  for s, data in unique_by_size.items():
-
-                      score, url = data
-
-                      candidates.append((score, s, url))
-
-                  candidates.sort(reverse=True)
-
-                  best = candidates[0][2]
-
-                  print("\nSELECTED:")
-                  print(best)
-
-                  final_links.append(best)
+                      print("NO LINK SELECTED")
 
               browser.close()
 
@@ -282,14 +238,22 @@ jobs:
               for x in final_links:
                   f.write(x + "\n")
 
-          print("\n==============================")
+          print("\n======================")
           print("FINAL LINKS")
-          print("==============================")
+          print("======================")
 
           for x in final_links:
               print(x)
 
           EOF
+
+      - name: Show extracted links
+        run: |
+          echo "======================"
+          echo "EXTRACTED LINKS"
+          echo "======================"
+
+          cat grabbed/final_links.txt || true
 
       - name: Download videos
         env:
@@ -320,7 +284,7 @@ jobs:
 
             if [[ "$MODE" != "browser_only" ]]; then
 
-              echo "[ARIA2] TRYING..."
+              echo "[ARIA2]"
 
               aria2c \
                 -x ${CONNECTIONS} \
@@ -339,11 +303,13 @@ jobs:
 
                 SIZE=$(stat -c%s "$OUTPUT")
 
-                if [ "$SIZE" -gt 5000000 ]; then
+                echo "SIZE: $SIZE"
+
+                if [ "$SIZE" -gt 1000000 ]; then
                   SUCCESS=1
-                  echo "[ARIA2] SUCCESS"
+                  echo "[ARIA2 SUCCESS]"
                 else
-                  echo "[ARIA2] BAD FILE"
+                  echo "[ARIA2 BAD FILE]"
                   rm -f "$OUTPUT"
                 fi
               fi
@@ -364,18 +330,17 @@ jobs:
 
                 SIZE=$(stat -c%s "$OUTPUT")
 
-                if [ "$SIZE" -gt 5000000 ]; then
+                echo "SIZE: $SIZE"
+
+                if [ "$SIZE" -gt 1000000 ]; then
                   SUCCESS=1
-                  echo "[CURL] SUCCESS"
+                  echo "[CURL SUCCESS]"
                 else
-                  echo "[CURL] BAD FILE"
+                  echo "[CURL BAD FILE]"
                   rm -f "$OUTPUT"
                 fi
               fi
             fi
-
-            # اگر m3u8 بود
-            # ffmpeg تست کن
 
             if [[ "$SUCCESS" == "0" ]]; then
 
@@ -391,11 +356,13 @@ jobs:
 
                 SIZE=$(stat -c%s "$OUTPUT")
 
-                if [ "$SIZE" -gt 5000000 ]; then
+                echo "SIZE: $SIZE"
+
+                if [ "$SIZE" -gt 1000000 ]; then
                   SUCCESS=1
-                  echo "[FFMPEG] SUCCESS"
+                  echo "[FFMPEG SUCCESS]"
                 else
-                  echo "[FFMPEG] BAD FILE"
+                  echo "[FFMPEG BAD FILE]"
                   rm -f "$OUTPUT"
                 fi
               fi
@@ -409,10 +376,13 @@ jobs:
 
           done < grabbed/final_links.txt
 
-      - name: Remove bad files
+      - name: Show downloaded files
         run: |
+          echo "======================"
+          echo "DOWNLOADED FILES"
+          echo "======================"
 
-          find downloads -type f -size -5M -delete
+          ls -lh downloads || true
 
       - name: Create zip
         env:
