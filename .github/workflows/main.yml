@@ -1,4 +1,4 @@
-name: Download, Separate Zip
+name: 1 - Download, Separate Zip
 
 on:
   workflow_dispatch:
