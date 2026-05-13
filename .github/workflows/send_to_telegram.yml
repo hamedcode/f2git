@@ -26,7 +26,7 @@ jobs:
 
           API_ID = int(os.environ["API_ID"])
           API_HASH = os.environ["API_HASH"]
-          SESSION = os.environ["SESSION_PYROGRAM"]
+          SESSION = os.environ["PYROGRAM_SESSION"]
           CHAT_ID = os.environ["CHAT_ID"]
 
           os.makedirs("downloads", exist_ok=True)
@@ -140,7 +140,7 @@ jobs:
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          SESSION_PYROGRAM: ${{ secrets.SESSION_PYROGRAM }}
+          PYROGRAM_SESSION: ${{ secrets.PYROGRAM_SESSION }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python uploader.py
