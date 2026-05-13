@@ -22,6 +22,8 @@ jobs:
           import glob
           import asyncio
           import requests
+
+          from urllib.parse import urlparse, unquote
           from pyrogram import Client
 
           API_ID = int(os.environ["API_ID"])
@@ -31,9 +33,9 @@ jobs:
 
           os.makedirs("downloads", exist_ok=True)
 
-          # =========================
-          # DOWNLOAD FILES
-          # =========================
+          # =========================================
+          # DOWNLOAD FILES FROM link.txt
+          # =========================================
 
           if not os.path.exists("link.txt"):
               raise Exception("link.txt not found")
@@ -46,26 +48,45 @@ jobs:
 
           for i, url in enumerate(links, start=1):
 
-              filename = f"downloads/file_{i}.zip"
+              parsed = urlparse(url)
+
+              real_name = os.path.basename(parsed.path)
+
+              real_name = unquote(real_name)
+
+              if not real_name or "." not in real_name:
+                  real_name = f"file_{i}"
+
+              filename = os.path.join("downloads", real_name)
 
               print("=" * 60)
               print("DOWNLOADING:")
               print(url)
               print("=" * 60)
 
-              r = requests.get(url, stream=True)
+              response = requests.get(url, stream=True)
 
-              total = int(r.headers.get("content-length", 0))
+              if response.status_code != 200:
+                  print(f"FAILED: HTTP {response.status_code}")
+                  continue
+
+              total = int(response.headers.get("content-length", 0))
               downloaded = 0
 
               with open(filename, "wb") as f:
-                  for chunk in r.iter_content(chunk_size=1024*1024):
+
+                  for chunk in response.iter_content(chunk_size=1024*1024):
+
                       if chunk:
+
                           f.write(chunk)
+
                           downloaded += len(chunk)
 
                           if total > 0:
+
                               percent = downloaded * 100 / total
+
                               print(
                                   f"\r{downloaded//1024//1024} MB / "
                                   f"{total//1024//1024} MB "
@@ -76,62 +97,95 @@ jobs:
               print()
               print(f"DOWNLOADED: {filename}")
 
-          # =========================
+          # =========================================
           # TELEGRAM UPLOAD
-          # =========================
+          # =========================================
 
           async def main():
 
+              print("STARTING PYROGRAM...")
+
               app = Client(
-                  "uploader",
+                  name="uploader",
                   api_id=API_ID,
                   api_hash=API_HASH,
-                  session_string=SESSION
+                  session_string=str(SESSION).strip()
               )
 
               await app.start()
 
               me = await app.get_me()
+
               print(f"LOGGED IN AS: {me.first_name}")
 
               files = sorted(glob.glob("downloads/*"))
+
+              if not files:
+                  raise Exception("No files found")
+
+              print(f"FOUND {len(files)} FILE(S)")
 
               for file in files:
 
                   size_mb = os.path.getsize(file) / 1024 / 1024
 
                   print("=" * 60)
-                  print(f"Uploading: {os.path.basename(file)} ({size_mb:.1f} MB)")
+                  print(
+                      f"UPLOADING: "
+                      f"{os.path.basename(file)} "
+                      f"({size_mb:.1f} MB)"
+                  )
                   print("=" * 60)
 
                   try:
-                      await app.send_video(
-                          chat_id=CHAT_ID,
-                          video=file,
-                          caption=os.path.basename(file),
-                          supports_streaming=True,
-                          progress=lambda c, t:
-                              print(f"\rUPLOAD: {c*100/t:.1f}%", end="")
+
+                      video_ext = (
+                          ".mp4",
+                          ".mkv",
+                          ".mov",
+                          ".webm",
+                          ".avi"
                       )
 
-                      print("\nVIDEO SENT")
+                      if file.lower().endswith(video_ext):
+
+                          await app.send_video(
+                              chat_id=CHAT_ID,
+                              video=file,
+                              caption=os.path.basename(file),
+                              supports_streaming=True,
+                              progress=lambda c, t:
+                                  print(
+                                      f"\rUPLOAD: {c*100/t:.1f}%",
+                                      end=""
+                                  )
+                          )
+
+                          print("\nVIDEO SENT")
+
+                      else:
+
+                          await app.send_document(
+                              chat_id=CHAT_ID,
+                              document=file,
+                              caption=os.path.basename(file),
+                              progress=lambda c, t:
+                                  print(
+                                      f"\rUPLOAD: {c*100/t:.1f}%",
+                                      end=""
+                                  )
+                          )
+
+                          print("\nDOCUMENT SENT")
 
                   except Exception as e:
 
-                      print(f"\nsend_video failed: {e}")
-                      print("Trying send_document...")
-
-                      await app.send_document(
-                          chat_id=CHAT_ID,
-                          document=file,
-                          caption=os.path.basename(file),
-                          progress=lambda c, t:
-                              print(f"\rUPLOAD: {c*100/t:.1f}%", end="")
-                      )
-
-                      print("\nDOCUMENT SENT")
+                      print()
+                      print(f"UPLOAD FAILED: {e}")
 
               await app.stop()
+
+              print("DONE")
 
           asyncio.run(main())
           PYEOF
