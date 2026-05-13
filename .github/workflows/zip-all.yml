@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       max_size_mb:
-        description: "Max ZIP size in MB before splitting (e.g. 950)"
+        description: "Max archive size per part in MB (e.g. 950)"
         required: false
         default: "950"
 
@@ -27,6 +27,11 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      - name: Install 7zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
       - name: Run downloader
         run: python download_all.py
 
@@ -42,63 +47,41 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 📦 ساخت ZIP اولیه
-      - name: Create ZIP
+      # 📦 ساخت آرشیو 7z (multi-part واقعی)
+      - name: Create 7z archive (multi-part safe)
         env:
           ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
         run: |
-          mkdir -p zipped
-
           if [ "$(find downloads -type f | wc -l)" -eq 0 ]; then
             echo "No files downloaded."
             exit 0
           fi
 
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          ZIP_FILE="zipped/${TIMESTAMP}.zip"
+          ARCHIVE_NAME="zipped/${TIMESTAMP}.7z"
+
+          mkdir -p zipped
+
+          MAX_MB=${{ github.event.inputs.max_size_mb }}
 
           cd downloads
-          zip -r -P "$ZIP_PASSWORD" "../$ZIP_FILE" .
 
-          echo "ZIP_FILE=$ZIP_FILE" >> $GITHUB_ENV
+          # ساخت آرشیو multi-part واقعی
+          7z a -t7z -m0=lzma2 -mx=9 \
+            -v${MAX_MB}m \
+            -p"$ZIP_PASSWORD" \
+            "../$ARCHIVE_NAME" \
+            .
 
-      # ✂️ بررسی حجم و split در صورت نیاز
-      - name: Split ZIP if needed
-        run: |
-          MAX_MB=${{ github.event.inputs.max_size_mb }}
-          MAX_BYTES=$((MAX_MB * 1024 * 1024))
-
-          ZIP_PATH="${ZIP_FILE}"
-
-          SIZE=$(stat -c%s "$ZIP_PATH")
-
-          echo "ZIP size: $SIZE bytes"
-          echo "Max allowed: $MAX_BYTES bytes"
-
-          if [ "$SIZE" -le "$MAX_BYTES" ]; then
-            echo "No split needed."
-            exit 0
-          fi
-
-          echo "Splitting ZIP..."
-
-          mkdir -p split
-
-          # split into parts
-          split -b $MAX_BYTES "$ZIP_PATH" split/part_
-
-          # حذف zip اصلی چون دیگر لازم نیست
-          rm "$ZIP_PATH"
+          echo "ARCHIVE_BASENAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
 
       # 🚀 ساخت Release
       - name: Create Release
-        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: release-${{ github.run_number }}
-          name: Single ZIP Release ${{ github.run_number }}
-          files: |
-            zipped/*.zip
-            split/*
+          name: Single Archive Release ${{ github.run_number }}
+          files: zipped/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
