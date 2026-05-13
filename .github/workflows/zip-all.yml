@@ -1,4 +1,4 @@
-name: Single ZIP
+name: 2 - Single ZIP
 
 on:
   workflow_dispatch:
