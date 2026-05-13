@@ -26,9 +26,7 @@ jobs:
 
           mkdir -p downloads
 
-          echo "================================"
           echo "READING link.txt"
-          echo "================================"
 
           if [ ! -f link.txt ]; then
             echo "link.txt NOT FOUND!"
@@ -40,12 +38,11 @@ jobs:
           while IFS= read -r URL
           do
 
-            # skip empty lines
             [ -z "$URL" ] && continue
 
             echo ""
             echo "================================"
-            echo "DOWNLOADING FILE $COUNT"
+            echo "DOWNLOADING:"
             echo "$URL"
             echo "================================"
 
@@ -54,55 +51,33 @@ jobs:
               -s 8 \
               -k 1M \
               --file-allocation=none \
-              --summary-interval=1 \
-              --console-log-level=notice \
               -d downloads \
               -o "file_${COUNT}.zip" \
               "$URL"
-
-            echo ""
-            echo "DOWNLOAD FINISHED: file_${COUNT}.zip"
 
             COUNT=$((COUNT+1))
 
           done < link.txt
 
-      - name: Show Downloaded Files
+      - name: Show Files
         run: |
-
-          echo ""
-          echo "================================"
-          echo "DOWNLOADED FILES"
-          echo "================================"
-
           ls -lh downloads
 
-      - name: Upload To Telegram
-        env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          PYROGRAM_SESSION: ${{ secrets.PYROGRAM_SESSION }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
+      - name: Create uploader.py
         run: |
 
-          python << 'EOF'
+          cat > uploader.py << 'PYEOF'
 
           import os
           import asyncio
-
           from pyrogram import Client
 
           API_ID = int(os.getenv("API_ID"))
           API_HASH = os.getenv("API_HASH")
           SESSION = os.getenv("PYROGRAM_SESSION")
-
-          # IMPORTANT
           CHAT_ID = int(os.getenv("TG_CHAT_ID"))
 
-          print("================================")
-          print("STARTING TELEGRAM CLIENT")
-          print("================================")
+          print("STARTING CLIENT...")
 
           app = Client(
               "uploader",
@@ -113,37 +88,20 @@ jobs:
 
           async def main():
 
-              print("CONNECTING TO TELEGRAM...")
+              print("CONNECTING...")
 
-              await asyncio.wait_for(
-                  app.start(),
-                  timeout=60
-              )
+              await app.start()
 
               print("CONNECTED!")
 
               me = await app.get_me()
 
-              print("")
-              print("================================")
-              print("ACCOUNT INFO")
-              print("================================")
-              print("NAME:", me.first_name)
-              print("ID:", me.id)
+              print("LOGGED IN AS:", me.first_name)
               print("CHAT_ID:", CHAT_ID)
-
-              print("")
-              print("================================")
-              print("CHECKING DOWNLOADS")
-              print("================================")
 
               files = sorted(os.listdir("downloads"))
 
-              print("FILES FOUND:", len(files))
-
-              if not files:
-                  print("NO FILES FOUND!")
-                  return
+              print("FILES:", files)
 
               for file in files:
 
@@ -158,48 +116,41 @@ jobs:
                   )
 
                   print("")
-                  print("================================")
                   print(f"UPLOADING: {file}")
                   print(f"SIZE: {size_mb} MB")
-                  print("================================")
 
                   try:
 
-                      await asyncio.wait_for(
-
-                          app.send_document(
-                              chat_id=CHAT_ID,
-                              document=path,
-                              caption=file
-
-                          ),
-
-                          timeout=3600
-
+                      await app.send_document(
+                          chat_id=CHAT_ID,
+                          document=path,
+                          caption=file
                       )
 
-                      print("UPLOAD SUCCESS!")
+                      print("UPLOAD SUCCESS")
 
                   except Exception as e:
 
-                      print("")
-                      print("================================")
-                      print("UPLOAD FAILED!")
-                      print("================================")
-
+                      print("UPLOAD FAILED")
                       print(repr(e))
 
                       raise e
 
-              print("")
-              print("================================")
-              print("ALL FILES UPLOADED")
-              print("================================")
-
               await app.stop()
 
-              print("CLIENT CLOSED")
+              print("DONE")
 
           asyncio.run(main())
 
-          EOF
+          PYEOF
+
+      - name: Upload To Telegram
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          PYROGRAM_SESSION: ${{ secrets.PYROGRAM_SESSION }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+        run: |
+
+          python uploader.py
