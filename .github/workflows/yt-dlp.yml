@@ -1,4 +1,4 @@
-name: 4 - Yt-dlp
+name: 3 - Yt-dlp
 
 on:
   workflow_dispatch:
