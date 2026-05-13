@@ -1,19 +1,19 @@
-name: Upload Files To Telegram
+name: Upload To Telegram Public Channel
 
 on:
   workflow_dispatch:
 
 jobs:
-  upload:
+  telegram-upload:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install requirements
+      - name: Install dependencies
         run: |
-          pip install -U pyrogram tgcrypto requests
+          pip install pyrogram tgcrypto requests
 
       - name: Create uploader.py
         run: |
@@ -26,59 +26,61 @@ jobs:
 
           API_ID = int(os.environ["API_ID"])
           API_HASH = os.environ["API_HASH"]
-          SESSION = os.environ["PYROGRAM_SESSION"]
-          CHAT_ID = int(os.environ["CHAT_ID"])
-
-          LINK_FILE = "link.txt"
+          SESSION = os.environ["SESSION_PYROGRAM"]
+          CHAT_ID = os.environ["CHAT_ID"]
 
           os.makedirs("downloads", exist_ok=True)
 
-          def download_files():
-              if not os.path.exists(LINK_FILE):
-                  raise Exception("link.txt not found")
+          # =========================
+          # DOWNLOAD FILES
+          # =========================
 
-              with open(LINK_FILE, "r", encoding="utf-8") as f:
-                  links = [x.strip() for x in f if x.strip()]
+          if not os.path.exists("link.txt"):
+              raise Exception("link.txt not found")
 
-              if not links:
-                  raise Exception("link.txt is empty")
+          with open("link.txt", "r", encoding="utf-8") as f:
+              links = [x.strip() for x in f if x.strip()]
 
-              for i, url in enumerate(links, start=1):
-                  filename = f"downloads/file_{i}.zip"
+          if not links:
+              raise Exception("link.txt is empty")
 
-                  print("=" * 60)
-                  print(f"DOWNLOADING: {url}")
-                  print("=" * 60)
+          for i, url in enumerate(links, start=1):
 
-                  r = requests.get(url, stream=True, timeout=60)
+              filename = f"downloads/file_{i}.zip"
 
-                  if r.status_code != 200:
-                      print(f"FAILED: HTTP {r.status_code}")
-                      continue
+              print("=" * 60)
+              print("DOWNLOADING:")
+              print(url)
+              print("=" * 60)
 
-                  total = int(r.headers.get("content-length", 0))
-                  downloaded = 0
+              r = requests.get(url, stream=True)
 
-                  with open(filename, "wb") as f:
-                      for chunk in r.iter_content(chunk_size=1024 * 1024):
-                          if chunk:
-                              f.write(chunk)
-                              downloaded += len(chunk)
+              total = int(r.headers.get("content-length", 0))
+              downloaded = 0
 
-                              if total > 0:
-                                  percent = downloaded * 100 / total
-                                  print(
-                                      f"\r{downloaded // (1024*1024)} MB / "
-                                      f"{total // (1024*1024)} MB "
-                                      f"({percent:.1f}%)",
-                                      end=""
-                                  )
+              with open(filename, "wb") as f:
+                  for chunk in r.iter_content(chunk_size=1024*1024):
+                      if chunk:
+                          f.write(chunk)
+                          downloaded += len(chunk)
 
-                  print()
-                  print(f"DOWNLOADED: {filename}")
+                          if total > 0:
+                              percent = downloaded * 100 / total
+                              print(
+                                  f"\r{downloaded//1024//1024} MB / "
+                                  f"{total//1024//1024} MB "
+                                  f"({percent:.1f}%)",
+                                  end=""
+                              )
 
-          async def upload_files():
-              print("STARTING PYROGRAM CLIENT...")
+              print()
+              print(f"DOWNLOADED: {filename}")
+
+          # =========================
+          # TELEGRAM UPLOAD
+          # =========================
+
+          async def main():
 
               app = Client(
                   "uploader",
@@ -94,43 +96,42 @@ jobs:
 
               files = sorted(glob.glob("downloads/*"))
 
-              if not files:
-                  raise Exception("No files found in downloads folder")
-
-              print(f"FOUND {len(files)} FILE(S)")
-
               for file in files:
+
                   size_mb = os.path.getsize(file) / 1024 / 1024
 
                   print("=" * 60)
-                  print(f"UPLOADING: {file}")
-                  print(f"SIZE: {size_mb:.1f} MB")
+                  print(f"Uploading: {os.path.basename(file)} ({size_mb:.1f} MB)")
                   print("=" * 60)
 
                   try:
+                      await app.send_video(
+                          chat_id=CHAT_ID,
+                          video=file,
+                          caption=os.path.basename(file),
+                          supports_streaming=True,
+                          progress=lambda c, t:
+                              print(f"\rUPLOAD: {c*100/t:.1f}%", end="")
+                      )
+
+                      print("\nVIDEO SENT")
+
+                  except Exception as e:
+
+                      print(f"\nsend_video failed: {e}")
+                      print("Trying send_document...")
+
                       await app.send_document(
                           chat_id=CHAT_ID,
                           document=file,
                           caption=os.path.basename(file),
-                          progress=lambda c, t: print(
-                              f"\rUPLOAD: {c*100/t:.1f}%",
-                              end=""
-                          )
+                          progress=lambda c, t:
+                              print(f"\rUPLOAD: {c*100/t:.1f}%", end="")
                       )
 
-                      print()
-                      print("UPLOAD SUCCESS")
-
-                  except Exception as e:
-                      print()
-                      print(f"UPLOAD FAILED: {e}")
+                      print("\nDOCUMENT SENT")
 
               await app.stop()
-              print("CLIENT STOPPED")
-
-          async def main():
-              download_files()
-              await upload_files()
 
           asyncio.run(main())
           PYEOF
@@ -139,7 +140,7 @@ jobs:
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          PYROGRAM_SESSION: ${{ secrets.PYROGRAM_SESSION }}
+          SESSION_PYROGRAM: ${{ secrets.SESSION_PYROGRAM }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python uploader.py
