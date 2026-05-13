@@ -1,4 +1,4 @@
-name: Download, Zip, and Release
+name: Download, Separate Zip
 
 on:
   workflow_dispatch:
