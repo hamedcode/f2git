@@ -1,0 +1,115 @@
+name: Send Release Files To Telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          pip install -U pyrogram tgcrypto requests
+
+      - name: Download files
+        run: |
+          mkdir -p downloads
+
+          COUNT=1
+
+          while IFS= read -r URL || [ -n "$URL" ]; do
+            [ -z "$URL" ] && continue
+
+            echo "Downloading: $URL"
+
+            EXT=$(echo "$URL" | sed 's/.*\.//g' | cut -d'?' -f1)
+
+            FILE="downloads/file_${COUNT}.${EXT}"
+
+            curl -L --retry 3 --retry-delay 5 \
+              -A "Mozilla/5.0" \
+              "$URL" \
+              -o "$FILE"
+
+            COUNT=$((COUNT+1))
+
+          done < Link.txt
+
+      - name: Show files
+        run: |
+          ls -lh downloads
+
+      - name: Upload to Telegram
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.PYROGRAM_SESSION }}
+          CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+        run: |
+
+          python << 'EOF'
+          import os
+          import asyncio
+          from pyrogram import Client
+
+          API_ID = int(os.environ["API_ID"])
+          API_HASH = os.environ["API_HASH"]
+          SESSION = os.environ["SESSION_STRING"]
+          CHAT_ID = os.environ["CHAT_ID"]
+
+          async def main():
+
+              app = Client(
+                  "uploader",
+                  api_id=API_ID,
+                  api_hash=API_HASH,
+                  session_string=SESSION
+              )
+
+              await app.start()
+
+              files = sorted(os.listdir("downloads"))
+
+              for f in files:
+
+                  path = os.path.join("downloads", f)
+
+                  if not os.path.isfile(path):
+                      continue
+
+                  size_mb = os.path.getsize(path) / 1024 / 1024
+
+                  print(f"Uploading: {f} ({size_mb:.1f} MB)")
+
+                  try:
+
+                      await app.send_video(
+                          chat_id=CHAT_ID,
+                          video=path,
+                          caption=f
+                      )
+
+                      print("Sent as video")
+
+                  except Exception as e:
+
+                      print("send_video failed:", e)
+                      print("Trying send_document...")
+
+                      await app.send_document(
+                          chat_id=CHAT_ID,
+                          document=path,
+                          caption=f
+                      )
+
+                      print("Sent as document")
+
+              await app.stop()
+
+          asyncio.run(main())
+          EOF
