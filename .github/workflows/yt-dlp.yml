@@ -1,4 +1,4 @@
-name: Smart Media Pipeline
+name: Yt-dlp
 
 on:
   workflow_dispatch:
