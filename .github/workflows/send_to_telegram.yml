@@ -1,115 +1,58 @@
-name: Send Release Files To Telegram
+import os
+import asyncio
+from pyrogram import Client
 
-on:
-  workflow_dispatch:
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION = os.getenv("PYROGRAM_SESSION")
 
-jobs:
-  send:
-    runs-on: ubuntu-latest
+# مهم:
+CHAT_ID = int(os.getenv("TG_CHAT_ID"))
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+app = Client(
+    "uploader",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION
+)
 
-      - name: Install
-        run: |
-          pip install -U pyrogram tgcrypto requests
+async def main():
+    await app.start()
 
-      - name: Download files
-        run: |
-          mkdir -p downloads
+    files = sorted(os.listdir("downloads"))
 
-          COUNT=1
+    for file in files:
+        path = f"downloads/{file}"
 
-          while IFS= read -r URL || [ -n "$URL" ]; do
-            [ -z "$URL" ] && continue
+        if not os.path.isfile(path):
+            continue
 
-            echo "Downloading: $URL"
+        size_mb = round(os.path.getsize(path) / 1024 / 1024, 1)
 
-            EXT=$(echo "$URL" | sed 's/.*\.//g' | cut -d'?' -f1)
+        print(f"Uploading: {file} ({size_mb} MB)")
 
-            FILE="downloads/file_${COUNT}.${EXT}"
+        try:
+            await app.send_video(
+                chat_id=CHAT_ID,
+                video=path,
+                supports_streaming=True,
+                caption=file
+            )
 
-            curl -L --retry 3 --retry-delay 5 \
-              -A "Mozilla/5.0" \
-              "$URL" \
-              -o "$FILE"
+            print("VIDEO SENT")
 
-            COUNT=$((COUNT+1))
+        except Exception as e:
+            print(f"send_video failed: {e}")
+            print("Trying send_document...")
 
-          done < link.txt
+            await app.send_document(
+                chat_id=CHAT_ID,
+                document=path,
+                caption=file
+            )
 
-      - name: Show files
-        run: |
-          ls -lh downloads
+            print("DOCUMENT SENT")
 
-      - name: Upload to Telegram
-        env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          SESSION_STRING: ${{ secrets.PYROGRAM_SESSION }}
-          CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+    await app.stop()
 
-        run: |
-
-          python << 'EOF'
-          import os
-          import asyncio
-          from pyrogram import Client
-
-          API_ID = int(os.environ["API_ID"])
-          API_HASH = os.environ["API_HASH"]
-          SESSION = os.environ["SESSION_STRING"]
-          CHAT_ID = os.environ["CHAT_ID"]
-
-          async def main():
-
-              app = Client(
-                  "uploader",
-                  api_id=API_ID,
-                  api_hash=API_HASH,
-                  session_string=SESSION
-              )
-
-              await app.start()
-
-              files = sorted(os.listdir("downloads"))
-
-              for f in files:
-
-                  path = os.path.join("downloads", f)
-
-                  if not os.path.isfile(path):
-                      continue
-
-                  size_mb = os.path.getsize(path) / 1024 / 1024
-
-                  print(f"Uploading: {f} ({size_mb:.1f} MB)")
-
-                  try:
-
-                      await app.send_video(
-                          chat_id=CHAT_ID,
-                          video=path,
-                          caption=f
-                      )
-
-                      print("Sent as video")
-
-                  except Exception as e:
-
-                      print("send_video failed:", e)
-                      print("Trying send_document...")
-
-                      await app.send_document(
-                          chat_id=CHAT_ID,
-                          document=path,
-                          caption=f
-                      )
-
-                      print("Sent as document")
-
-              await app.stop()
-
-          asyncio.run(main())
-          EOF
+asyncio.run(main())
