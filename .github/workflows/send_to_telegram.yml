@@ -1,4 +1,4 @@
-name: Send To Telegram Pub Channel
+name: 4 - Send To Telegram Pub Channel
 
 on:
   workflow_dispatch:
