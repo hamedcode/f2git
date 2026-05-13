@@ -1,4 +1,4 @@
-name: Browser Downloader
+name: 5 - Browser Downloader
 
 on:
   workflow_dispatch:
