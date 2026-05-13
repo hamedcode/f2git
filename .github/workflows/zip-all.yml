@@ -2,6 +2,11 @@ name: Single ZIP
 
 on:
   workflow_dispatch:
+    inputs:
+      max_size_mb:
+        description: "Max ZIP size in MB before splitting (e.g. 950)"
+        required: false
+        default: "950"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -37,8 +42,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 📦 ساخت ZIP رمزدار
-      - name: Create single ZIP
+      # 📦 ساخت ZIP اولیه
+      - name: Create ZIP
         env:
           ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
         run: |
@@ -50,17 +55,50 @@ jobs:
           fi
 
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          ZIP_FILE="zipped/${TIMESTAMP}.zip"
 
           cd downloads
-          zip -r -P "$ZIP_PASSWORD" "../zipped/${TIMESTAMP}.zip" .
+          zip -r -P "$ZIP_PASSWORD" "../$ZIP_FILE" .
+
+          echo "ZIP_FILE=$ZIP_FILE" >> $GITHUB_ENV
+
+      # ✂️ بررسی حجم و split در صورت نیاز
+      - name: Split ZIP if needed
+        run: |
+          MAX_MB=${{ github.event.inputs.max_size_mb }}
+          MAX_BYTES=$((MAX_MB * 1024 * 1024))
+
+          ZIP_PATH="${ZIP_FILE}"
+
+          SIZE=$(stat -c%s "$ZIP_PATH")
+
+          echo "ZIP size: $SIZE bytes"
+          echo "Max allowed: $MAX_BYTES bytes"
+
+          if [ "$SIZE" -le "$MAX_BYTES" ]; then
+            echo "No split needed."
+            exit 0
+          fi
+
+          echo "Splitting ZIP..."
+
+          mkdir -p split
+
+          # split into parts
+          split -b $MAX_BYTES "$ZIP_PATH" split/part_
+
+          # حذف zip اصلی چون دیگر لازم نیست
+          rm "$ZIP_PATH"
 
       # 🚀 ساخت Release
       - name: Create Release
-        if: hashFiles('zipped/*.zip') != ''
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: release-${{ github.run_number }}
           name: Single ZIP Release ${{ github.run_number }}
-          files: zipped/*.zip
+          files: |
+            zipped/*.zip
+            split/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
