@@ -1,58 +1,143 @@
-import os
-import asyncio
-from pyrogram import Client
+name: Download And Upload To Telegram
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("PYROGRAM_SESSION")
+on:
+  workflow_dispatch:
 
-# مهم:
-CHAT_ID = int(os.getenv("TG_CHAT_ID"))
+jobs:
+  upload:
+    runs-on: ubuntu-latest
 
-app = Client(
-    "uploader",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION
-)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-async def main():
-    await app.start()
+      - name: Install
+        run: |
+          sudo apt update
 
-    files = sorted(os.listdir("downloads"))
+          sudo apt install -y aria2
 
-    for file in files:
-        path = f"downloads/{file}"
+          pip install pyrogram tgcrypto requests
 
-        if not os.path.isfile(path):
-            continue
+      - name: Download Files
+        run: |
 
-        size_mb = round(os.path.getsize(path) / 1024 / 1024, 1)
+          mkdir -p downloads
 
-        print(f"Uploading: {file} ({size_mb} MB)")
+          COUNT=1
 
-        try:
-            await app.send_video(
-                chat_id=CHAT_ID,
-                video=path,
-                supports_streaming=True,
-                caption=file
-            )
+          while IFS= read -r URL
+          do
 
-            print("VIDEO SENT")
+            [ -z "$URL" ] && continue
 
-        except Exception as e:
-            print(f"send_video failed: {e}")
-            print("Trying send_document...")
+            echo "================================"
+            echo "DOWNLOADING:"
+            echo "$URL"
+            echo "================================"
 
-            await app.send_document(
-                chat_id=CHAT_ID,
-                document=path,
-                caption=file
-            )
+            OUT="downloads/file_${COUNT}.zip"
 
-            print("DOCUMENT SENT")
+            aria2c \
+              -x 8 \
+              -s 8 \
+              -k 1M \
+              --file-allocation=none \
+              --summary-interval=1 \
+              -o "file_${COUNT}.zip" \
+              -d downloads \
+              "$URL"
 
-    await app.stop()
+            COUNT=$((COUNT+1))
 
-asyncio.run(main())
+          done < link.txt
+
+      - name: Show Files
+        run: |
+          echo "FILES:"
+          ls -lh downloads
+
+      - name: Upload To Telegram
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          PYROGRAM_SESSION: ${{ secrets.PYROGRAM_SESSION }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+        run: |
+
+          python << 'EOF'
+
+          import os
+          import asyncio
+
+          from pyrogram import Client
+
+          API_ID = int(os.getenv("API_ID"))
+          API_HASH = os.getenv("API_HASH")
+          SESSION = os.getenv("PYROGRAM_SESSION")
+
+          # خیلی مهم
+          CHAT_ID = int(os.getenv("TG_CHAT_ID"))
+
+          app = Client(
+              "uploader",
+              api_id=API_ID,
+              api_hash=API_HASH,
+              session_string=SESSION
+          )
+
+          async def main():
+
+              await app.start()
+
+              files = sorted(os.listdir("downloads"))
+
+              print("CHAT_ID =", CHAT_ID)
+
+              me = await app.get_me()
+              print("LOGGED IN AS:", me.first_name)
+
+              for file in files:
+
+                  path = f"downloads/{file}"
+
+                  if not os.path.isfile(path):
+                      continue
+
+                  size_mb = round(
+                      os.path.getsize(path) / 1024 / 1024,
+                      1
+                  )
+
+                  print(f"Uploading: {file} ({size_mb} MB)")
+
+                  try:
+
+                      await app.send_video(
+                          chat_id=CHAT_ID,
+                          video=path,
+                          caption=file,
+                          supports_streaming=True
+                      )
+
+                      print("VIDEO SENT")
+
+                  except Exception as e:
+
+                      print("send_video failed:", e)
+                      print("Trying send_document...")
+
+                      await app.send_document(
+                          chat_id=CHAT_ID,
+                          document=path,
+                          caption=file
+                      )
+
+                      print("DOCUMENT SENT")
+
+              await app.stop()
+
+          asyncio.run(main())
+
+          EOF
