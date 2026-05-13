@@ -47,7 +47,7 @@ jobs:
           path: |
             ~/.cache/ms-playwright
             ~/.cache/pip
-          key: playwright-${{ runner.os }}-v1
+          key: playwright-${{ runner.os }}-v2
 
       - name: Install packages
         run: |
@@ -97,7 +97,12 @@ jobs:
           with sync_playwright() as p:
 
               browser = p.chromium.launch(
-                  headless=True
+                  headless=True,
+                  args=[
+                      "--disable-blink-features=AutomationControlled",
+                      "--no-sandbox",
+                      "--disable-dev-shm-usage"
+                  ]
               )
 
               for page_url in links:
@@ -106,7 +111,17 @@ jobs:
                   print("OPENING:", page_url)
                   print("================================")
 
-                  page = browser.new_page()
+                  page = browser.new_page(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                      viewport={"width": 1366, "height": 768},
+                      locale="en-US"
+                  )
+
+                  page.add_init_script("""
+                  Object.defineProperty(navigator, 'webdriver', {
+                      get: () => undefined
+                  })
+                  """)
 
                   found = []
 
@@ -129,11 +144,20 @@ jobs:
 
                       page.goto(
                           page_url,
-                          wait_until="load",
+                          wait_until="domcontentloaded",
                           timeout=120000
                       )
 
-                      page.wait_for_timeout(30000)
+                      # simulate human activity
+                      page.mouse.move(400, 400)
+                      page.wait_for_timeout(3000)
+
+                      page.mouse.move(600, 500)
+                      page.wait_for_timeout(3000)
+
+                      page.mouse.wheel(0, 500)
+
+                      page.wait_for_timeout(20000)
 
                   except Exception as e:
 
@@ -188,30 +212,31 @@ jobs:
 
                   selected = None
 
-                  for x in found:
+                  priority = [
+                      ".mp4",
+                      ".m3u8",
+                      ".webm",
+                      ".mkv",
+                      ".mov",
+                      ".vid",
+                      "master.m3u8"
+                  ]
 
-                      if not x.startswith("http"):
-                          continue
+                  # اول لینک ویدیویی واقعی
+                  for p in priority:
 
-                      low = x.lower()
+                      for x in found:
 
-                      if any(v in low for v in [
-                          ".mp4",
-                          ".m3u8",
-                          ".mkv",
-                          ".webm",
-                          ".mov",
-                          ".vid",
-                          "video",
-                          "master.m3u8"
-                      ]):
+                          low = x.lower()
 
-                          selected = x
+                          if p in low:
+                              selected = x
+                              break
+
+                      if selected:
                           break
 
-                  # اگر چیزی پیدا نشد
-                  # اولین لینک http رو بردار
-
+                  # اگر هیچ چیز پیدا نشد
                   if selected is None:
 
                       for x in found:
