@@ -8,35 +8,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install
+      - name: Install Dependencies
         run: |
+
           sudo apt update
 
           sudo apt install -y aria2
 
-          pip install pyrogram tgcrypto requests
+          pip install -U pyrogram tgcrypto
 
       - name: Download Files
         run: |
 
           mkdir -p downloads
 
+          echo "================================"
+          echo "READING link.txt"
+          echo "================================"
+
+          if [ ! -f link.txt ]; then
+            echo "link.txt NOT FOUND!"
+            exit 1
+          fi
+
           COUNT=1
 
           while IFS= read -r URL
           do
 
+            # skip empty lines
             [ -z "$URL" ] && continue
 
+            echo ""
             echo "================================"
-            echo "DOWNLOADING:"
+            echo "DOWNLOADING FILE $COUNT"
             echo "$URL"
             echo "================================"
-
-            OUT="downloads/file_${COUNT}.zip"
 
             aria2c \
               -x 8 \
@@ -44,17 +55,26 @@ jobs:
               -k 1M \
               --file-allocation=none \
               --summary-interval=1 \
-              -o "file_${COUNT}.zip" \
+              --console-log-level=notice \
               -d downloads \
+              -o "file_${COUNT}.zip" \
               "$URL"
+
+            echo ""
+            echo "DOWNLOAD FINISHED: file_${COUNT}.zip"
 
             COUNT=$((COUNT+1))
 
           done < link.txt
 
-      - name: Show Files
+      - name: Show Downloaded Files
         run: |
-          echo "FILES:"
+
+          echo ""
+          echo "================================"
+          echo "DOWNLOADED FILES"
+          echo "================================"
+
           ls -lh downloads
 
       - name: Upload To Telegram
@@ -77,8 +97,12 @@ jobs:
           API_HASH = os.getenv("API_HASH")
           SESSION = os.getenv("PYROGRAM_SESSION")
 
-          # خیلی مهم
+          # IMPORTANT
           CHAT_ID = int(os.getenv("TG_CHAT_ID"))
+
+          print("================================")
+          print("STARTING TELEGRAM CLIENT")
+          print("================================")
 
           app = Client(
               "uploader",
@@ -89,14 +113,37 @@ jobs:
 
           async def main():
 
-              await app.start()
+              print("CONNECTING TO TELEGRAM...")
+
+              await asyncio.wait_for(
+                  app.start(),
+                  timeout=60
+              )
+
+              print("CONNECTED!")
+
+              me = await app.get_me()
+
+              print("")
+              print("================================")
+              print("ACCOUNT INFO")
+              print("================================")
+              print("NAME:", me.first_name)
+              print("ID:", me.id)
+              print("CHAT_ID:", CHAT_ID)
+
+              print("")
+              print("================================")
+              print("CHECKING DOWNLOADS")
+              print("================================")
 
               files = sorted(os.listdir("downloads"))
 
-              print("CHAT_ID =", CHAT_ID)
+              print("FILES FOUND:", len(files))
 
-              me = await app.get_me()
-              print("LOGGED IN AS:", me.first_name)
+              if not files:
+                  print("NO FILES FOUND!")
+                  return
 
               for file in files:
 
@@ -110,33 +157,48 @@ jobs:
                       1
                   )
 
-                  print(f"Uploading: {file} ({size_mb} MB)")
+                  print("")
+                  print("================================")
+                  print(f"UPLOADING: {file}")
+                  print(f"SIZE: {size_mb} MB")
+                  print("================================")
 
                   try:
 
-                      await app.send_video(
-                          chat_id=CHAT_ID,
-                          video=path,
-                          caption=file,
-                          supports_streaming=True
+                      await asyncio.wait_for(
+
+                          app.send_document(
+                              chat_id=CHAT_ID,
+                              document=path,
+                              caption=file
+
+                          ),
+
+                          timeout=3600
+
                       )
 
-                      print("VIDEO SENT")
+                      print("UPLOAD SUCCESS!")
 
                   except Exception as e:
 
-                      print("send_video failed:", e)
-                      print("Trying send_document...")
+                      print("")
+                      print("================================")
+                      print("UPLOAD FAILED!")
+                      print("================================")
 
-                      await app.send_document(
-                          chat_id=CHAT_ID,
-                          document=path,
-                          caption=file
-                      )
+                      print(repr(e))
 
-                      print("DOCUMENT SENT")
+                      raise e
+
+              print("")
+              print("================================")
+              print("ALL FILES UPLOADED")
+              print("================================")
 
               await app.stop()
+
+              print("CLIENT CLOSED")
 
           asyncio.run(main())
 
