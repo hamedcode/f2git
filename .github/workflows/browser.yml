@@ -18,6 +18,24 @@ on:
         required: true
         default: "20"
 
+      upload_mode:
+        description: "Upload mode"
+        required: true
+        default: "zip"
+        type: choice
+        options:
+          - "zip"
+          - "direct"
+
+      delete_old_releases:
+        description: "Delete old releases?"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
 permissions:
   contents: write
 
@@ -41,7 +59,8 @@ jobs:
             curl \
             wget \
             aria2 \
-            jq
+            jq \
+            gh
 
           npm init -y
           npm install playwright
@@ -152,7 +171,6 @@ jobs:
           python3 << 'EOF'
 
           import requests
-          import re
           import os
 
           quality = os.environ["QUALITY"]
@@ -310,6 +328,7 @@ jobs:
           done < grabbed/final_links.txt
 
       - name: Create ZIP
+        if: github.event.inputs.upload_mode == 'zip'
         run: |
 
           ts=$(date +"%Y%m%d_%H%M%S")
@@ -320,6 +339,7 @@ jobs:
             downloads/
 
       - name: Delete old releases
+        if: github.event.inputs.delete_old_releases == 'yes'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -330,7 +350,8 @@ jobs:
             gh release delete "$tag" -y || true
           done
 
-      - name: Upload Release
+      - name: Upload ZIP Release
+        if: github.event.inputs.upload_mode == 'zip'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: browser-${{ github.run_number }}
@@ -338,3 +359,13 @@ jobs:
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Direct Video Release
+        if: github.event.inputs.upload_mode == 'direct'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: browser-${{ github.run_number }}
+          files: "downloads/*"
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}: ${{ secrets.GITHUB_TOKEN }}
