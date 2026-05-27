@@ -45,7 +45,7 @@ jobs:
           for file in downloads/*; do
             if [ -f "$file" ]; then
               echo "Zipping $file -> $i.zip"
-              zip -j -P github "zipped/$i.zip" "$file"
+              zip -j -P "${{ secrets.ZIP_PASSWORD }}" "zipped/$i.zip" "$file"
               i=$((i+1))
             fi
           done
