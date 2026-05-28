@@ -52,6 +52,7 @@ jobs:
             ffmpeg \
             zip \
             jq \
+            git \
             python3 \
             python3-pip
 
@@ -59,8 +60,18 @@ jobs:
 
           python3 -m pip install -U yt-dlp
 
-          python3 -m pip install \
-            git+https://github.com/mirkul-yeah/yt-dlp-uncensored-plugin.git
+          mkdir -p ~/.config/yt-dlp/plugins
+
+          git clone \
+            https://github.com/mirkul-yeah/yt-dlp-uncensored-plugin.git \
+            /tmp/yt-uncensored-plugin
+
+          cp -r \
+            /tmp/yt-uncensored-plugin/* \
+            ~/.config/yt-dlp/plugins/
+
+          echo "================ INSTALLED PLUGINS ================"
+          find ~/.config/yt-dlp/plugins -type f
 
       - name: Check yt-dlp and plugins
         run: |
@@ -70,8 +81,11 @@ jobs:
           echo "================ PATH ================"
           which yt-dlp || true
 
-          echo "================ PLUGINS ================"
-          yt-dlp --verbose --list-extractors | head -n 200 || true
+          echo "================ CONFIG DIR ================"
+          echo "$HOME/.config/yt-dlp/plugins"
+
+          echo "================ EXTRACTORS ================"
+          yt-dlp --list-extractors | head -n 300 || true
 
       - name: Download videos
         run: |
