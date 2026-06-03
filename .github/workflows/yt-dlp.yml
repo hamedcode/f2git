@@ -145,7 +145,7 @@ jobs:
                 -i "$file" \
                 -c:v libx265 \
                 -preset veryfast \
-                -crf 28 \
+                -crf 32 \
                 -c:a aac \
                 "$output"
 
@@ -156,7 +156,7 @@ jobs:
                 -vf scale=-2:540 \
                 -c:v libx265 \
                 -preset veryfast \
-                -crf 32 \
+                -crf 28 \
                 -c:a aac \
                 "$output"
 
