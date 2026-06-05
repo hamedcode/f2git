@@ -176,11 +176,11 @@ jobs:
 
               ffmpeg -y \
                 -i "$file" \
-                -vf scale=-2:540 \
-                -c:v libx264 \
-                -preset veryfast \
-                -b:v 900k \
-                -c:a aac \
+                -c:v libsvtav1 \
+                -preset 8 \
+                -crf 32 \
+                -svtav1-params tune=0 \
+                -c:a aac -b:a 96k \
                 "$output"
 
             fi
