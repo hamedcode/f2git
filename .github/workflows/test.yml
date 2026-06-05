@@ -11,49 +11,75 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install FFmpeg
         run: |
-          sudo apt update
-          sudo apt install -y ffmpeg zip
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip wget
 
-      - name: Create demo clips
+      - name: Create Demo Videos
         shell: bash
         run: |
+          set -e
+
           mkdir -p demos
           mkdir -p work
 
           while IFS= read -r url || [ -n "$url" ]; do
 
-            [ -z "$url" ] && continue
+            # Skip empty lines
+            [[ -z "$url" ]] && continue
 
-            echo "Downloading: $url"
+            echo "================================="
+            echo "Processing:"
+            echo "$url"
+            echo "================================="
 
             filename=$(basename "${url%%\?*}")
 
-            wget -O "$filename" "$url"
+            wget -q --show-progress -O "$filename" "$url"
 
             base="${filename%.*}"
             ext="${filename##*.}"
 
             mkdir -p "work/$base"
 
-            ffmpeg -y -ss 00:05:00 -i "$filename" -t 60 -c copy "work/$base/part1.$ext"
-            ffmpeg -y -ss 00:15:00 -i "$filename" -t 60 -c copy "work/$base/part2.$ext"
-            ffmpeg -y -ss 00:25:00 -i "$filename" -t 60 -c copy "work/$base/part3.$ext"
+            echo "Extracting segment 1..."
+            ffmpeg -hide_banner -loglevel error -y \
+              -ss 00:05:00 \
+              -i "$filename" \
+              -t 60 \
+              -c copy \
+              "work/$base/part1.$ext"
 
-            cat > "work/$base/list.txt" << EOF
-            file 'part1.$ext'
-            file 'part2.$ext'
-            file 'part3.$ext'
-            EOF
+            echo "Extracting segment 2..."
+            ffmpeg -hide_banner -loglevel error -y \
+              -ss 00:15:00 \
+              -i "$filename" \
+              -t 60 \
+              -c copy \
+              "work/$base/part2.$ext"
+
+            echo "Extracting segment 3..."
+            ffmpeg -hide_banner -loglevel error -y \
+              -ss 00:25:00 \
+              -i "$filename" \
+              -t 60 \
+              -c copy \
+              "work/$base/part3.$ext"
+
+            echo "file 'part1.$ext'" > "work/$base/list.txt"
+            echo "file 'part2.$ext'" >> "work/$base/list.txt"
+            echo "file 'part3.$ext'" >> "work/$base/list.txt"
+
+            echo "Creating demo video..."
 
             (
               cd "work/$base"
 
-              ffmpeg -y \
+              ffmpeg -hide_banner -loglevel error -y \
                 -f concat \
                 -safe 0 \
                 -i list.txt \
@@ -65,7 +91,7 @@ jobs:
 
           done < link.txt
 
-      - name: Create ZIP
+      - name: Create ZIP Archive
         run: |
           cd demos
           zip -r ../demo_videos.zip .
@@ -76,3 +102,4 @@ jobs:
           tag_name: demo-${{ github.run_number }}
           name: Demo Videos ${{ github.run_number }}
           files: demo_videos.zip
+          generate_release_notes: true
