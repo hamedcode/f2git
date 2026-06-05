@@ -45,10 +45,10 @@ jobs:
             ffmpeg -y -ss 00:25:00 -i "$filename" -t 60 -c copy "work/$base/part3.$ext"
 
             cat > "work/$base/list.txt" << EOF
-file 'part1.$ext'
-file 'part2.$ext'
-file 'part3.$ext'
-EOF
+            file 'part1.$ext'
+            file 'part2.$ext'
+            file 'part3.$ext'
+            EOF
 
             (
               cd "work/$base"
