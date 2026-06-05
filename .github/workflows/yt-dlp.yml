@@ -153,7 +153,8 @@ jobs:
 
               ffmpeg -y \
                 -i "$file" \
-                -vf scale=-2:540 \
+                -vf "setpts=0.5*PTS,fps=30" \
+                -af "atempo=2.0" \
                 -c:v libx265 \
                 -preset fast \
                 -crf 27 \
