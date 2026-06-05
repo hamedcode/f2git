@@ -14,72 +14,114 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zip wget
+          sudo apt-get install -y ffmpeg zip curl
 
       - name: Create Demo Videos
         shell: bash
         run: |
-          set -e
+          set +e
 
           mkdir -p demos
           mkdir -p work
 
           while IFS= read -r url || [ -n "$url" ]; do
 
-            # Skip empty lines
+            url="$(echo "$url" | xargs)"
+
             [[ -z "$url" ]] && continue
 
-            echo "================================="
+            echo "========================================"
             echo "Processing:"
             echo "$url"
-            echo "================================="
+            echo "========================================"
 
             filename=$(basename "${url%%\?*}")
 
-            wget -q --show-progress -O "$filename" "$url"
+            echo "Downloading..."
+
+            curl -L --fail --retry 3 \
+              -o "$filename" \
+              "$url"
+
+            if [[ $? -ne 0 ]]; then
+              echo "Download failed, skipping..."
+              continue
+            fi
+
+            if [[ ! -f "$filename" ]]; then
+              echo "File not found after download, skipping..."
+              continue
+            fi
+
+            duration=$(ffprobe \
+              -v error \
+              -show_entries format=duration \
+              -of default=noprint_wrappers=1:nokey=1 \
+              "$filename")
+
+            echo "Duration: $duration seconds"
 
             base="${filename%.*}"
             ext="${filename##*.}"
 
             mkdir -p "work/$base"
 
-            echo "Extracting segment 1..."
-            ffmpeg -hide_banner -loglevel error -y \
-              -ss 00:05:00 \
-              -i "$filename" \
-              -t 60 \
-              -c copy \
-              "work/$base/part1.$ext"
+            extract_segment() {
+              local start="$1"
+              local output="$2"
 
-            echo "Extracting segment 2..."
-            ffmpeg -hide_banner -loglevel error -y \
-              -ss 00:15:00 \
-              -i "$filename" \
-              -t 60 \
-              -c copy \
-              "work/$base/part2.$ext"
+              local start_sec
 
-            echo "Extracting segment 3..."
-            ffmpeg -hide_banner -loglevel error -y \
-              -ss 00:25:00 \
-              -i "$filename" \
-              -t 60 \
-              -c copy \
-              "work/$base/part3.$ext"
+              IFS=':' read -r hh mm ss <<< "$start"
+              start_sec=$((10#$hh * 3600 + 10#$mm * 60 + 10#$ss))
 
-            echo "file 'part1.$ext'" > "work/$base/list.txt"
-            echo "file 'part2.$ext'" >> "work/$base/list.txt"
-            echo "file 'part3.$ext'" >> "work/$base/list.txt"
+              duration_int=${duration%.*}
 
-            echo "Creating demo video..."
+              if (( start_sec >= duration_int )); then
+                echo "Skipping $start (beyond video length)"
+                return
+              fi
+
+              ffmpeg -y \
+                -ss "$start" \
+                -i "$filename" \
+                -t 60 \
+                -c copy \
+                "$output"
+            }
+
+            extract_segment "00:05:00" "work/$base/part1.$ext"
+            extract_segment "00:15:00" "work/$base/part2.$ext"
+            extract_segment "00:25:00" "work/$base/part3.$ext"
+
+            list_file="work/$base/list.txt"
+            rm -f "$list_file"
+
+            for part in \
+              "part1.$ext" \
+              "part2.$ext" \
+              "part3.$ext"
+            do
+              if [[ -f "work/$base/$part" ]]; then
+                echo "file '$part'" >> "$list_file"
+              fi
+            done
+
+            if [[ ! -s "$list_file" ]]; then
+              echo "No valid segments found."
+              rm -f "$filename"
+              continue
+            fi
+
+            echo "Creating demo..."
 
             (
               cd "work/$base"
 
-              ffmpeg -hide_banner -loglevel error -y \
+              ffmpeg -y \
                 -f concat \
                 -safe 0 \
                 -i list.txt \
@@ -90,6 +132,17 @@ jobs:
             rm -f "$filename"
 
           done < link.txt
+
+      - name: Check Demo Files
+        run: |
+          count=$(find demos -type f | wc -l)
+
+          echo "Demo files: $count"
+
+          if [ "$count" -eq 0 ]; then
+            echo "No demo files created."
+            exit 1
+          fi
 
       - name: Create ZIP Archive
         run: |
