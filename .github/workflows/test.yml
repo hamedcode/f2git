@@ -1,0 +1,78 @@
+name: Build Demo Clips
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt update
+          sudo apt install -y ffmpeg zip
+
+      - name: Create demo clips
+        shell: bash
+        run: |
+          mkdir -p demos
+          mkdir -p work
+
+          while IFS= read -r url || [ -n "$url" ]; do
+
+            [ -z "$url" ] && continue
+
+            echo "Downloading: $url"
+
+            filename=$(basename "${url%%\?*}")
+
+            wget -O "$filename" "$url"
+
+            base="${filename%.*}"
+            ext="${filename##*.}"
+
+            mkdir -p "work/$base"
+
+            ffmpeg -y -ss 00:05:00 -i "$filename" -t 60 -c copy "work/$base/part1.$ext"
+            ffmpeg -y -ss 00:15:00 -i "$filename" -t 60 -c copy "work/$base/part2.$ext"
+            ffmpeg -y -ss 00:25:00 -i "$filename" -t 60 -c copy "work/$base/part3.$ext"
+
+            cat > "work/$base/list.txt" << EOF
+file 'part1.$ext'
+file 'part2.$ext'
+file 'part3.$ext'
+EOF
+
+            (
+              cd "work/$base"
+
+              ffmpeg -y \
+                -f concat \
+                -safe 0 \
+                -i list.txt \
+                -c copy \
+                "../../demos/${base}_demo.${ext}"
+            )
+
+            rm -f "$filename"
+
+          done < link.txt
+
+      - name: Create ZIP
+        run: |
+          cd demos
+          zip -r ../demo_videos.zip .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: demo-${{ github.run_number }}
+          name: Demo Videos ${{ github.run_number }}
+          files: demo_videos.zip
