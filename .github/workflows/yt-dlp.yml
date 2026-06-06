@@ -153,11 +153,12 @@ jobs:
 
               ffmpeg -y \
                 -i "$file" \
+                -vf scale=-2:360 \
                 -vf "setpts=0.5*PTS,fps=30" \
                 -af "atempo=2.0" \
                 -c:v libx265 \
                 -preset fast \
-                -crf 27 \
+                -crf 32 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
                 -c:a aac -b:a 96k \
                 "$output"
