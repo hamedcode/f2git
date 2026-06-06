@@ -95,7 +95,7 @@ jobs:
 
             extract_segment "00:05:00" "work/$base/part1.$ext"
             extract_segment "00:15:00" "work/$base/part2.$ext"
-            extract_segment "00:25:00" "work/$base/part3.$ext"
+            extract_segment "00:20:00" "work/$base/part3.$ext"
 
             list_file="work/$base/list.txt"
             rm -f "$list_file"
