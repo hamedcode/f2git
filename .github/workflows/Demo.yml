@@ -1,4 +1,4 @@
-name: Build Demo Clips
+name: 7. Build Demo Clips
 
 on:
   workflow_dispatch:
