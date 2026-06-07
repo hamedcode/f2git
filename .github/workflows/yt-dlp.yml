@@ -156,6 +156,7 @@ jobs:
                 -vf "setpts=0.5*PTS,fps=30,scale=-2:540" \
                 -af "atempo=2.0" \
                 -c:v libx265 \
+                -pix_fmt yuv420p10le \
                 -preset fast \
                 -crf 29 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
