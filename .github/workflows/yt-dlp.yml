@@ -159,7 +159,7 @@ jobs:
                 -preset fast \
                 -crf 29 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
-                -c:a aac -b:a 96k \
+                -c:a aac -b:a 80k \
                 "$output"
 
             elif [[ "$MODE" == "x264-lite" ]]; then
