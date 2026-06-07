@@ -22,7 +22,7 @@ on:
         options:
           - disabled
           - x265-veryfast
-          - x265-540p
+          - x265-2X
           - x264-lite
           - x264-540p
         default: x265-veryfast
@@ -149,16 +149,15 @@ jobs:
                 -c:a aac \
                 "$output"
 
-            elif [[ "$MODE" == "x265-540p" ]]; then
+            elif [[ "$MODE" == "x265-2X" ]]; then
 
               ffmpeg -y \
                 -i "$file" \
-                -vf scale=-2:360 \
                 -vf "setpts=0.5*PTS,fps=30" \
                 -af "atempo=2.0" \
                 -c:v libx265 \
-                -preset fast \
-                -crf 32 \
+                -preset medium \
+                -crf 27 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
                 -c:a aac -b:a 96k \
                 "$output"
