@@ -167,6 +167,7 @@ jobs:
 
               ffmpeg -y \
                 -i "$file" \
+                -vf "scale=-2:540" \
                 -c:v libx264 \
                 -preset veryfast \
                 -b:v 1000k \
@@ -177,7 +178,6 @@ jobs:
 
               ffmpeg -y \
                 -i "$file" \
-                -vf "scale=-2:540" \
                 -c:v libx265 \
                 -pix_fmt yuv420p10le \
                 -preset fast \
