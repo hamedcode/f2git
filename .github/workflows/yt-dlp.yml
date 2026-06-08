@@ -30,7 +30,7 @@ on:
       min_size_mb:
         description: "Minimum size for encoding (MB)"
         required: true
-        default: "350"
+        default: "250"
 
       create_zip:
         description: "Create ZIP file?"
@@ -39,7 +39,7 @@ on:
         options:
           - "yes"
           - "no"
-        default: "yes"
+        default: "no"
 
       delete_old_releases:
         description: "Delete old releases?"
@@ -48,7 +48,7 @@ on:
         options:
           - "yes"
           - "no"
-        default: "yes"
+        default: "no"
 
 permissions:
   contents: write
