@@ -179,7 +179,6 @@ jobs:
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
-                -pix_fmt yuv420p10le \
                 -preset fast \
                 -crf 29 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
