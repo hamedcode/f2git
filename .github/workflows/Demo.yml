@@ -88,7 +88,7 @@ jobs:
               ffmpeg -y \
                 -ss "$start" \
                 -i "$filename" \
-                -t 60 \
+                -t 20 \
                 -c copy \
                 "$output"
             }
