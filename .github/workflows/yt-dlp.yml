@@ -21,11 +21,11 @@ on:
         type: choice
         options:
           - disabled
-          - x265-veryfast
-          - x265-2X
+          - x265-fast-27
+          - x265-540p-29-2X
           - x264-lite
-          - x264-540p
-        default: x265-veryfast
+          - x265-29-80k
+        default: x265-fast-27
 
       min_size_mb:
         description: "Minimum size for encoding (MB)"
@@ -139,17 +139,18 @@ jobs:
             name=$(basename "$file")
             output="encoded/${name%.*}_encoded.mp4"
 
-            if [[ "$MODE" == "x265-veryfast" ]]; then
+            if [[ "$MODE" == "x265-fast-27" ]]; then
 
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
-                -preset veryfast \
-                -crf 28 \
+                -pix_fmt yuv420p10le \
+                -preset fast \
+                -crf 27 \
                 -c:a aac \
                 "$output"
 
-            elif [[ "$MODE" == "x265-2X" ]]; then
+            elif [[ "$MODE" == "x265-540p-29-2X" ]]; then
 
               ffmpeg -y \
                 -i "$file" \
@@ -174,11 +175,12 @@ jobs:
                 -c:a aac \
                 "$output"
 
-            elif [[ "$MODE" == "x264-540p" ]]; then
+            elif [[ "$MODE" == "x265-29-80k" ]]; then
 
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
+                -pix_fmt yuv420p10le \
                 -preset fast \
                 -crf 29 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
