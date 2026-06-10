@@ -104,11 +104,31 @@ jobs:
           MODE="${{ github.event.inputs.encode_mode }}"
           MIN_SIZE="${{ github.event.inputs.min_size_mb }}"
 
+          # Helper: extract video info via ffprobe
+          get_video_info() {
+            local f="$1"
+            local res bitrate_raw bitrate_k
+            res=$(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=width,height \
+              -of csv=s=x:p=0 "$f" 2>/dev/null || echo "N/A")
+            bitrate_raw=$(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=bit_rate \
+              -of default=nk=1:nw=1 "$f" 2>/dev/null || echo "0")
+            bitrate_raw=${bitrate_raw:-0}
+            bitrate_k=$((bitrate_raw / 1000))
+            echo "${res}|${bitrate_k}"
+          }
+
+          # File that accumulates per-file stats for release notes
+          STATS_FILE="encode_stats.txt"
+          > "$STATS_FILE"
+
           for file in downloads/*; do
 
             [ -f "$file" ] || continue
 
             size_mb=$(du -m "$file" | cut -f1)
+            name=$(basename "$file")
 
             if [[ "$MODE" == "disabled" ]]; then
               cp "$file" encoded/
@@ -117,6 +137,16 @@ jobs:
 
             if [[ "$size_mb" -lt "$MIN_SIZE" ]]; then
               cp "$file" encoded/
+              # Record as "copied (too small)"
+              info_before=$(get_video_info "$file")
+              res_before=$(echo "$info_before" | cut -d'|' -f1)
+              br_before=$(echo "$info_before" | cut -d'|' -f2)
+              echo "### 馃搫 \`${name}\`" >> "$STATS_FILE"
+              echo "- **Status:** Copied as-is (size ${size_mb} MB < minimum ${MIN_SIZE} MB)" >> "$STATS_FILE"
+              echo "- **Resolution:** ${res_before}" >> "$STATS_FILE"
+              echo "- **Video bitrate:** ${br_before} kbps" >> "$STATS_FILE"
+              echo "- **File size:** ${size_mb} MB" >> "$STATS_FILE"
+              echo "" >> "$STATS_FILE"
               continue
             fi
 
@@ -133,14 +163,31 @@ jobs:
             if [[ "$bitrate_k" -lt 900 ]]; then
               echo "Skipping encode (bitrate too low): $file"
               cp "$file" encoded/
+              info_before=$(get_video_info "$file")
+              res_before=$(echo "$info_before" | cut -d'|' -f1)
+              echo "### 馃搫 \`${name}\`" >> "$STATS_FILE"
+              echo "- **Status:** Copied as-is (bitrate ${bitrate_k} kbps < 900 kbps threshold)" >> "$STATS_FILE"
+              echo "- **Resolution:** ${res_before}" >> "$STATS_FILE"
+              echo "- **Video bitrate:** ${bitrate_k} kbps" >> "$STATS_FILE"
+              echo "- **File size:** ${size_mb} MB" >> "$STATS_FILE"
+              echo "" >> "$STATS_FILE"
               continue
             fi
 
-            name=$(basename "$file")
             output="encoded/${name%.*}_encoded.mp4"
+
+            # Capture before-encode info
+            info_before=$(get_video_info "$file")
+            res_before=$(echo "$info_before" | cut -d'|' -f1)
+            br_before=$(echo "$info_before" | cut -d'|' -f2)
+            size_before_mb=$size_mb
+
+            # Determine CRF used by mode
+            CRF_USED="N/A"
 
             if [[ "$MODE" == "x265-fast-27" ]]; then
 
+              CRF_USED="27"
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
@@ -152,6 +199,7 @@ jobs:
 
             elif [[ "$MODE" == "x265-540p-29-2X" ]]; then
 
+              CRF_USED="29"
               ffmpeg -y \
                 -i "$file" \
                 -vf "setpts=0.5*PTS,fps=30,scale=-2:540" \
@@ -166,6 +214,7 @@ jobs:
 
             elif [[ "$MODE" == "x264-lite" ]]; then
 
+              CRF_USED="N/A (CBR 1000k)"
               ffmpeg -y \
                 -i "$file" \
                 -vf "scale=-2:540" \
@@ -177,6 +226,7 @@ jobs:
 
             elif [[ "$MODE" == "x265-29-80k" ]]; then
 
+              CRF_USED="29"
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
@@ -187,10 +237,53 @@ jobs:
                 -c:a aac -b:a 80k \
                 "$output"
 
+            fi
 
+            # Capture after-encode info
+            if [[ -f "$output" ]]; then
+              info_after=$(get_video_info "$output")
+              res_after=$(echo "$info_after" | cut -d'|' -f1)
+              br_after=$(echo "$info_after" | cut -d'|' -f2)
+              size_after_mb=$(du -m "$output" | cut -f1)
+
+              # Calculate size reduction percentage
+              if [[ "$size_before_mb" -gt 0 ]]; then
+                reduction=$(awk "BEGIN {printf \"%.1f\", (1 - $size_after_mb/$size_before_mb)*100}")
+              else
+                reduction="N/A"
+              fi
+
+              out_name=$(basename "$output")
+              echo "### 馃幀 \`${out_name}\`" >> "$STATS_FILE"
+              echo "- **Encode mode:** \`${MODE}\`" >> "$STATS_FILE"
+              echo "- **CRF:** ${CRF_USED}" >> "$STATS_FILE"
+              echo "- **Resolution:** ${res_before} 鈫� ${res_after}" >> "$STATS_FILE"
+              echo "- **Video bitrate:** ${br_before} kbps 鈫� ${br_after} kbps" >> "$STATS_FILE"
+              echo "- **File size:** ${size_before_mb} MB 鈫� ${size_after_mb} MB  (馃搲 ${reduction}% reduction)" >> "$STATS_FILE"
+              echo "" >> "$STATS_FILE"
             fi
 
           done
+
+      - name: Build release notes
+        run: |
+          MODE="${{ github.event.inputs.encode_mode }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          RUN_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          {
+            echo "## 馃摝 Release Info"
+            echo "- **Date:** ${RUN_DATE}"
+            echo "- **Requested quality:** ${QUALITY}p"
+            echo "- **Encode mode:** \`${MODE}\`"
+            echo ""
+            if [[ -s encode_stats.txt ]]; then
+              echo "---"
+              echo "## 馃帪锔� File Details"
+              echo ""
+              cat encode_stats.txt
+            fi
+          } > release_notes.md
 
       - name: Create ZIP
         if: github.event.inputs.create_zip == 'yes'
@@ -219,6 +312,7 @@ jobs:
         with:
           tag_name: media-${{ github.run_number }}
           files: "*.zip"
+          body_path: release_notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -231,7 +325,7 @@ jobs:
           gh release create \
             "media-${{ github.run_number }}" \
             --title "media-${{ github.run_number }}" \
-            --notes "Generated by workflow"
+            --notes-file release_notes.md
 
       - name: Upload Files
         if: github.event.inputs.create_zip == 'no'
