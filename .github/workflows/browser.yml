@@ -93,6 +93,7 @@ jobs:
             const page = await context.newPage();
 
             const found = new Set();
+            let currentTitle = 'video';
 
             page.on('response', async (response) => {
 
@@ -116,7 +117,7 @@ jobs:
 
                   fs.appendFileSync(
                     'grabbed/raw_links.txt',
-                    url + '\n'
+                    currentTitle + '|||' + url + '\n'
                   );
 
                 }
@@ -143,6 +144,10 @@ jobs:
                 });
 
                 await page.waitForTimeout(15000);
+
+                currentTitle = (await page.title()).trim() || 'video';
+
+                console.log('TITLE:', currentTitle);
 
               } catch (e) {
                 console.log('ERROR:', e);
@@ -184,7 +189,13 @@ jobs:
           checked = []
           seen_sizes = []
 
-          for url in links:
+          for entry in links:
+
+              if '|||' in entry:
+                  title, url = entry.split('|||', 1)
+              else:
+                  title = 'video'
+                  url = entry
 
               try:
 
@@ -237,6 +248,7 @@ jobs:
 
                   checked.append({
                       "url": url,
+                      "title": title,
                       "size": size,
                       "score": score
                   })
@@ -251,7 +263,7 @@ jobs:
           with open("grabbed/final_links.txt", "w", encoding="utf-8") as f:
               for item in final:
                   print("SELECTED:", item["url"])
-                  f.write(item["url"] + "\n")
+                  f.write(item["title"] + "|||" + item["url"] + "\n")
 
           EOF
 
@@ -265,19 +277,32 @@ jobs:
 
           counter=1
 
-          while read url; do
+          while read entry; do
 
-            [ -z "$url" ] && continue
+            [ -z "$entry" ] && continue
+
+            # split TITLE|||URL
+            title=$(echo "$entry" | cut -d'|' -f1)
+            url=$(echo "$entry"   | sed 's/^[^|]*|||//')
+
+            # sanitize title: keep alphanumeric, spaces, dashes, dots; replace rest with _
+            safe_title=$(echo "$title" | tr -cs 'a-zA-Z0-9 ._-' '_' | sed 's/[[:space:]]/_/g' | cut -c1-120)
+            [ -z "$safe_title" ] && safe_title="video_${counter}"
 
             echo ""
             echo "================================"
-            echo "DOWNLOADING:"
-            echo "$url"
+            echo "DOWNLOADING: $url"
+            echo "FILENAME:    $safe_title"
             echo "================================"
 
             clean_url=$(echo "$url" | cut -d'?' -f1)
 
             ext=$(echo "$clean_url" | grep -oE '\.(mp4|m3u8|vid)' | head -1 | tr -d '.')
+
+            # treat .vid as mp4
+            if [[ "$ext" == "vid" ]]; then
+              ext="mp4"
+            fi
 
             if [[ "$ext" == "m3u8" ]]; then
 
@@ -288,7 +313,7 @@ jobs:
                 -user_agent "Mozilla/5.0" \
                 -i "$url" \
                 -c copy \
-                "downloads/${counter}.mp4"
+                "downloads/${safe_title}.mp4"
 
             else
 
@@ -303,7 +328,7 @@ jobs:
                 --download-result=hide \
                 --console-log-level=warn \
                 --dir=downloads \
-                --out="${counter}.${ext:-mp4}" \
+                --out="${safe_title}.${ext:-mp4}" \
                 "$url"
 
               result=$?
@@ -316,7 +341,7 @@ jobs:
                   --retry 5 \
                   --connect-timeout 30 \
                   -A "Mozilla/5.0" \
-                  -o "downloads/${counter}.${ext:-mp4}" \
+                  -o "downloads/${safe_title}.${ext:-mp4}" \
                   "$url"
 
               fi
