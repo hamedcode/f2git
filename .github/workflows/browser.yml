@@ -92,39 +92,7 @@ jobs:
 
             const page = await context.newPage();
 
-            const found = new Set();
-            let currentTitle = 'video';
-
-            page.on('response', async (response) => {
-
-              try {
-
-                const url = response.url();
-
-                if (
-                  url.includes('.mp4') ||
-                  url.includes('.m3u8') ||
-                  url.includes('.vid')
-                ) {
-
-                  const clean = url.split('?')[0];
-
-                  if (found.has(clean)) return;
-
-                  found.add(clean);
-
-                  console.log('FOUND:', url);
-
-                  fs.appendFileSync(
-                    'grabbed/raw_links.txt',
-                    currentTitle + '|||' + url + '\n'
-                  );
-
-                }
-
-              } catch (e) {}
-
-            });
+            const foundGlobal = new Set();
 
             const urls = fs
               .readFileSync('browser.txt', 'utf8')
@@ -132,26 +100,58 @@ jobs:
               .map(v => v.trim())
               .filter(Boolean);
 
-            for (const url of urls) {
+            for (const pageUrl of urls) {
 
-              console.log('OPENING:', url);
+              console.log('OPENING:', pageUrl);
+
+              // collect links found during THIS page load
+              const pageLinks = [];
+
+              const onResponse = async (response) => {
+                try {
+                  const url = response.url();
+                  if (
+                    url.includes('.mp4') ||
+                    url.includes('.m3u8') ||
+                    url.includes('.vid')
+                  ) {
+                    const clean = url.split('?')[0];
+                    if (foundGlobal.has(clean)) return;
+                    foundGlobal.add(clean);
+                    console.log('FOUND:', url);
+                    pageLinks.push(url);
+                  }
+                } catch (e) {}
+              };
+
+              page.on('response', onResponse);
 
               try {
 
-                await page.goto(url, {
+                await page.goto(pageUrl, {
                   waitUntil: 'networkidle',
                   timeout: 120000
                 });
 
                 await page.waitForTimeout(15000);
 
-                currentTitle = (await page.title()).trim() || 'video';
+                // title is read AFTER the page has fully settled
+                const title = (await page.title()).trim() || 'video';
+                console.log('TITLE:', title);
 
-                console.log('TITLE:', currentTitle);
+                // write all links found on this page with the correct title
+                for (const link of pageLinks) {
+                  fs.appendFileSync(
+                    'grabbed/raw_links.txt',
+                    title + '|||' + link + '\n'
+                  );
+                }
 
               } catch (e) {
                 console.log('ERROR:', e);
               }
+
+              page.off('response', onResponse);
 
             }
 
@@ -184,12 +184,12 @@ jobs:
           links = []
 
           with open("grabbed/raw_links.txt", "r", encoding="utf-8") as f:
-              links = [x.strip() for x in f if x.strip()]
+              lines = [x.strip() for x in f if x.strip()]
 
           checked = []
           seen_sizes = []
 
-          for entry in links:
+          for entry in lines:
 
               if '|||' in entry:
                   title, url = entry.split('|||', 1)
@@ -277,16 +277,25 @@ jobs:
 
           counter=1
 
-          while read entry; do
+          while IFS= read -r entry; do
 
             [ -z "$entry" ] && continue
 
-            # split TITLE|||URL
-            title=$(echo "$entry" | cut -d'|' -f1)
-            url=$(echo "$entry"   | sed 's/^[^|]*|||//')
+            # split on |||
+            title="${entry%%|||*}"
+            url="${entry#*|||}"
 
-            # sanitize title: keep alphanumeric, spaces, dashes, dots; replace rest with _
-            safe_title=$(echo "$title" | tr -cs 'a-zA-Z0-9 ._-' '_' | sed 's/[[:space:]]/_/g' | cut -c1-120)
+            # sanitize title:
+            #   1. replace any char that is NOT alphanumeric, space, dot, dash, underscore with _
+            #   2. collapse multiple underscores/spaces into one underscore
+            #   3. strip leading/trailing underscores
+            #   4. limit to 80 characters
+            safe_title=$(echo "$title" \
+              | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
+              | sed 's/[_ ]\+/_/g' \
+              | sed 's/^_//;s/_$//' \
+              | cut -c1-80)
+
             [ -z "$safe_title" ] && safe_title="video_${counter}"
 
             echo ""
