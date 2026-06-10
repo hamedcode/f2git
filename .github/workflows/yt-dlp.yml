@@ -24,7 +24,7 @@ on:
           - x265-fast-27
           - x265-540p-29-2X
           - x264-lite
-          - x265-29-80k
+          - x265-26-80k
         default: x265-fast-27
 
       min_size_mb:
@@ -224,16 +224,16 @@ jobs:
                 -c:a aac \
                 "$output"
 
-            elif [[ "$MODE" == "x265-29-80k" ]]; then
+            elif [[ "$MODE" == "x265-26-80k" ]]; then
 
-              CRF_USED="29"
+              CRF_USED="26"
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
                 -pix_fmt yuv420p10le \
-                -preset fast \
-                -crf 29 \
-                -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
+                -preset medium \
+                -crf 26 \
+                -x265-params aq-mode=3:psy-rd=2.0:bframes=6:keyint=240 \
                 -c:a aac -b:a 80k \
                 "$output"
 
