@@ -24,7 +24,7 @@ on:
           - x265-fast-27
           - x265-540p-29-2X
           - x264-lite
-          - x265-26-80k
+          - x265-29-80k
         default: x265-fast-27
 
       min_size_mb:
@@ -92,7 +92,7 @@ jobs:
               --merge-output-format mp4 \
               --no-part \
               --restrict-filenames \
-              -o "downloads/%(title).80s.%(ext)s" \
+              -o "downloads/%(title).80s%(title|%(webpage_url_basename)s)s.%(ext)s" \
               "$url"
 
           done < yt.txt
@@ -141,7 +141,7 @@ jobs:
               info_before=$(get_video_info "$file")
               res_before=$(echo "$info_before" | cut -d'|' -f1)
               br_before=$(echo "$info_before" | cut -d'|' -f2)
-              echo "### 馃搫 \`${name}\`" >> "$STATS_FILE"
+              echo "### \`${name}\`" >> "$STATS_FILE"
               echo "- **Status:** Copied as-is (size ${size_mb} MB < minimum ${MIN_SIZE} MB)" >> "$STATS_FILE"
               echo "- **Resolution:** ${res_before}" >> "$STATS_FILE"
               echo "- **Video bitrate:** ${br_before} kbps" >> "$STATS_FILE"
@@ -165,7 +165,7 @@ jobs:
               cp "$file" encoded/
               info_before=$(get_video_info "$file")
               res_before=$(echo "$info_before" | cut -d'|' -f1)
-              echo "### 馃搫 \`${name}\`" >> "$STATS_FILE"
+              echo "### \`${name}\`" >> "$STATS_FILE"
               echo "- **Status:** Copied as-is (bitrate ${bitrate_k} kbps < 900 kbps threshold)" >> "$STATS_FILE"
               echo "- **Resolution:** ${res_before}" >> "$STATS_FILE"
               echo "- **Video bitrate:** ${bitrate_k} kbps" >> "$STATS_FILE"
@@ -224,16 +224,16 @@ jobs:
                 -c:a aac \
                 "$output"
 
-            elif [[ "$MODE" == "x265-26-80k" ]]; then
+            elif [[ "$MODE" == "x265-29-80k" ]]; then
 
-              CRF_USED="26"
+              CRF_USED="29"
               ffmpeg -y \
                 -i "$file" \
                 -c:v libx265 \
                 -pix_fmt yuv420p10le \
-                -preset medium \
-                -crf 26 \
-                -x265-params aq-mode=3:psy-rd=2.0:bframes=6:keyint=240 \
+                -preset fast \
+                -crf 29 \
+                -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
                 -c:a aac -b:a 80k \
                 "$output"
 
@@ -254,12 +254,12 @@ jobs:
               fi
 
               out_name=$(basename "$output")
-              echo "### 馃幀 \`${out_name}\`" >> "$STATS_FILE"
+              echo "### \`${out_name}\`" >> "$STATS_FILE"
               echo "- **Encode mode:** \`${MODE}\`" >> "$STATS_FILE"
               echo "- **CRF:** ${CRF_USED}" >> "$STATS_FILE"
-              echo "- **Resolution:** ${res_before} 鈫� ${res_after}" >> "$STATS_FILE"
-              echo "- **Video bitrate:** ${br_before} kbps 鈫� ${br_after} kbps" >> "$STATS_FILE"
-              echo "- **File size:** ${size_before_mb} MB 鈫� ${size_after_mb} MB  (馃搲 ${reduction}% reduction)" >> "$STATS_FILE"
+              echo "- **Resolution:** ${res_before} -> ${res_after}" >> "$STATS_FILE"
+              echo "- **Video bitrate:** ${br_before} kbps -> ${br_after} kbps" >> "$STATS_FILE"
+              echo "- **File size:** ${size_before_mb} MB -> ${size_after_mb} MB  (-${reduction}% reduction)" >> "$STATS_FILE"
               echo "" >> "$STATS_FILE"
             fi
 
@@ -272,14 +272,14 @@ jobs:
           RUN_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
 
           {
-            echo "## 馃摝 Release Info"
+            echo "## Release Info"
             echo "- **Date:** ${RUN_DATE}"
             echo "- **Requested quality:** ${QUALITY}p"
             echo "- **Encode mode:** \`${MODE}\`"
             echo ""
             if [[ -s encode_stats.txt ]]; then
               echo "---"
-              echo "## 馃帪锔� File Details"
+              echo "## File Details"
               echo ""
               cat encode_stats.txt
             fi
