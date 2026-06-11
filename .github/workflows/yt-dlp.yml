@@ -81,19 +81,26 @@ jobs:
 
             echo "Downloading: $url"
 
-            if [[ "$QUALITY" == "best" ]]; then
-              FORMAT="bestvideo+bestaudio/best"
+            # Check if URL is a direct file link (ends with video extension)
+            if echo "$url" | grep -qiE '\.(mp4|mkv|webm|avi|mov|m4v)([\?#].*)?$'; then
+              # Use curl for direct file links to preserve original filename
+              filename=$(basename "$(echo "$url" | cut -d'?' -f1)")
+              curl -L --output "downloads/${filename}" "$url"
             else
-              FORMAT="bestvideo[height<=$QUALITY]+bestaudio/best[height<=$QUALITY]/best"
-            fi
+              if [[ "$QUALITY" == "best" ]]; then
+                FORMAT="bestvideo+bestaudio/best"
+              else
+                FORMAT="bestvideo[height<=$QUALITY]+bestaudio/best[height<=$QUALITY]/best"
+              fi
 
-            yt-dlp \
-              -f "$FORMAT" \
-              --merge-output-format mp4 \
-              --no-part \
-              --restrict-filenames \
-              -o "downloads/%(title).80s%(title|%(webpage_url_basename)s)s.%(ext)s" \
-              "$url"
+              yt-dlp \
+                -f "$FORMAT" \
+                --merge-output-format mp4 \
+                --no-part \
+                --restrict-filenames \
+                -o "downloads/%(title).80B.%(ext)s" \
+                "$url"
+            fi
 
           done < yt.txt
 
