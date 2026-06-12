@@ -14,3 +14,6 @@ ZIP_PASSWORD
 	  X265 720 crf 27 fast x2 = 164
 	  X265 720 crf 28 veryfast = 213
 	  source = 356
+
+	  
+** https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md
