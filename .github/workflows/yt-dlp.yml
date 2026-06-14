@@ -122,6 +122,7 @@ jobs:
               -show_entries stream=bit_rate \
               -of default=nk=1:nw=1 "$f" 2>/dev/null || echo "0")
             bitrate_raw=${bitrate_raw:-0}
+            [[ "$bitrate_raw" =~ ^[0-9]+$ ]] || bitrate_raw=0
             bitrate_k=$((bitrate_raw / 1000))
             echo "${res}|${bitrate_k}"
           }
@@ -165,6 +166,7 @@ jobs:
               "$file")
 
             bitrate=${bitrate:-0}
+            [[ "$bitrate" =~ ^[0-9]+$ ]] || bitrate=0
             bitrate_k=$((bitrate / 1000))
 
             if [[ "$bitrate_k" -lt 900 ]]; then
@@ -236,7 +238,6 @@ jobs:
               CRF_USED="29"
               ffmpeg -y \
                 -i "$file" \
-                -vf "scale=-2:540" \
                 -c:v libx265 \
                 -pix_fmt yuv420p10le \
                 -preset fast \
