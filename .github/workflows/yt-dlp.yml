@@ -169,13 +169,13 @@ jobs:
             [[ "$bitrate" =~ ^[0-9]+$ ]] || bitrate=0
             bitrate_k=$((bitrate / 1000))
 
-            if [[ "$bitrate_k" -lt 900 ]]; then
+            if [[ "$bitrate_k" -gt 0 && "$bitrate_k" -lt 900 ]]; then
               echo "Skipping encode (bitrate too low): $file"
               cp "$file" encoded/
               info_before=$(get_video_info "$file")
               res_before=$(echo "$info_before" | cut -d'|' -f1)
               echo "### \`${name}\`" >> "$STATS_FILE"
-              echo "- **Status:** Copied as-is (bitrate ${bitrate_k} kbps < 10 kbps threshold)" >> "$STATS_FILE"
+              echo "- **Status:** Copied as-is (bitrate ${bitrate_k} kbps < 900 kbps threshold)" >> "$STATS_FILE"
               echo "- **Resolution:** ${res_before}" >> "$STATS_FILE"
               echo "- **Video bitrate:** ${bitrate_k} kbps" >> "$STATS_FILE"
               echo "- **File size:** ${size_mb} MB" >> "$STATS_FILE"
