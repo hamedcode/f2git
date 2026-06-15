@@ -169,7 +169,7 @@ jobs:
             [[ "$bitrate" =~ ^[0-9]+$ ]] || bitrate=0
             bitrate_k=$((bitrate / 1000))
 
-            if [[ "$bitrate_k" -gt 0 && "$bitrate_k" -lt 900 ]]; then
+            if [[ "$bitrate_k" -gt 0 && "$bitrate_k" -lt 500 ]]; then
               echo "Skipping encode (bitrate too low): $file"
               cp "$file" encoded/
               info_before=$(get_video_info "$file")
