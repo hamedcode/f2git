@@ -34,21 +34,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            curl \
-            wget \
-            aria2 \
-            jq \
-            zip \
-            gh
+          sudo apt-get install -y curl aria2 zip jq gh
+
+      - name: Install Node + Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
 
       - name: Prepare folders
         run: |
-          mkdir -p downloads
-          mkdir -p grabbed
+          mkdir -p downloads grabbed
 
       - name: Read URLs from browser.txt
         run: |
@@ -56,132 +55,237 @@ jobs:
             echo "ERROR: browser.txt not found in repository root!"
             exit 1
           fi
-          echo "URLs found in browser.txt:"
+          echo "=== All URLs in browser.txt ==="
           cat browser.txt
-          # Filter only gofile.io URLs
           grep -E "gofile\.io" browser.txt > grabbed/gofile_urls.txt || true
-          echo "--- Gofile URLs ---"
-          cat grabbed/gofile_urls.txt
+          echo "=== Gofile URLs ==="
+          cat grabbed/gofile_urls.txt || echo "(none)"
 
-      - name: Fetch Gofile download links via API
+      - name: Browse Gofile and extract download links
         run: |
-          python3 << 'PYEOF'
-          import re
-          import sys
-          import json
-          import urllib.request
-          import urllib.error
+          cat > gofile_grab.js << 'EOF'
+          const fs = require('fs');
+          const { chromium } = require('playwright');
 
-          def api_get(url, token=None):
-              req = urllib.request.Request(url)
-              req.add_header("User-Agent", "Mozilla/5.0")
-              if token:
-                  req.add_header("Authorization", f"Bearer {token}")
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      return json.loads(r.read().decode())
-              except Exception as e:
-                  print(f"  [API ERROR] {url} -> {e}")
-                  return None
+          (async () => {
 
-          # Step 1: Get a guest token from Gofile
-          print("[*] Getting guest token...")
-          resp = api_get("https://api.gofile.io/accounts")
-          if not resp or resp.get("status") != "ok":
-              print("[!] Could not get guest token. Response:", resp)
-              sys.exit(1)
+            const urlsFile = 'grabbed/gofile_urls.txt';
+            if (!fs.existsSync(urlsFile)) {
+              console.log('No Gofile URLs file found.');
+              process.exit(1);
+            }
 
-          token = resp["data"]["token"]
-          print(f"[+] Token: {token[:8]}...")
+            const urls = fs.readFileSync(urlsFile, 'utf8')
+              .split('\n').map(l => l.trim()).filter(Boolean);
 
-          # Step 2: Read gofile URLs
-          with open("grabbed/gofile_urls.txt", "r") as f:
-              urls = [u.strip() for u in f if u.strip()]
+            if (urls.length === 0) {
+              console.log('No gofile.io links found in browser.txt');
+              process.exit(1);
+            }
 
-          if not urls:
-              print("[!] No Gofile URLs found in grabbed/gofile_urls.txt")
-              sys.exit(1)
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-blink-features=AutomationControlled']
+            });
 
-          results = []
+            const context = await browser.newContext({
+              userAgent:
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                'Chrome/124.0.0.0 Safari/537.36',
+              locale: 'en-US',
+              timezoneId: 'America/New_York',
+              viewport: { width: 1280, height: 800 },
+              extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
+            });
 
-          for page_url in urls:
-              print(f"\n[*] Processing: {page_url}")
+            // hide automation flag
+            await context.addInitScript(() => {
+              Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            });
 
-              # Extract content ID from URL
-              # Supports: https://gofile.io/d/XXXXXX
-              m = re.search(r"gofile\.io/d/([A-Za-z0-9]+)", page_url)
-              if not m:
-                  print(f"  [!] Could not extract content ID from: {page_url}")
-                  continue
+            const results = [];
 
-              content_id = m.group(1)
-              print(f"  [+] Content ID: {content_id}")
+            for (const pageUrl of urls) {
+              console.log('\n========================================');
+              console.log('OPENING:', pageUrl);
+              console.log('========================================');
 
-              # Step 3: Get content info
-              api_url = f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6&cache=true"
-              data = api_get(api_url, token=token)
+              const page = await context.newPage();
 
-              if not data or data.get("status") != "ok":
-                  print(f"  [!] API error: {data}")
-                  continue
+              let accountToken = '';
+              const fileLinks = [];
 
-              content = data["data"]
-              content_type = content.get("type", "")
+              // intercept every network response
+              page.on('response', async (response) => {
+                try {
+                  const url = response.url();
 
-              print(f"  [+] Content type: {content_type}")
-              print(f"  [+] Content name: {content.get('name','unknown')}")
+                  // grab guest token from accounts endpoint
+                  if (url.includes('api.gofile.io/accounts')) {
+                    try {
+                      const body = await response.json();
+                      if (body?.data?.token) {
+                        accountToken = body.data.token;
+                        console.log('  [TOKEN] captured:', accountToken.slice(0, 8) + '...');
+                      }
+                    } catch (_) {}
+                  }
 
-              def extract_files(node, depth=0):
-                  """Recursively extract files from Gofile content tree."""
-                  files = []
-                  if node.get("type") == "file":
-                      link = node.get("link", "")
-                      name = node.get("name", "file")
-                      size = node.get("size", 0)
-                      mime = node.get("mimetype", "")
-                      if link:
-                          files.append({
-                              "name": name,
-                              "link": link,
-                              "size": size,
-                              "mime": mime
-                          })
-                  elif node.get("type") == "folder":
-                      children = node.get("children", {})
-                      if isinstance(children, dict):
-                          for child in children.values():
-                              files.extend(extract_files(child, depth+1))
-                  return files
+                  // grab file list from contents endpoint
+                  if (url.includes('api.gofile.io/contents')) {
+                    try {
+                      const body = await response.json();
+                      if (body?.status === 'ok') {
+                        const walk = (node) => {
+                          if (!node) return;
+                          if (node.type === 'file' && node.link) {
+                            fileLinks.push({ name: node.name, url: node.link });
+                            console.log('  [FILE]', node.name);
+                          }
+                          const ch = node.children;
+                          if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
+                        };
+                        walk(body.data);
+                      }
+                    } catch (_) {}
+                  }
 
-              found_files = extract_files(content)
+                  // also catch direct mp4/mkv/zip URLs that appear in network
+                  if (/\.(mp4|mkv|avi|mov|zip|rar)(\?|$)/i.test(url)) {
+                    const name = url.split('/').pop().split('?')[0] || 'file';
+                    if (!fileLinks.find(f => f.url === url)) {
+                      fileLinks.push({ name, url });
+                      console.log('  [DIRECT URL]', name);
+                    }
+                  }
 
-              if not found_files:
-                  print("  [!] No files found in this content.")
-                  continue
+                } catch (_) {}
+              });
 
-              for f in found_files:
-                  size_mb = f["size"] / (1024*1024) if f["size"] else 0
-                  print(f"  [FILE] {f['name']} | {size_mb:.1f} MB | {f['link']}")
-                  results.append({
-                      "name": f["name"],
-                      "link": f["link"],
-                      "size": f["size"],
-                      "mime": f["mime"],
-                      "token": token
-                  })
+              try {
+                await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 90000 });
+                await page.waitForTimeout(8000);
 
-          if not results:
-              print("\n[!] No downloadable files found.")
-              sys.exit(1)
+                // wait for any download button to appear
+                try {
+                  await page.waitForSelector(
+                    '[class*="download"i], [id*="download"i], a[href*="/download/"]',
+                    { timeout: 12000 }
+                  );
+                } catch (_) {}
 
-          # Write final links
-          with open("grabbed/final_links.txt", "w") as out:
-              for item in results:
-                  # format: name|||link|||token
-                  out.write(f"{item['name']}|||{item['link']}|||{item['token']}\n")
+                await page.waitForTimeout(3000);
 
-          print(f"\n[+] Saved {len(results)} file(s) to grabbed/final_links.txt")
-          PYEOF
+              } catch (e) {
+                console.log('  [PAGE ERROR]', e.message);
+              }
+
+              // ── fallback: call API from inside the page with the real cookies/token ──
+              if (fileLinks.length === 0) {
+                console.log('  [FALLBACK] Calling Gofile API from inside the page context...');
+                const m = pageUrl.match(/gofile\.io\/d\/([A-Za-z0-9]+)/);
+                if (m) {
+                  const contentId = m[1];
+                  try {
+                    const apiResult = await page.evaluate(async ({ contentId, token }) => {
+                      // first get a fresh token if we don't have one
+                      let useToken = token;
+                      if (!useToken) {
+                        const accResp = await fetch('https://api.gofile.io/accounts', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' }
+                        });
+                        const accData = await accResp.json();
+                        useToken = accData?.data?.token || '';
+                      }
+
+                      const r = await fetch(
+                        `https://api.gofile.io/contents/${contentId}?wt=4fd6sg89d7s6&cache=true`,
+                        { headers: { 'Authorization': `Bearer ${useToken}` } }
+                      );
+                      const data = await r.json();
+                      return { data, token: useToken };
+                    }, { contentId, token: accountToken });
+
+                    if (apiResult?.token) accountToken = apiResult.token;
+
+                    const body = apiResult?.data;
+                    if (body?.status === 'ok') {
+                      const walk = (node) => {
+                        if (!node) return;
+                        if (node.type === 'file' && node.link) {
+                          fileLinks.push({ name: node.name, url: node.link });
+                          console.log('  [FILE via fallback]', node.name);
+                        }
+                        const ch = node.children;
+                        if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
+                      };
+                      walk(body.data);
+                    } else {
+                      console.log('  [FALLBACK API response]', JSON.stringify(body)?.slice(0, 200));
+                    }
+                  } catch (e) {
+                    console.log('  [FALLBACK ERROR]', e.message);
+                  }
+                }
+              }
+
+              // ── fallback 2: scrape any <a> links on the page ──
+              if (fileLinks.length === 0) {
+                console.log('  [FALLBACK2] Scraping page links...');
+                try {
+                  const hrefs = await page.evaluate(() =>
+                    Array.from(document.querySelectorAll('a[href]'))
+                      .map(a => ({ href: a.href, text: (a.textContent || '').trim() }))
+                      .filter(a =>
+                        a.href.includes('/download/') ||
+                        /\.(mp4|mkv|avi|mov|zip|rar)/i.test(a.href)
+                      )
+                  );
+                  for (const h of hrefs) {
+                    const name = h.text || h.href.split('/').pop().split('?')[0] || 'file';
+                    fileLinks.push({ name, url: h.href });
+                    console.log('  [SCRAPED]', name);
+                  }
+                } catch (e) {
+                  console.log('  [FALLBACK2 ERROR]', e.message);
+                }
+              }
+
+              const cookies = await context.cookies();
+              const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+              for (const fl of fileLinks) {
+                results.push({ name: fl.name, url: fl.url, token: accountToken, cookie: cookieStr });
+              }
+
+              await page.close();
+            }
+
+            await browser.close();
+
+            if (results.length === 0) {
+              console.log('\n[!] No downloadable files found!');
+              process.exit(1);
+            }
+
+            fs.writeFileSync(
+              'grabbed/final_links.txt',
+              results.map(r => `${r.name}|||${r.url}|||${r.token}|||${r.cookie}`).join('\n') + '\n'
+            );
+
+            console.log(`\n[+] Saved ${results.length} file(s) to grabbed/final_links.txt`);
+
+          })();
+          EOF
+
+          node gofile_grab.js
+
+      - name: Show grabbed links
+        run: |
+          echo "=== Final links ==="
+          awk -F'\|\|\|' '{print NR". "$1" -> "substr($2,1,80)"..."}' grabbed/final_links.txt
 
       - name: Download files
         run: |
@@ -195,85 +299,78 @@ jobs:
           while IFS= read -r entry; do
             [ -z "$entry" ] && continue
 
-            # Parse: name|||link|||token
-            name=$(echo "$entry"   | awk -F'\\|\\|\\|' '{print $1}')
-            url=$(echo "$entry"    | awk -F'\\|\\|\\|' '{print $2}')
-            token=$(echo "$entry"  | awk -F'\\|\\|\\|' '{print $3}')
+            name=$(  echo "$entry" | awk -F'\|\|\|' '{print $1}')
+            url=$(   echo "$entry" | awk -F'\|\|\|' '{print $2}')
+            token=$( echo "$entry" | awk -F'\|\|\|' '{print $3}')
+            cookie=$(echo "$entry" | awk -F'\|\|\|' '{print $4}')
 
-            # Sanitize filename
             safe_name=$(echo "$name" \
               | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
               | sed 's/[_ ]\+/_/g' \
               | sed 's/^_//;s/_$//' \
               | cut -c1-120)
-
             [ -z "$safe_name" ] && safe_name="file_${counter}"
 
             echo ""
             echo "========================================"
-            echo "DOWNLOADING : $name"
-            echo "URL         : $url"
-            echo "SAVE AS     : downloads/$safe_name"
+            echo "FILE    : $name"
+            echo "SAVE AS : downloads/$safe_name"
             echo "========================================"
 
-            # Try aria2c first with Authorization header
-            aria2c \
-              -x 16 -s 16 -k 1M \
-              -c \
+            HEADERS=(
+              "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+              "--header=Accept: */*"
+              "--header=Referer: https://gofile.io/"
+            )
+            [ -n "$token"  ] && HEADERS+=("--header=Authorization: Bearer ${token}")
+            [ -n "$cookie" ] && HEADERS+=("--header=Cookie: ${cookie}")
+
+            aria2c -x 16 -s 16 -k 1M -c \
               --summary-interval=0 \
               --download-result=hide \
               --console-log-level=warn \
-              --header="Authorization: Bearer ${token}" \
-              --header="User-Agent: Mozilla/5.0" \
+              "${HEADERS[@]}" \
               --dir=downloads \
               --out="${safe_name}" \
               "$url"
 
-            result=$?
-
-            if [ $result -ne 0 ]; then
-              echo "[CURL FALLBACK] aria2 failed, trying curl..."
-              curl -L \
-                --retry 5 \
-                --connect-timeout 30 \
-                -A "Mozilla/5.0" \
-                -H "Authorization: Bearer ${token}" \
+            if [ $? -ne 0 ]; then
+              echo "[CURL FALLBACK]"
+              curl -L --retry 5 --connect-timeout 30 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+                -H "Referer: https://gofile.io/" \
+                $( [ -n "$token"  ] && echo "-H 'Authorization: Bearer ${token}'" ) \
+                $( [ -n "$cookie" ] && echo "-H 'Cookie: ${cookie}'" ) \
                 -o "downloads/${safe_name}" \
                 "$url"
             fi
 
             counter=$((counter + 1))
-
           done < grabbed/final_links.txt
 
           echo ""
           echo "=== Downloaded files ==="
           ls -lh downloads/
 
-      - name: Create ZIP (if zip mode)
+      - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
         run: |
           ts=$(date +"%Y%m%d_%H%M%S")
-          zip -r \
-            -P "${{ secrets.ZIP_PASSWORD }}" \
-            "gofile_media_${ts}.zip" \
-            downloads/
-          echo "ZIP created:"
-          ls -lh *.zip
+          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "gofile_media_${ts}.zip" downloads/
 
       - name: Delete old releases
         if: github.event.inputs.delete_old_releases == 'yes'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          releases=$(gh release list --limit 100 --json tagName -q '.[].tagName' 2>/dev/null || true)
-          for tag in $releases; do
-            echo "Deleting release: $tag"
-            gh release delete "$tag" --yes || true
+          tags=$(gh release list --limit 100 --json tagName -q '.[].tagName' 2>/dev/null || true)
+          for tag in $tags; do
+            echo "Deleting: $tag"
+            gh release delete "$tag" --yes 2>/dev/null || true
             git push --delete origin "$tag" 2>/dev/null || true
           done
 
-      - name: Upload to Release (direct)
+      - name: Upload Release (direct)
         if: github.event.inputs.upload_mode == 'direct'
         uses: softprops/action-gh-release@v2
         with:
@@ -281,12 +378,12 @@ jobs:
           name: "Gofile Download #${{ github.run_number }}"
           body: |
             Downloaded from Gofile links in `browser.txt`
-            Run: ${{ github.run_number }}
+            Run: #${{ github.run_number }}
           files: downloads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload to Release (zip)
+      - name: Upload Release (zip)
         if: github.event.inputs.upload_mode == 'zip'
         uses: softprops/action-gh-release@v2
         with:
@@ -294,7 +391,7 @@ jobs:
           name: "Gofile Download #${{ github.run_number }}"
           body: |
             Downloaded from Gofile links in `browser.txt`
-            Run: ${{ github.run_number }}
+            Run: #${{ github.run_number }}
           files: "*.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
