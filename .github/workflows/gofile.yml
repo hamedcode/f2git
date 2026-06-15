@@ -3,8 +3,23 @@ name: Gofile Downloader
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        default: "scan"
+        type: choice
+        options:
+          - "scan"
+          - "download"
+
+      file_selection:
+        description: "Files to download — run 'scan' first to see the list, then enter numbers like: 1,3 or 'all'"
+        required: false
+        default: "all"
+        type: string
+
       upload_mode:
-        description: "Upload mode"
+        description: "Upload mode (only used in download action)"
         required: true
         default: "direct"
         type: choice
@@ -12,29 +27,194 @@ on:
           - "direct"
           - "zip"
 
-      delete_old_releases:
-        description: "Delete old releases?"
-        required: true
-        default: "yes"
-        type: choice
-        options:
-          - "yes"
-          - "no"
-
 permissions:
   contents: write
 
 jobs:
-  gofile-download:
+  # ══════════════════════════════════════════════════
+  #  JOB 1 — SCAN: list files without downloading
+  # ══════════════════════════════════════════════════
+  scan:
+    if: github.event.inputs.action == 'scan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node + Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Prepare folders
+        run: mkdir -p grabbed
+
+      - name: Read URLs from browser.txt
+        run: |
+          if [ ! -f browser.txt ]; then
+            echo "ERROR: browser.txt not found!"
+            exit 1
+          fi
+          grep -E "gofile\.io" browser.txt > grabbed/gofile_urls.txt || true
+          if [ ! -s grabbed/gofile_urls.txt ]; then
+            echo "ERROR: No gofile.io URLs found in browser.txt"
+            exit 1
+          fi
+          echo "URLs to scan:"
+          cat grabbed/gofile_urls.txt
+
+      - name: Scan Gofile and list files
+        run: |
+          cat > gofile_scan.js << 'EOF'
+          const fs = require('fs');
+          const { chromium } = require('playwright');
+
+          (async () => {
+            const urls = fs.readFileSync('grabbed/gofile_urls.txt', 'utf8')
+              .split('\n').map(l => l.trim()).filter(Boolean);
+
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-blink-features=AutomationControlled']
+            });
+
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              locale: 'en-US',
+              timezoneId: 'America/New_York',
+              viewport: { width: 1280, height: 800 },
+              extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
+            });
+
+            await context.addInitScript(() => {
+              Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            });
+
+            const allFiles = [];
+
+            for (const pageUrl of urls) {
+              console.log('\nScanning:', pageUrl);
+              const page = await context.newPage();
+              let accountToken = '';
+              const fileLinks = [];
+
+              page.on('response', async (response) => {
+                try {
+                  const url = response.url();
+                  if (url.includes('api.gofile.io/accounts')) {
+                    try {
+                      const body = await response.json();
+                      if (body?.data?.token) accountToken = body.data.token;
+                    } catch (_) {}
+                  }
+                  if (url.includes('api.gofile.io/contents')) {
+                    try {
+                      const body = await response.json();
+                      if (body?.status === 'ok') {
+                        const walk = (node) => {
+                          if (!node) return;
+                          if (node.type === 'file' && node.link) {
+                            fileLinks.push({
+                              name: node.name,
+                              url: node.link,
+                              size: node.size || 0,
+                              mimetype: node.mimetype || ''
+                            });
+                          }
+                          const ch = node.children;
+                          if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
+                        };
+                        walk(body.data);
+                      }
+                    } catch (_) {}
+                  }
+                } catch (_) {}
+              });
+
+              try {
+                await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 90000 });
+                await page.waitForTimeout(8000);
+                try {
+                  await page.waitForSelector('[class*="download"i],[id*="download"i]', { timeout: 12000 });
+                } catch (_) {}
+                await page.waitForTimeout(3000);
+              } catch (e) {
+                console.log('Page error:', e.message);
+              }
+
+              const cookies = await context.cookies();
+              const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+              for (const fl of fileLinks) {
+                allFiles.push({ ...fl, token: accountToken, cookie: cookieStr, source: pageUrl });
+              }
+              await page.close();
+            }
+
+            await browser.close();
+
+            if (allFiles.length === 0) {
+              console.log('No files found!');
+              process.exit(1);
+            }
+
+            fs.writeFileSync('grabbed/final_links.json', JSON.stringify(allFiles, null, 2));
+            console.log(`\nFound ${allFiles.length} file(s).`);
+          })();
+          EOF
+
+          node gofile_scan.js
+
+      - name: Print file list for selection
+        run: |
+          python3 << 'PYEOF'
+          import json
+
+          with open('grabbed/final_links.json') as f:
+              items = json.load(f)
+
+          print('\n' + '='*60)
+          print('  FILES FOUND — copy numbers to use in download step')
+          print('='*60)
+          for i, item in enumerate(items, 1):
+              size_mb = item.get('size', 0) / (1024*1024)
+              size_gb = size_mb / 1024
+              if size_gb >= 1:
+                  size_str = f'{size_gb:.2f} GB'
+              else:
+                  size_str = f'{size_mb:.1f} MB'
+              print(f'  [{i}] {item["name"]}  ({size_str})')
+          print('='*60)
+          print(f'\n  Total: {len(items)} file(s)')
+          print('\n  HOW TO DOWNLOAD:')
+          print('  - All files  → run "download" action with selection: all')
+          print('  - Some files → run "download" action with selection: 1,3  (or any numbers)')
+          print('='*60)
+          PYEOF
+
+      - name: Upload scan result as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gofile-scan-result
+          path: grabbed/final_links.json
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════
+  #  JOB 2 — DOWNLOAD: download selected files
+  # ══════════════════════════════════════════════════
+  download:
+    if: github.event.inputs.action == 'download'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl aria2 zip jq gh
@@ -46,42 +226,40 @@ jobs:
           npx playwright install chromium --with-deps
 
       - name: Prepare folders
-        run: |
-          mkdir -p downloads grabbed
+        run: mkdir -p downloads grabbed
 
-      - name: Read URLs from browser.txt
+      - name: Download scan artifact (if exists from previous scan)
+        uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
+        with:
+          name: gofile-scan-result
+          path: grabbed/
+          workflow: ${{ github.workflow }}
+          if_no_artifact_found: ignore
+
+      - name: Re-scan if no artifact found
         run: |
+          if [ -f grabbed/final_links.json ]; then
+            echo "Using existing scan result."
+            exit 0
+          fi
+
+          echo "No scan artifact found — running fresh scan..."
+
           if [ ! -f browser.txt ]; then
-            echo "ERROR: browser.txt not found in repository root!"
+            echo "ERROR: browser.txt not found!"
             exit 1
           fi
-          echo "=== All URLs in browser.txt ==="
-          cat browser.txt
-          grep -E "gofile\.io" browser.txt > grabbed/gofile_urls.txt || true
-          echo "=== Gofile URLs ==="
-          cat grabbed/gofile_urls.txt || echo "(none)"
 
-      - name: Browse Gofile and extract download links
-        run: |
-          cat > gofile_grab.js << 'EOF'
+          grep -E "gofile\.io" browser.txt > grabbed/gofile_urls.txt || true
+
+          cat > gofile_scan.js << 'EOF'
           const fs = require('fs');
           const { chromium } = require('playwright');
 
           (async () => {
-
-            const urlsFile = 'grabbed/gofile_urls.txt';
-            if (!fs.existsSync(urlsFile)) {
-              console.log('No Gofile URLs file found.');
-              process.exit(1);
-            }
-
-            const urls = fs.readFileSync(urlsFile, 'utf8')
+            const urls = fs.readFileSync('grabbed/gofile_urls.txt', 'utf8')
               .split('\n').map(l => l.trim()).filter(Boolean);
-
-            if (urls.length === 0) {
-              console.log('No gofile.io links found in browser.txt');
-              process.exit(1);
-            }
 
             const browser = await chromium.launch({
               headless: true,
@@ -89,10 +267,7 @@ jobs:
             });
 
             const context = await browser.newContext({
-              userAgent:
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                'Chrome/124.0.0.0 Safari/537.36',
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
               locale: 'en-US',
               timezoneId: 'America/New_York',
               viewport: { width: 1280, height: 800 },
@@ -103,32 +278,23 @@ jobs:
               Object.defineProperty(navigator, 'webdriver', { get: () => false });
             });
 
-            const results = [];
+            const allFiles = [];
 
             for (const pageUrl of urls) {
-              console.log('\n========================================');
-              console.log('OPENING:', pageUrl);
-              console.log('========================================');
-
+              console.log('Scanning:', pageUrl);
               const page = await context.newPage();
-
               let accountToken = '';
               const fileLinks = [];
 
               page.on('response', async (response) => {
                 try {
                   const url = response.url();
-
                   if (url.includes('api.gofile.io/accounts')) {
                     try {
                       const body = await response.json();
-                      if (body?.data?.token) {
-                        accountToken = body.data.token;
-                        console.log('  [TOKEN] captured:', accountToken.slice(0, 8) + '...');
-                      }
+                      if (body?.data?.token) accountToken = body.data.token;
                     } catch (_) {}
                   }
-
                   if (url.includes('api.gofile.io/contents')) {
                     try {
                       const body = await response.json();
@@ -136,8 +302,12 @@ jobs:
                         const walk = (node) => {
                           if (!node) return;
                           if (node.type === 'file' && node.link) {
-                            fileLinks.push({ name: node.name, url: node.link });
-                            console.log('  [FILE]', node.name);
+                            fileLinks.push({
+                              name: node.name,
+                              url: node.link,
+                              size: node.size || 0,
+                              mimetype: node.mimetype || ''
+                            });
                           }
                           const ch = node.children;
                           if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
@@ -146,7 +316,6 @@ jobs:
                       }
                     } catch (_) {}
                   }
-
                 } catch (_) {}
               });
 
@@ -154,107 +323,86 @@ jobs:
                 await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 90000 });
                 await page.waitForTimeout(8000);
                 try {
-                  await page.waitForSelector(
-                    '[class*="download"i], [id*="download"i], a[href*="/download/"]',
-                    { timeout: 12000 }
-                  );
+                  await page.waitForSelector('[class*="download"i],[id*="download"i]', { timeout: 12000 });
                 } catch (_) {}
                 await page.waitForTimeout(3000);
               } catch (e) {
-                console.log('  [PAGE ERROR]', e.message);
-              }
-
-              // fallback: call API from inside page context
-              if (fileLinks.length === 0) {
-                console.log('  [FALLBACK] Calling API from inside page context...');
-                const m = pageUrl.match(/gofile\.io\/d\/([A-Za-z0-9]+)/);
-                if (m) {
-                  try {
-                    const apiResult = await page.evaluate(async ({ contentId, token }) => {
-                      let useToken = token;
-                      if (!useToken) {
-                        const accResp = await fetch('https://api.gofile.io/accounts', {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' }
-                        });
-                        const accData = await accResp.json();
-                        useToken = accData?.data?.token || '';
-                      }
-                      const r = await fetch(
-                        `https://api.gofile.io/contents/${contentId}?wt=4fd6sg89d7s6&cache=true`,
-                        { headers: { 'Authorization': `Bearer ${useToken}` } }
-                      );
-                      return { data: await r.json(), token: useToken };
-                    }, { contentId: m[1], token: accountToken });
-
-                    if (apiResult?.token) accountToken = apiResult.token;
-                    const body = apiResult?.data;
-                    if (body?.status === 'ok') {
-                      const walk = (node) => {
-                        if (!node) return;
-                        if (node.type === 'file' && node.link) {
-                          fileLinks.push({ name: node.name, url: node.link });
-                          console.log('  [FILE via fallback]', node.name);
-                        }
-                        const ch = node.children;
-                        if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
-                      };
-                      walk(body.data);
-                    }
-                  } catch (e) {
-                    console.log('  [FALLBACK ERROR]', e.message);
-                  }
-                }
+                console.log('Page error:', e.message);
               }
 
               const cookies = await context.cookies();
               const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
               for (const fl of fileLinks) {
-                results.push({ name: fl.name, url: fl.url, token: accountToken, cookie: cookieStr });
+                allFiles.push({ ...fl, token: accountToken, cookie: cookieStr, source: pageUrl });
               }
-
               await page.close();
             }
 
             await browser.close();
 
-            if (results.length === 0) {
-              console.log('\n[!] No downloadable files found!');
+            if (allFiles.length === 0) {
+              console.log('No files found!');
               process.exit(1);
             }
 
-            // Write as JSON - no delimiter issues
-            fs.writeFileSync('grabbed/final_links.json', JSON.stringify(results, null, 2));
-            console.log(`\n[+] Saved ${results.length} file(s) to grabbed/final_links.json`);
-
+            fs.writeFileSync('grabbed/final_links.json', JSON.stringify(allFiles, null, 2));
+            console.log(`Found ${allFiles.length} file(s).`);
           })();
           EOF
 
-          node gofile_grab.js
+          node gofile_scan.js
 
-      - name: Show grabbed links
-        run: |
-          echo "=== Final links ==="
-          python3 -c "
-          import json
-          with open('grabbed/final_links.json') as f:
-              items = json.load(f)
-          for i, item in enumerate(items, 1):
-              print(f'{i}. {item[\"name\"]} -> {item[\"url\"][:80]}...')
-          "
-
-      - name: Download files
+      - name: Filter and download selected files
         run: |
           python3 << 'PYEOF'
-          import json, os, subprocess, sys
+          import json, os, re, subprocess, sys
+
+          selection = "${{ github.event.inputs.file_selection }}".strip().lower()
 
           with open('grabbed/final_links.json') as f:
-              items = json.load(f)
+              all_items = json.load(f)
 
-          if not items:
-              print('No files to download.')
+          print('\n' + '='*60)
+          print('  ALL AVAILABLE FILES')
+          print('='*60)
+          for i, item in enumerate(all_items, 1):
+              size_mb = item.get('size', 0) / (1024*1024)
+              size_gb = size_mb / 1024
+              size_str = f'{size_gb:.2f} GB' if size_gb >= 1 else f'{size_mb:.1f} MB'
+              print(f'  [{i}] {item["name"]}  ({size_str})')
+          print('='*60)
+
+          # parse selection
+          if selection in ('all', '', '*'):
+              selected = list(range(len(all_items)))
+              print(f'\n  Selection: ALL ({len(all_items)} files)')
+          else:
+              indices = []
+              for part in selection.split(','):
+                  part = part.strip()
+                  if part.isdigit():
+                      idx = int(part) - 1
+                      if 0 <= idx < len(all_items):
+                          indices.append(idx)
+                      else:
+                          print(f'  WARNING: [{part}] is out of range, skipping.')
+                  else:
+                      print(f'  WARNING: "{part}" is not a valid number, skipping.')
+              selected = indices
+              print(f'\n  Selection: {[i+1 for i in selected]}')
+
+          if not selected:
+              print('No valid files selected!')
               sys.exit(1)
+
+          items = [all_items[i] for i in selected]
+
+          print('\n  Files to download:')
+          for item in items:
+              size_mb = item.get('size', 0) / (1024*1024)
+              size_gb = size_mb / 1024
+              size_str = f'{size_gb:.2f} GB' if size_gb >= 1 else f'{size_mb:.1f} MB'
+              print(f'    - {item["name"]}  ({size_str})')
 
           os.makedirs('downloads', exist_ok=True)
 
@@ -264,8 +412,6 @@ jobs:
               token  = item.get('token', '')
               cookie = item.get('cookie', '')
 
-              # sanitize filename
-              import re
               safe = re.sub(r'[^a-zA-Z0-9 ._-]', '_', name)
               safe = re.sub(r'[\s_]+', '_', safe).strip('_')[:120]
               if not safe:
@@ -274,9 +420,10 @@ jobs:
               out_path = f'downloads/{safe}'
 
               print(f'\n{"="*50}')
-              print(f'FILE    : {name}')
-              print(f'SAVE AS : {out_path}')
-              print(f'URL     : {url[:80]}...')
+              print(f'  Downloading [{i}/{len(items)}]: {name}')
+              size_mb = item.get('size', 0) / (1024*1024)
+              size_gb = size_mb / 1024
+              print(f'  Size: {f"{size_gb:.2f} GB" if size_gb >= 1 else f"{size_mb:.1f} MB"}')
               print('='*50)
 
               headers = [
@@ -291,9 +438,8 @@ jobs:
 
               cmd = [
                   'aria2c',
-                  '-x', '16', '-s', '16', '-k', '1M',
-                  '-c',
-                  '--summary-interval=0',
+                  '-x', '16', '-s', '16', '-k', '1M', '-c',
+                  '--summary-interval=30',
                   '--download-result=hide',
                   '--console-log-level=warn',
                   *headers,
@@ -305,7 +451,7 @@ jobs:
               result = subprocess.run(cmd)
 
               if result.returncode != 0:
-                  print('[CURL FALLBACK]')
+                  print('  [CURL FALLBACK]')
                   curl_cmd = [
                       'curl', '-L', '--retry', '5', '--connect-timeout', '30',
                       '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -320,9 +466,12 @@ jobs:
                   subprocess.run(curl_cmd)
 
           print('\n=== Downloaded files ===')
-          for f in os.listdir('downloads'):
-              size = os.path.getsize(f'downloads/{f}')
-              print(f'  {f}  ({size/1024/1024:.1f} MB)')
+          for fn in os.listdir('downloads'):
+              size = os.path.getsize(f'downloads/{fn}')
+              size_mb = size / (1024*1024)
+              size_gb = size_mb / 1024
+              size_str = f'{size_gb:.2f} GB' if size_gb >= 1 else f'{size_mb:.1f} MB'
+              print(f'  {fn}  ({size_str})')
           PYEOF
 
       - name: Create ZIP
@@ -330,18 +479,6 @@ jobs:
         run: |
           ts=$(date +"%Y%m%d_%H%M%S")
           zip -r -P "${{ secrets.ZIP_PASSWORD }}" "gofile_media_${ts}.zip" downloads/
-
-      - name: Delete old releases
-        if: github.event.inputs.delete_old_releases == 'yes'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tags=$(gh release list --limit 100 --json tagName -q '.[].tagName' 2>/dev/null || true)
-          for tag in $tags; do
-            echo "Deleting: $tag"
-            gh release delete "$tag" --yes 2>/dev/null || true
-            git push --delete origin "$tag" 2>/dev/null || true
-          done
 
       - name: Upload Release (direct)
         if: github.event.inputs.upload_mode == 'direct'
@@ -351,6 +488,7 @@ jobs:
           name: "Gofile Download #${{ github.run_number }}"
           body: |
             Downloaded from Gofile links in `browser.txt`
+            Selection: `${{ github.event.inputs.file_selection }}`
             Run: #${{ github.run_number }}
           files: downloads/*
         env:
@@ -364,6 +502,7 @@ jobs:
           name: "Gofile Download #${{ github.run_number }}"
           body: |
             Downloaded from Gofile links in `browser.txt`
+            Selection: `${{ github.event.inputs.file_selection }}`
             Run: #${{ github.run_number }}
           files: "*.zip"
         env:
