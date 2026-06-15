@@ -148,38 +148,25 @@ jobs:
                 console.log('Page error:', e.message);
               }
 
-              // Save cookies as a jar file (Netscape format) for aria2c/curl
               const cookies = await context.cookies();
               const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-              // Build Netscape cookie jar
               let cookieJar = '# Netscape HTTP Cookie File\n';
               for (const c of cookies) {
-                const domain   = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
-                const flag     = 'TRUE';
-                const path     = c.path || '/';
-                const secure   = c.secure ? 'TRUE' : 'FALSE';
-                const expires  = c.expires && c.expires > 0 ? Math.floor(c.expires) : 0;
-                const name     = c.name;
-                const value    = c.value;
-                cookieJar += `${domain}\t${flag}\t${path}\t${secure}\t${expires}\t${name}\t${value}\n`;
+                const domain  = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
+                const path    = c.path || '/';
+                const secure  = c.secure ? 'TRUE' : 'FALSE';
+                const expires = c.expires && c.expires > 0 ? Math.floor(c.expires) : 0;
+                cookieJar += `${domain}\tTRUE\t${path}\t${secure}\t${expires}\t${c.name}\t${c.value}\n`;
               }
-
-              // also add accountToken as cookie explicitly
               if (accountToken) {
                 cookieJar += `.gofile.io\tTRUE\t/\tFALSE\t0\taccountToken\t${accountToken}\n`;
               }
 
               for (const fl of fileLinks) {
                 allFiles.push({
-                  name:      fl.name,
-                  url:       fl.url,
-                  size:      fl.size,
-                  mimetype:  fl.mimetype,
-                  token:     accountToken,
-                  cookieStr: cookieStr,
-                  cookieJar: cookieJar,
-                  source:    pageUrl
+                  name: fl.name, url: fl.url, size: fl.size,
+                  mimetype: fl.mimetype, token: accountToken,
+                  cookieStr, cookieJar, source: pageUrl
                 });
               }
               await page.close();
@@ -203,16 +190,22 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import json
+          LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB
+
           with open('grabbed/final_links.json') as f:
               items = json.load(f)
+
+          def size_str(b):
+              mb = b / (1024*1024)
+              return f'{mb/1024:.2f} GB' if mb >= 1024 else f'{mb:.1f} MB'
+
           print('\n' + '='*60)
           print('  FILES FOUND')
           print('='*60)
           for i, item in enumerate(items, 1):
-              size_mb = item.get('size', 0) / (1024*1024)
-              size_gb = size_mb / 1024
-              size_str = f'{size_gb:.2f} GB' if size_gb >= 1 else f'{size_mb:.1f} MB'
-              print(f'  [{i}] {item["name"]}  ({size_str})')
+              sz = item.get('size', 0)
+              note = '  ⚠ will be split (>2GB)' if sz > LIMIT else ''
+              print(f'  [{i}] {item["name"]}  ({size_str(sz)}){note}')
           print('='*60)
           print(f'\n  Total: {len(items)} file(s)')
           print('\n  HOW TO DOWNLOAD:')
@@ -243,7 +236,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl aria2 zip jq gh
+          sudo apt-get install -y curl aria2 zip jq gh ffmpeg
 
       - name: Install Node + Playwright
         run: |
@@ -252,7 +245,7 @@ jobs:
           npx playwright install chromium --with-deps
 
       - name: Prepare folders
-        run: mkdir -p downloads grabbed
+        run: mkdir -p downloads grabbed upload_ready
 
       - name: Download scan artifact
         uses: dawidd6/action-download-artifact@v3
@@ -275,46 +268,27 @@ jobs:
           cat > gofile_scan.js << 'EOF'
           const fs = require('fs');
           const { chromium } = require('playwright');
-
           (async () => {
             const urls = fs.readFileSync('grabbed/gofile_urls.txt', 'utf8')
               .split('\n').map(l => l.trim()).filter(Boolean);
-
-            const browser = await chromium.launch({
-              headless: true,
-              args: ['--no-sandbox', '--disable-blink-features=AutomationControlled']
-            });
-
+            const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'] });
             const context = await browser.newContext({
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-              locale: 'en-US',
-              timezoneId: 'America/New_York',
-              viewport: { width: 1280, height: 800 },
+              locale: 'en-US', timezoneId: 'America/New_York', viewport: { width: 1280, height: 800 },
               extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
             });
-
-            await context.addInitScript(() => {
-              Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            });
-
+            await context.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
             const allFiles = [];
-
             for (const pageUrl of urls) {
               console.log('Scanning:', pageUrl);
               const page = await context.newPage();
               let accountToken = '';
               const fileLinks = [];
-
               page.on('response', async (response) => {
                 try {
                   const url = response.url();
                   if (url.includes('api.gofile.io/accounts')) {
-                    try {
-                      const body = await response.json();
-                      if (body?.data?.token) {
-                        accountToken = body.data.token;
-                      }
-                    } catch (_) {}
+                    try { const body = await response.json(); if (body?.data?.token) accountToken = body.data.token; } catch (_) {}
                   }
                   if (url.includes('api.gofile.io/contents')) {
                     try {
@@ -322,9 +296,7 @@ jobs:
                       if (body?.status === 'ok') {
                         const walk = (node) => {
                           if (!node) return;
-                          if (node.type === 'file' && node.link) {
-                            fileLinks.push({ name: node.name, url: node.link, size: node.size || 0, mimetype: node.mimetype || '' });
-                          }
+                          if (node.type === 'file' && node.link) fileLinks.push({ name: node.name, url: node.link, size: node.size || 0, mimetype: node.mimetype || '' });
                           const ch = node.children;
                           if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
                         };
@@ -334,33 +306,23 @@ jobs:
                   }
                 } catch (_) {}
               });
-
               try {
                 await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 90000 });
                 await page.waitForTimeout(8000);
                 try { await page.waitForSelector('[class*="download"i]', { timeout: 12000 }); } catch (_) {}
                 await page.waitForTimeout(3000);
               } catch (e) { console.log('Page error:', e.message); }
-
               const cookies = await context.cookies();
               const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
               let cookieJar = '# Netscape HTTP Cookie File\n';
               for (const c of cookies) {
-                const domain  = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
-                const path    = c.path || '/';
-                const secure  = c.secure ? 'TRUE' : 'FALSE';
-                const expires = c.expires && c.expires > 0 ? Math.floor(c.expires) : 0;
-                cookieJar += `${domain}\tTRUE\t${path}\t${secure}\t${expires}\t${c.name}\t${c.value}\n`;
+                const domain = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
+                cookieJar += `${domain}\tTRUE\t${c.path||'/'}\t${c.secure?'TRUE':'FALSE'}\t${c.expires>0?Math.floor(c.expires):0}\t${c.name}\t${c.value}\n`;
               }
-              if (accountToken) {
-                cookieJar += `.gofile.io\tTRUE\t/\tFALSE\t0\taccountToken\t${accountToken}\n`;
-              }
-              for (const fl of fileLinks) {
-                allFiles.push({ name: fl.name, url: fl.url, size: fl.size, token: accountToken, cookieStr, cookieJar, source: pageUrl });
-              }
+              if (accountToken) cookieJar += `.gofile.io\tTRUE\t/\tFALSE\t0\taccountToken\t${accountToken}\n`;
+              for (const fl of fileLinks) allFiles.push({ name: fl.name, url: fl.url, size: fl.size, token: accountToken, cookieStr, cookieJar, source: pageUrl });
               await page.close();
             }
-
             await browser.close();
             if (allFiles.length === 0) { console.log('No files found!'); process.exit(1); }
             fs.writeFileSync('grabbed/final_links.json', JSON.stringify(allFiles, null, 2));
@@ -370,10 +332,14 @@ jobs:
 
           node gofile_scan.js
 
-      - name: Filter selected files and download
+      - name: Download and split if needed
         run: |
           python3 << 'PYEOF'
           import json, os, re, subprocess, sys
+
+          LIMIT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+          # split target: 1.9 GB per part to have some margin
+          PART_SIZE_BYTES = int(1.9 * 1024 * 1024 * 1024)
 
           selection = "${{ github.event.inputs.file_selection }}".strip().lower()
 
@@ -384,16 +350,9 @@ jobs:
               mb = b / (1024*1024)
               return f'{mb/1024:.2f} GB' if mb >= 1024 else f'{mb:.1f} MB'
 
-          print('\n' + '='*60)
-          print('  ALL AVAILABLE FILES')
-          print('='*60)
-          for i, item in enumerate(all_items, 1):
-              print(f'  [{i}] {item["name"]}  ({size_str(item.get("size",0))})')
-          print('='*60)
-
+          # parse selection
           if selection in ('all', '', '*'):
               selected = list(range(len(all_items)))
-              print(f'\nSelection: ALL')
           else:
               selected = []
               for part in selection.split(','):
@@ -404,9 +363,6 @@ jobs:
                           selected.append(idx)
                       else:
                           print(f'WARNING: [{part}] out of range, skipping.')
-                  else:
-                      print(f'WARNING: "{part}" not valid, skipping.')
-              print(f'\nSelection: {[i+1 for i in selected]}')
 
           if not selected:
               print('No valid files selected!')
@@ -414,39 +370,19 @@ jobs:
 
           items = [all_items[i] for i in selected]
 
-          print('\nFiles to download:')
+          print('\nFiles to process:')
           for item in items:
-              print(f'  - {item["name"]}  ({size_str(item.get("size",0))})')
+              sz = item.get('size', 0)
+              note = ' → will be split' if sz > LIMIT_BYTES else ''
+              print(f'  - {item["name"]}  ({size_str(sz)}){note}')
 
           os.makedirs('downloads', exist_ok=True)
+          os.makedirs('upload_ready', exist_ok=True)
 
-          for i, item in enumerate(items, 1):
-              name      = item['name']
-              url       = item['url']
-              token     = item.get('token', '')
-              cookieJar = item.get('cookieJar', '')
-              cookieStr = item.get('cookieStr', '')
-
-              safe = re.sub(r'[^a-zA-Z0-9 ._-]', '_', name)
-              safe = re.sub(r'[\s_]+', '_', safe).strip('_')[:120] or f'file_{i}'
-              out_path = f'downloads/{safe}'
-
-              # Write cookie jar file for this download
-              jar_path = f'/tmp/gofile_cookies_{i}.txt'
+          def run_download(url, token, cookieJar, out_path, safe_name):
+              jar_path = f'/tmp/cookies_{safe_name}.txt'
               with open(jar_path, 'w') as jf:
                   jf.write(cookieJar)
-
-              print(f'\n{"="*50}')
-              print(f'Downloading [{i}/{len(items)}]: {name}')
-              print(f'Size: {size_str(item.get("size",0))}')
-              print(f'URL:  {url[:80]}')
-              print('='*50)
-
-              # Verify the cookie jar has accountToken
-              print(f'Cookie jar preview:')
-              for line in cookieJar.split('\n'):
-                  if 'accountToken' in line or 'gofile' in line.lower():
-                      print(f'  {line[:100]}')
 
               cmd = [
                   'aria2c',
@@ -457,26 +393,23 @@ jobs:
                   f'--load-cookies={jar_path}',
                   '--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
                   '--header=Accept: video/mp4,video/*;q=0.9,*/*;q=0.8',
-                  '--header=Accept-Language: en-US,en;q=0.9',
                   '--header=Referer: https://gofile.io/',
-                  f'--header=Authorization: Bearer {token}' if token else '--header=X-Placeholder: 1',
                   '--dir=downloads',
-                  f'--out={safe}',
+                  f'--out={safe_name}',
                   url
               ]
-              # remove placeholder if no token
-              cmd = [c for c in cmd if 'X-Placeholder' not in c]
+              if token:
+                  cmd.insert(-1, f'--header=Authorization: Bearer {token}')
 
               result = subprocess.run(cmd)
 
               if result.returncode != 0:
-                  print('[CURL FALLBACK]')
+                  print('  [CURL FALLBACK]')
                   curl_cmd = [
                       'curl', '-L', '--retry', '5', '--connect-timeout', '30',
                       '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                       '-H', 'Accept: video/mp4,video/*;q=0.9,*/*;q=0.8',
                       '-H', 'Referer: https://gofile.io/',
-                      '--cookie-jar', jar_path,
                       '--cookie', jar_path,
                       '-o', out_path,
                   ]
@@ -485,40 +418,130 @@ jobs:
                   curl_cmd.append(url)
                   subprocess.run(curl_cmd)
 
-              # Verify downloaded file is actually a video
-              if os.path.exists(out_path):
-                  actual_size = os.path.getsize(out_path)
-                  print(f'Downloaded size: {size_str(actual_size)}')
-                  # Check magic bytes
-                  with open(out_path, 'rb') as f:
-                      header = f.read(12)
-                  print(f'File magic bytes: {header.hex()[:24]}')
-                  # MP4 magic: ftyp at offset 4, or starts with 0000
-                  is_mp4 = b'ftyp' in header or header[:4] == b'\x00\x00\x00\x20'
-                  is_html = header[:5] in (b'<!DOC', b'<html', b'<?xml')
-                  if is_html:
-                      print('WARNING: Downloaded file appears to be HTML — authentication may have failed!')
-                      # show first 500 bytes
-                      with open(out_path, 'r', errors='replace') as f:
-                          print('File content preview:', f.read(500))
-                  elif is_mp4:
-                      print('OK: File appears to be a valid MP4.')
-                  else:
-                      print('File type unknown — check manually.')
-              else:
-                  print('ERROR: File not found after download!')
+          def verify_file(path):
+              if not os.path.exists(path):
+                  return False, 'not found'
+              with open(path, 'rb') as f:
+                  header = f.read(12)
+              if header[:5] in (b'<!DOC', b'<html', b'<?xml'):
+                  return False, 'HTML (auth failed)'
+              return True, 'ok'
 
-          print('\n=== Downloaded files ===')
-          for fn in sorted(os.listdir('downloads')):
-              sz = os.path.getsize(f'downloads/{fn}')
+          def split_video(input_path, base_name, part_size):
+              """Split video into parts using ffmpeg segment muxer — no re-encode."""
+              print(f'\n  Splitting into ~{size_str(part_size)} parts (no re-encode)...')
+
+              # get total duration
+              probe = subprocess.run(
+                  ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+                   '-show_format', input_path],
+                  capture_output=True, text=True
+              )
+              duration = 0
+              try:
+                  info = json.loads(probe.stdout)
+                  duration = float(info['format']['duration'])
+                  file_size = int(info['format']['size'])
+                  print(f'  Duration: {duration:.1f}s  |  Size: {size_str(file_size)}')
+              except Exception as e:
+                  print(f'  ffprobe error: {e}')
+                  # fallback: estimate from file size and 10 Mbps
+                  file_size = os.path.getsize(input_path)
+                  duration = (file_size * 8) / (10 * 1024 * 1024)
+
+              # calculate segment duration
+              file_size = os.path.getsize(input_path)
+              n_parts = -(-file_size // part_size)  # ceiling division
+              seg_duration = duration / n_parts
+              print(f'  Parts: {n_parts}  |  ~{seg_duration:.1f}s per part')
+
+              ext = os.path.splitext(input_path)[1] or '.mp4'
+              pattern = f'upload_ready/{base_name}_part%03d{ext}'
+
+              cmd = [
+                  'ffmpeg', '-i', input_path,
+                  '-c', 'copy',           # no re-encode
+                  '-map', '0',
+                  '-segment_time', str(int(seg_duration)),
+                  '-f', 'segment',
+                  '-reset_timestamps', '1',
+                  '-avoid_negative_ts', 'make_zero',
+                  pattern
+              ]
+              result = subprocess.run(cmd)
+              if result.returncode != 0:
+                  print('  ffmpeg split failed!')
+                  return False
+
+              parts = sorted([
+                  f for f in os.listdir('upload_ready')
+                  if f.startswith(base_name + '_part')
+              ])
+              print(f'\n  Split result:')
+              for p in parts:
+                  sz = os.path.getsize(f'upload_ready/{p}')
+                  print(f'    {p}  ({size_str(sz)})')
+              return True
+
+          # ── main loop ────────────────────────────────────────────
+          for i, item in enumerate(items, 1):
+              name      = item['name']
+              url       = item['url']
+              token     = item.get('token', '')
+              cookieJar = item.get('cookieJar', '')
+              declared_size = item.get('size', 0)
+
+              safe = re.sub(r'[^a-zA-Z0-9 ._-]', '_', name)
+              safe = re.sub(r'[\s_]+', '_', safe).strip('_')[:120] or f'file_{i}'
+              base_name = os.path.splitext(safe)[0]
+              out_path  = f'downloads/{safe}'
+
+              print(f'\n{"="*55}')
+              print(f'  [{i}/{len(items)}] {name}')
+              print(f'  Size: {size_str(declared_size)}')
+              print('='*55)
+
+              # download
+              run_download(url, token, cookieJar, out_path, safe)
+
+              ok, reason = verify_file(out_path)
+              if not ok:
+                  print(f'  ERROR: File invalid — {reason}')
+                  continue
+
+              actual_size = os.path.getsize(out_path)
+              print(f'  Downloaded: {size_str(actual_size)}  ✓')
+
+              if actual_size > LIMIT_BYTES:
+                  # split with ffmpeg
+                  ok = split_video(out_path, base_name, PART_SIZE_BYTES)
+                  if not ok:
+                      print('  Falling back to raw copy to upload_ready...')
+                      import shutil
+                      shutil.copy(out_path, f'upload_ready/{safe}')
+              else:
+                  # small enough — copy directly to upload_ready
+                  import shutil
+                  shutil.copy(out_path, f'upload_ready/{safe}')
+                  print(f'  → upload_ready/{safe}')
+
+          print('\n\n' + '='*55)
+          print('  UPLOAD READY FILES')
+          print('='*55)
+          total = 0
+          for fn in sorted(os.listdir('upload_ready')):
+              sz = os.path.getsize(f'upload_ready/{fn}')
+              total += sz
               print(f'  {fn}  ({size_str(sz)})')
+          print(f'\n  Total: {size_str(total)}')
+          print('='*55)
           PYEOF
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
         run: |
           ts=$(date +"%Y%m%d_%H%M%S")
-          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "gofile_media_${ts}.zip" downloads/
+          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "gofile_media_${ts}.zip" upload_ready/
 
       - name: Upload Release (direct)
         if: github.event.inputs.upload_mode == 'direct'
@@ -530,7 +553,7 @@ jobs:
             Downloaded from Gofile links in `browser.txt`
             Selection: `${{ github.event.inputs.file_selection }}`
             Run: #${{ github.run_number }}
-          files: downloads/*
+          files: upload_ready/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
