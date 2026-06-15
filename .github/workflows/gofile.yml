@@ -1,0 +1,300 @@
+name: Gofile Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_mode:
+        description: "Upload mode"
+        required: true
+        default: "direct"
+        type: choice
+        options:
+          - "direct"
+          - "zip"
+
+      delete_old_releases:
+        description: "Delete old releases?"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+permissions:
+  contents: write
+
+jobs:
+  gofile-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            curl \
+            wget \
+            aria2 \
+            jq \
+            zip \
+            gh
+
+      - name: Prepare folders
+        run: |
+          mkdir -p downloads
+          mkdir -p grabbed
+
+      - name: Read URLs from browser.txt
+        run: |
+          if [ ! -f browser.txt ]; then
+            echo "ERROR: browser.txt not found in repository root!"
+            exit 1
+          fi
+          echo "URLs found in browser.txt:"
+          cat browser.txt
+          # Filter only gofile.io URLs
+          grep -E "gofile\.io" browser.txt > grabbed/gofile_urls.txt || true
+          echo "--- Gofile URLs ---"
+          cat grabbed/gofile_urls.txt
+
+      - name: Fetch Gofile download links via API
+        run: |
+          python3 << 'PYEOF'
+          import re
+          import sys
+          import json
+          import urllib.request
+          import urllib.error
+
+          def api_get(url, token=None):
+              req = urllib.request.Request(url)
+              req.add_header("User-Agent", "Mozilla/5.0")
+              if token:
+                  req.add_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return json.loads(r.read().decode())
+              except Exception as e:
+                  print(f"  [API ERROR] {url} -> {e}")
+                  return None
+
+          # Step 1: Get a guest token from Gofile
+          print("[*] Getting guest token...")
+          resp = api_get("https://api.gofile.io/accounts")
+          if not resp or resp.get("status") != "ok":
+              print("[!] Could not get guest token. Response:", resp)
+              sys.exit(1)
+
+          token = resp["data"]["token"]
+          print(f"[+] Token: {token[:8]}...")
+
+          # Step 2: Read gofile URLs
+          with open("grabbed/gofile_urls.txt", "r") as f:
+              urls = [u.strip() for u in f if u.strip()]
+
+          if not urls:
+              print("[!] No Gofile URLs found in grabbed/gofile_urls.txt")
+              sys.exit(1)
+
+          results = []
+
+          for page_url in urls:
+              print(f"\n[*] Processing: {page_url}")
+
+              # Extract content ID from URL
+              # Supports: https://gofile.io/d/XXXXXX
+              m = re.search(r"gofile\.io/d/([A-Za-z0-9]+)", page_url)
+              if not m:
+                  print(f"  [!] Could not extract content ID from: {page_url}")
+                  continue
+
+              content_id = m.group(1)
+              print(f"  [+] Content ID: {content_id}")
+
+              # Step 3: Get content info
+              api_url = f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6&cache=true"
+              data = api_get(api_url, token=token)
+
+              if not data or data.get("status") != "ok":
+                  print(f"  [!] API error: {data}")
+                  continue
+
+              content = data["data"]
+              content_type = content.get("type", "")
+
+              print(f"  [+] Content type: {content_type}")
+              print(f"  [+] Content name: {content.get('name','unknown')}")
+
+              def extract_files(node, depth=0):
+                  """Recursively extract files from Gofile content tree."""
+                  files = []
+                  if node.get("type") == "file":
+                      link = node.get("link", "")
+                      name = node.get("name", "file")
+                      size = node.get("size", 0)
+                      mime = node.get("mimetype", "")
+                      if link:
+                          files.append({
+                              "name": name,
+                              "link": link,
+                              "size": size,
+                              "mime": mime
+                          })
+                  elif node.get("type") == "folder":
+                      children = node.get("children", {})
+                      if isinstance(children, dict):
+                          for child in children.values():
+                              files.extend(extract_files(child, depth+1))
+                  return files
+
+              found_files = extract_files(content)
+
+              if not found_files:
+                  print("  [!] No files found in this content.")
+                  continue
+
+              for f in found_files:
+                  size_mb = f["size"] / (1024*1024) if f["size"] else 0
+                  print(f"  [FILE] {f['name']} | {size_mb:.1f} MB | {f['link']}")
+                  results.append({
+                      "name": f["name"],
+                      "link": f["link"],
+                      "size": f["size"],
+                      "mime": f["mime"],
+                      "token": token
+                  })
+
+          if not results:
+              print("\n[!] No downloadable files found.")
+              sys.exit(1)
+
+          # Write final links
+          with open("grabbed/final_links.txt", "w") as out:
+              for item in results:
+                  # format: name|||link|||token
+                  out.write(f"{item['name']}|||{item['link']}|||{item['token']}\n")
+
+          print(f"\n[+] Saved {len(results)} file(s) to grabbed/final_links.txt")
+          PYEOF
+
+      - name: Download files
+        run: |
+          if [ ! -s grabbed/final_links.txt ]; then
+            echo "No links to download."
+            exit 1
+          fi
+
+          counter=1
+
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+
+            # Parse: name|||link|||token
+            name=$(echo "$entry"   | awk -F'\\|\\|\\|' '{print $1}')
+            url=$(echo "$entry"    | awk -F'\\|\\|\\|' '{print $2}')
+            token=$(echo "$entry"  | awk -F'\\|\\|\\|' '{print $3}')
+
+            # Sanitize filename
+            safe_name=$(echo "$name" \
+              | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
+              | sed 's/[_ ]\+/_/g' \
+              | sed 's/^_//;s/_$//' \
+              | cut -c1-120)
+
+            [ -z "$safe_name" ] && safe_name="file_${counter}"
+
+            echo ""
+            echo "========================================"
+            echo "DOWNLOADING : $name"
+            echo "URL         : $url"
+            echo "SAVE AS     : downloads/$safe_name"
+            echo "========================================"
+
+            # Try aria2c first with Authorization header
+            aria2c \
+              -x 16 -s 16 -k 1M \
+              -c \
+              --summary-interval=0 \
+              --download-result=hide \
+              --console-log-level=warn \
+              --header="Authorization: Bearer ${token}" \
+              --header="User-Agent: Mozilla/5.0" \
+              --dir=downloads \
+              --out="${safe_name}" \
+              "$url"
+
+            result=$?
+
+            if [ $result -ne 0 ]; then
+              echo "[CURL FALLBACK] aria2 failed, trying curl..."
+              curl -L \
+                --retry 5 \
+                --connect-timeout 30 \
+                -A "Mozilla/5.0" \
+                -H "Authorization: Bearer ${token}" \
+                -o "downloads/${safe_name}" \
+                "$url"
+            fi
+
+            counter=$((counter + 1))
+
+          done < grabbed/final_links.txt
+
+          echo ""
+          echo "=== Downloaded files ==="
+          ls -lh downloads/
+
+      - name: Create ZIP (if zip mode)
+        if: github.event.inputs.upload_mode == 'zip'
+        run: |
+          ts=$(date +"%Y%m%d_%H%M%S")
+          zip -r \
+            -P "${{ secrets.ZIP_PASSWORD }}" \
+            "gofile_media_${ts}.zip" \
+            downloads/
+          echo "ZIP created:"
+          ls -lh *.zip
+
+      - name: Delete old releases
+        if: github.event.inputs.delete_old_releases == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          releases=$(gh release list --limit 100 --json tagName -q '.[].tagName' 2>/dev/null || true)
+          for tag in $releases; do
+            echo "Deleting release: $tag"
+            gh release delete "$tag" --yes || true
+            git push --delete origin "$tag" 2>/dev/null || true
+          done
+
+      - name: Upload to Release (direct)
+        if: github.event.inputs.upload_mode == 'direct'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gofile-${{ github.run_number }}
+          name: "Gofile Download #${{ github.run_number }}"
+          body: |
+            Downloaded from Gofile links in `browser.txt`
+            Run: ${{ github.run_number }}
+          files: downloads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to Release (zip)
+        if: github.event.inputs.upload_mode == 'zip'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gofile-${{ github.run_number }}
+          name: "Gofile Download #${{ github.run_number }}"
+          body: |
+            Downloaded from Gofile links in `browser.txt`
+            Run: ${{ github.run_number }}
+          files: "*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
