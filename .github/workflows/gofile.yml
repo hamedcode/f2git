@@ -99,7 +99,6 @@ jobs:
               extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
             });
 
-            // hide automation flag
             await context.addInitScript(() => {
               Object.defineProperty(navigator, 'webdriver', { get: () => false });
             });
@@ -116,12 +115,10 @@ jobs:
               let accountToken = '';
               const fileLinks = [];
 
-              // intercept every network response
               page.on('response', async (response) => {
                 try {
                   const url = response.url();
 
-                  // grab guest token from accounts endpoint
                   if (url.includes('api.gofile.io/accounts')) {
                     try {
                       const body = await response.json();
@@ -132,7 +129,6 @@ jobs:
                     } catch (_) {}
                   }
 
-                  // grab file list from contents endpoint
                   if (url.includes('api.gofile.io/contents')) {
                     try {
                       const body = await response.json();
@@ -151,45 +147,30 @@ jobs:
                     } catch (_) {}
                   }
 
-                  // also catch direct mp4/mkv/zip URLs that appear in network
-                  if (/\.(mp4|mkv|avi|mov|zip|rar)(\?|$)/i.test(url)) {
-                    const name = url.split('/').pop().split('?')[0] || 'file';
-                    if (!fileLinks.find(f => f.url === url)) {
-                      fileLinks.push({ name, url });
-                      console.log('  [DIRECT URL]', name);
-                    }
-                  }
-
                 } catch (_) {}
               });
 
               try {
                 await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 90000 });
                 await page.waitForTimeout(8000);
-
-                // wait for any download button to appear
                 try {
                   await page.waitForSelector(
                     '[class*="download"i], [id*="download"i], a[href*="/download/"]',
                     { timeout: 12000 }
                   );
                 } catch (_) {}
-
                 await page.waitForTimeout(3000);
-
               } catch (e) {
                 console.log('  [PAGE ERROR]', e.message);
               }
 
-              // ── fallback: call API from inside the page with the real cookies/token ──
+              // fallback: call API from inside page context
               if (fileLinks.length === 0) {
-                console.log('  [FALLBACK] Calling Gofile API from inside the page context...');
+                console.log('  [FALLBACK] Calling API from inside page context...');
                 const m = pageUrl.match(/gofile\.io\/d\/([A-Za-z0-9]+)/);
                 if (m) {
-                  const contentId = m[1];
                   try {
                     const apiResult = await page.evaluate(async ({ contentId, token }) => {
-                      // first get a fresh token if we don't have one
                       let useToken = token;
                       if (!useToken) {
                         const accResp = await fetch('https://api.gofile.io/accounts', {
@@ -199,17 +180,14 @@ jobs:
                         const accData = await accResp.json();
                         useToken = accData?.data?.token || '';
                       }
-
                       const r = await fetch(
                         `https://api.gofile.io/contents/${contentId}?wt=4fd6sg89d7s6&cache=true`,
                         { headers: { 'Authorization': `Bearer ${useToken}` } }
                       );
-                      const data = await r.json();
-                      return { data, token: useToken };
-                    }, { contentId, token: accountToken });
+                      return { data: await r.json(), token: useToken };
+                    }, { contentId: m[1], token: accountToken });
 
                     if (apiResult?.token) accountToken = apiResult.token;
-
                     const body = apiResult?.data;
                     if (body?.status === 'ok') {
                       const walk = (node) => {
@@ -222,34 +200,10 @@ jobs:
                         if (ch && typeof ch === 'object') Object.values(ch).forEach(walk);
                       };
                       walk(body.data);
-                    } else {
-                      console.log('  [FALLBACK API response]', JSON.stringify(body)?.slice(0, 200));
                     }
                   } catch (e) {
                     console.log('  [FALLBACK ERROR]', e.message);
                   }
-                }
-              }
-
-              // ── fallback 2: scrape any <a> links on the page ──
-              if (fileLinks.length === 0) {
-                console.log('  [FALLBACK2] Scraping page links...');
-                try {
-                  const hrefs = await page.evaluate(() =>
-                    Array.from(document.querySelectorAll('a[href]'))
-                      .map(a => ({ href: a.href, text: (a.textContent || '').trim() }))
-                      .filter(a =>
-                        a.href.includes('/download/') ||
-                        /\.(mp4|mkv|avi|mov|zip|rar)/i.test(a.href)
-                      )
-                  );
-                  for (const h of hrefs) {
-                    const name = h.text || h.href.split('/').pop().split('?')[0] || 'file';
-                    fileLinks.push({ name, url: h.href });
-                    console.log('  [SCRAPED]', name);
-                  }
-                } catch (e) {
-                  console.log('  [FALLBACK2 ERROR]', e.message);
                 }
               }
 
@@ -270,12 +224,9 @@ jobs:
               process.exit(1);
             }
 
-            fs.writeFileSync(
-              'grabbed/final_links.txt',
-              results.map(r => `${r.name}|||${r.url}|||${r.token}|||${r.cookie}`).join('\n') + '\n'
-            );
-
-            console.log(`\n[+] Saved ${results.length} file(s) to grabbed/final_links.txt`);
+            // Write as JSON - no delimiter issues
+            fs.writeFileSync('grabbed/final_links.json', JSON.stringify(results, null, 2));
+            console.log(`\n[+] Saved ${results.length} file(s) to grabbed/final_links.json`);
 
           })();
           EOF
@@ -285,72 +236,94 @@ jobs:
       - name: Show grabbed links
         run: |
           echo "=== Final links ==="
-          awk -F'\|\|\|' '{print NR". "$1" -> "substr($2,1,80)"..."}' grabbed/final_links.txt
+          python3 -c "
+          import json
+          with open('grabbed/final_links.json') as f:
+              items = json.load(f)
+          for i, item in enumerate(items, 1):
+              print(f'{i}. {item[\"name\"]} -> {item[\"url\"][:80]}...')
+          "
 
       - name: Download files
         run: |
-          if [ ! -s grabbed/final_links.txt ]; then
-            echo "No links to download."
-            exit 1
-          fi
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys
 
-          counter=1
+          with open('grabbed/final_links.json') as f:
+              items = json.load(f)
 
-          while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
+          if not items:
+              print('No files to download.')
+              sys.exit(1)
 
-            name=$(  echo "$entry" | awk -F'\|\|\|' '{print $1}')
-            url=$(   echo "$entry" | awk -F'\|\|\|' '{print $2}')
-            token=$( echo "$entry" | awk -F'\|\|\|' '{print $3}')
-            cookie=$(echo "$entry" | awk -F'\|\|\|' '{print $4}')
+          os.makedirs('downloads', exist_ok=True)
 
-            safe_name=$(echo "$name" \
-              | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
-              | sed 's/[_ ]\+/_/g' \
-              | sed 's/^_//;s/_$//' \
-              | cut -c1-120)
-            [ -z "$safe_name" ] && safe_name="file_${counter}"
+          for i, item in enumerate(items, 1):
+              name   = item['name']
+              url    = item['url']
+              token  = item.get('token', '')
+              cookie = item.get('cookie', '')
 
-            echo ""
-            echo "========================================"
-            echo "FILE    : $name"
-            echo "SAVE AS : downloads/$safe_name"
-            echo "========================================"
+              # sanitize filename
+              import re
+              safe = re.sub(r'[^a-zA-Z0-9 ._-]', '_', name)
+              safe = re.sub(r'[\s_]+', '_', safe).strip('_')[:120]
+              if not safe:
+                  safe = f'file_{i}'
 
-            HEADERS=(
-              "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
-              "--header=Accept: */*"
-              "--header=Referer: https://gofile.io/"
-            )
-            [ -n "$token"  ] && HEADERS+=("--header=Authorization: Bearer ${token}")
-            [ -n "$cookie" ] && HEADERS+=("--header=Cookie: ${cookie}")
+              out_path = f'downloads/{safe}'
 
-            aria2c -x 16 -s 16 -k 1M -c \
-              --summary-interval=0 \
-              --download-result=hide \
-              --console-log-level=warn \
-              "${HEADERS[@]}" \
-              --dir=downloads \
-              --out="${safe_name}" \
-              "$url"
+              print(f'\n{"="*50}')
+              print(f'FILE    : {name}')
+              print(f'SAVE AS : {out_path}')
+              print(f'URL     : {url[:80]}...')
+              print('='*50)
 
-            if [ $? -ne 0 ]; then
-              echo "[CURL FALLBACK]"
-              curl -L --retry 5 --connect-timeout 30 \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-                -H "Referer: https://gofile.io/" \
-                $( [ -n "$token"  ] && echo "-H 'Authorization: Bearer ${token}'" ) \
-                $( [ -n "$cookie" ] && echo "-H 'Cookie: ${cookie}'" ) \
-                -o "downloads/${safe_name}" \
-                "$url"
-            fi
+              headers = [
+                  '--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+                  '--header=Accept: */*',
+                  '--header=Referer: https://gofile.io/',
+              ]
+              if token:
+                  headers.append(f'--header=Authorization: Bearer {token}')
+              if cookie:
+                  headers.append(f'--header=Cookie: {cookie}')
 
-            counter=$((counter + 1))
-          done < grabbed/final_links.txt
+              cmd = [
+                  'aria2c',
+                  '-x', '16', '-s', '16', '-k', '1M',
+                  '-c',
+                  '--summary-interval=0',
+                  '--download-result=hide',
+                  '--console-log-level=warn',
+                  *headers,
+                  '--dir=downloads',
+                  f'--out={safe}',
+                  url
+              ]
 
-          echo ""
-          echo "=== Downloaded files ==="
-          ls -lh downloads/
+              result = subprocess.run(cmd)
+
+              if result.returncode != 0:
+                  print('[CURL FALLBACK]')
+                  curl_cmd = [
+                      'curl', '-L', '--retry', '5', '--connect-timeout', '30',
+                      '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                      '-H', 'Referer: https://gofile.io/',
+                      '-o', out_path,
+                  ]
+                  if token:
+                      curl_cmd += ['-H', f'Authorization: Bearer {token}']
+                  if cookie:
+                      curl_cmd += ['-H', f'Cookie: {cookie}']
+                  curl_cmd.append(url)
+                  subprocess.run(curl_cmd)
+
+          print('\n=== Downloaded files ===')
+          for f in os.listdir('downloads'):
+              size = os.path.getsize(f'downloads/{f}')
+              print(f'  {f}  ({size/1024/1024:.1f} MB)')
+          PYEOF
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
