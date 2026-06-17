@@ -23,7 +23,7 @@ on:
           - disabled
           - x265-fast-27
           - x265-540p-29-2X
-          - x264-lite
+          - x265-360
           - x265-29-80k
         default: x265-fast-27
 
@@ -221,16 +221,17 @@ jobs:
                 -c:a aac -b:a 80k \
                 "$output"
 
-            elif [[ "$MODE" == "x264-lite" ]]; then
+            elif [[ "$MODE" == "x265-360" ]]; then
 
-              CRF_USED="N/A (CBR 1000k)"
+              CRF_USED="26"
               ffmpeg -y \
                 -i "$file" \
-                -vf "scale=-2:540" \
-                -c:v libx264 \
-                -preset veryfast \
-                -b:v 1000k \
-                -c:a aac \
+                -vf "scale=-2:360" \
+                -c:v libx265 \
+                -preset fast \
+                -crf 26 \
+                -x265-params "bframes=8:ref=4:aq-mode=3:aq-strength=1.0:cutree=1:rc-lookahead=40:psy-rd=2.0:psy-rdoq=1.0:deblock=0,0"
+                -c:a aac -b:a 80k \
                 "$output"
 
             elif [[ "$MODE" == "x265-29-80k" ]]; then
