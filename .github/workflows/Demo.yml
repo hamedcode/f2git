@@ -46,8 +46,10 @@ jobs:
               -o "$filename" \
               "$url"
 
-            if [[ $? -ne 0 ]]; then
-              echo "Download failed, skipping..."
+            curl_exit=$?
+
+            if [[ $curl_exit -ne 0 ]]; then
+              echo "Download failed (exit $curl_exit), skipping..."
               continue
             fi
 
@@ -62,7 +64,31 @@ jobs:
               -of default=noprint_wrappers=1:nokey=1 \
               "$filename")
 
+            if [[ -z "$duration" || "$duration" == "N/A" ]]; then
+              echo "Could not read duration, skipping..."
+              rm -f "$filename"
+              continue
+            fi
+
             echo "Duration: $duration seconds"
+
+            duration_int=${duration%.*}
+
+            # Calculate dynamic start times: 25%, 50%, 75% of total duration
+            # Leave at least 20 seconds before end for the segment
+            start1=$(( duration_int * 25 / 100 ))
+            start2=$(( duration_int * 50 / 100 ))
+            start3=$(( duration_int * 75 / 100 ))
+
+            # Clamp each start so the 20s segment doesn't exceed video length
+            max_start=$(( duration_int - 20 ))
+            [[ $max_start -lt 0 ]] && max_start=0
+
+            [[ $start1 -gt $max_start ]] && start1=$max_start
+            [[ $start2 -gt $max_start ]] && start2=$max_start
+            [[ $start3 -gt $max_start ]] && start3=$max_start
+
+            echo "Segment starts (seconds): $start1 | $start2 | $start3"
 
             base="${filename%.*}"
             ext="${filename##*.}"
@@ -70,32 +96,31 @@ jobs:
             mkdir -p "work/$base"
 
             extract_segment() {
-              local start="$1"
+              local start_sec="$1"
               local output="$2"
 
-              local start_sec
-
-              IFS=':' read -r hh mm ss <<< "$start"
-              start_sec=$((10#$hh * 3600 + 10#$mm * 60 + 10#$ss))
-
-              duration_int=${duration%.*}
-
               if (( start_sec >= duration_int )); then
-                echo "Skipping $start (beyond video length)"
+                echo "Skipping segment at ${start_sec}s (beyond video length)"
                 return
               fi
 
               ffmpeg -y \
-                -ss "$start" \
+                -ss "$start_sec" \
                 -i "$filename" \
                 -t 20 \
                 -c copy \
                 "$output"
+
+              local ffmpeg_exit=$?
+              if [[ $ffmpeg_exit -ne 0 ]]; then
+                echo "ffmpeg failed for segment at ${start_sec}s (exit $ffmpeg_exit)"
+                rm -f "$output"
+              fi
             }
 
-            extract_segment "00:05:00" "work/$base/part1.$ext"
-            extract_segment "00:15:00" "work/$base/part2.$ext"
-            extract_segment "00:20:00" "work/$base/part3.$ext"
+            extract_segment "$start1" "work/$base/part1.$ext"
+            extract_segment "$start2" "work/$base/part2.$ext"
+            extract_segment "$start3" "work/$base/part3.$ext"
 
             list_file="work/$base/list.txt"
             rm -f "$list_file"
@@ -111,7 +136,7 @@ jobs:
             done
 
             if [[ ! -s "$list_file" ]]; then
-              echo "No valid segments found."
+              echo "No valid segments found, skipping..."
               rm -f "$filename"
               continue
             fi
@@ -128,6 +153,14 @@ jobs:
                 -c copy \
                 "../../demos/${base}_demo.${ext}"
             )
+
+            concat_exit=$?
+
+            if [[ $concat_exit -ne 0 ]]; then
+              echo "Concat failed for $base (exit $concat_exit)"
+            else
+              echo "Demo created: demos/${base}_demo.${ext}"
+            fi
 
             rm -f "$filename"
 
