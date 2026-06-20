@@ -201,7 +201,7 @@ jobs:
                 -i "$file" \
                 -c:v libx265 \
                 -pix_fmt yuv420p10le \
-                -preset fast \
+                -preset veryfast \
                 -crf 27 \
                 -c:a aac \
                 "$output"
