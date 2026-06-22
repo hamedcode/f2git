@@ -1,0 +1,391 @@
+name: 6 - 9xBuddy Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: "9xbuddy process URL (e.g. https://9xbuddy.site/process?url=...)"
+        required: true
+
+      upload_mode:
+        description: "Upload mode"
+        required: true
+        default: "direct"
+        type: choice
+        options:
+          - "direct"
+          - "zip"
+
+      delete_old_releases:
+        description: "Delete old releases?"
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            zip \
+            curl \
+            aria2 \
+            jq \
+            gh
+
+          npm init -y
+          npm install playwright
+
+          npx playwright install chromium --with-deps
+
+      - name: Prepare folders
+        run: |
+          mkdir -p downloads
+          mkdir -p grabbed
+
+      - name: Create Playwright script
+        run: |
+          cat > buddy_dl.js << 'EOF'
+
+          const fs   = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright');
+
+          const PAGE_URL = process.argv[2];
+
+          if (!PAGE_URL) {
+            console.error('No URL provided');
+            process.exit(1);
+          }
+
+          // sanitize a string for use as filename (max 80 chars)
+          function sanitize(str) {
+            return (str || 'video')
+              .replace(/[^a-zA-Z0-9 ._-]/g, '_')
+              .replace(/[_ ]+/g, '_')
+              .replace(/^_|_$/g, '')
+              .slice(0, 80) || 'video';
+          }
+
+          (async () => {
+
+            const browser = await chromium.launch({ headless: true });
+
+            const context = await browser.newContext({
+              userAgent:
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                'Chrome/122.0.0.0 Safari/537.36'
+            });
+
+            const page = await context.newPage();
+
+            console.log('Opening:', PAGE_URL);
+
+            await page.goto(PAGE_URL, {
+              waitUntil: 'networkidle',
+              timeout: 60000
+            });
+
+            // wait for download buttons to appear
+            // 9xbuddy renders a list of quality/server rows
+            console.log('Waiting for download links to render...');
+
+            try {
+              await page.waitForSelector('a[href*="download"], a.download-btn, button:has-text("Download")', {
+                timeout: 30000
+              });
+            } catch (e) {
+              console.log('Selector timeout — trying anyway...');
+            }
+
+            // extra wait for any lazy-loaded content
+            await page.waitForTimeout(5000);
+
+            // grab page title for filename
+            const rawTitle = (await page.title()).trim();
+            const title    = sanitize(rawTitle);
+            console.log('PAGE TITLE:', rawTitle);
+
+            // collect all candidate download anchors
+            // 9xbuddy puts direct links in <a> tags with download attribute
+            // or href pointing to the actual file
+            const anchors = await page.$$eval('a', (els) =>
+              els
+                .map(a => ({
+                  href:  a.href  || '',
+                  text:  (a.innerText || a.textContent || '').trim(),
+                  dl:    a.hasAttribute('download')
+                }))
+                .filter(a =>
+                  a.href &&
+                  !a.href.startsWith('javascript') &&
+                  (
+                    a.dl ||
+                    /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(a.href) ||
+                    /download/i.test(a.href)
+                  )
+                )
+            );
+
+            console.log(`Found ${anchors.length} candidate anchor(s)`);
+
+            // also intercept any navigation / new-tab URLs triggered by clicks
+            const clickedUrls = [];
+
+            context.on('page', async (newPage) => {
+              try {
+                await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 });
+                const u = newPage.url();
+                console.log('NEW TAB:', u);
+                if (u && u !== 'about:blank') clickedUrls.push(u);
+                await newPage.close();
+              } catch (e) {}
+            });
+
+            // build list of direct file URLs from anchors
+            const directUrls = anchors
+              .map(a => a.href)
+              .filter(href =>
+                /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href) ||
+                href.includes('/download')
+              );
+
+            // also try clicking each button that has a loading delay
+            // to force 9xbuddy to resolve the real link
+            const buttons = await page.$$('a, button');
+            for (const btn of buttons) {
+              try {
+                const txt = (await btn.innerText()).trim().toLowerCase();
+                if (!txt.includes('download')) continue;
+
+                const href = await btn.getAttribute('href') || '';
+                if (
+                  href.startsWith('http') &&
+                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href)
+                ) {
+                  // already a direct link — no need to click
+                  if (!directUrls.includes(href)) directUrls.push(href);
+                  continue;
+                }
+
+                console.log('Clicking download button:', txt, href);
+
+                // click and wait for the anti-bot loader to finish
+                await btn.click({ timeout: 5000 }).catch(() => {});
+                await page.waitForTimeout(8000);
+
+                // check if href changed or a redirect happened
+                const newHref = await btn.getAttribute('href').catch(() => '');
+                if (
+                  newHref &&
+                  newHref.startsWith('http') &&
+                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(newHref) &&
+                  !directUrls.includes(newHref)
+                ) {
+                  console.log('RESOLVED LINK:', newHref);
+                  directUrls.push(newHref);
+                }
+
+              } catch (e) {}
+            }
+
+            // merge clicked new-tab URLs
+            for (const u of clickedUrls) {
+              if (!directUrls.includes(u)) directUrls.push(u);
+            }
+
+            console.log(`\nTotal candidate download URLs: ${directUrls.length}`);
+
+            // write results for the shell step
+            const out = {
+              title,
+              urls: directUrls
+            };
+
+            fs.writeFileSync('grabbed/candidates.json', JSON.stringify(out, null, 2));
+            console.log('Wrote grabbed/candidates.json');
+
+            await browser.close();
+
+          })();
+
+          EOF
+
+      - name: Run Playwright
+        run: |
+          node buddy_dl.js "${{ github.event.inputs.page_url }}"
+
+      - name: Show candidates
+        run: |
+          echo "=== candidates.json ==="
+          cat grabbed/candidates.json
+
+      - name: Try download links
+        run: |
+
+          if [ ! -f grabbed/candidates.json ]; then
+            echo "No candidates.json found"
+            exit 1
+          fi
+
+          title=$(jq -r '.title' grabbed/candidates.json)
+          mapfile -t urls < <(jq -r '.urls[]' grabbed/candidates.json)
+
+          echo "Title  : $title"
+          echo "URLs   : ${#urls[@]}"
+
+          downloaded=0
+
+          for url in "${urls[@]}"; do
+
+            [ -z "$url" ] && continue
+
+            echo ""
+            echo "========================================"
+            echo "TRYING: $url"
+            echo "========================================"
+
+            clean_url=$(echo "$url" | cut -d'?' -f1)
+            ext=$(echo "$clean_url" | grep -oiE '\.(mp4|m3u8|mkv|avi|mov|webm|vid)' | head -1 | tr -d '.')
+            [ "$ext" = "vid" ] && ext="mp4"
+            [ -z "$ext" ] && ext="mp4"
+
+            out_file="downloads/${title}.${ext}"
+
+            if [[ "$ext" == "m3u8" ]]; then
+
+              echo "[FFMPEG] HLS download"
+
+              ffmpeg -y \
+                -user_agent "Mozilla/5.0" \
+                -i "$url" \
+                -c copy \
+                "$out_file" && {
+                  echo "SUCCESS (ffmpeg)"
+                  downloaded=1
+                  break
+                }
+
+            else
+
+              echo "[ARIA2] trying..."
+
+              aria2c \
+                -x 16 -s 16 -k 1M \
+                -c \
+                --summary-interval=0 \
+                --download-result=hide \
+                --console-log-level=warn \
+                --max-tries=3 \
+                --retry-wait=5 \
+                --dir=downloads \
+                --out="${title}.${ext}" \
+                "$url"
+
+              result=$?
+
+              # verify file is not empty / too small (< 1 MB = probably error page)
+              if [ $result -eq 0 ] && [ -f "$out_file" ]; then
+                size=$(stat -c%s "$out_file" 2>/dev/null || echo 0)
+                if [ "$size" -gt 1048576 ]; then
+                  echo "SUCCESS (aria2) — size: $((size/1024/1024)) MB"
+                  downloaded=1
+                  break
+                else
+                  echo "SKIP: file too small ($size bytes), probably error page"
+                  rm -f "$out_file"
+                fi
+              fi
+
+              echo "[CURL] fallback..."
+
+              curl -L \
+                --retry 3 \
+                --connect-timeout 30 \
+                --max-time 3600 \
+                -A "Mozilla/5.0" \
+                -o "$out_file" \
+                "$url"
+
+              if [ -f "$out_file" ]; then
+                size=$(stat -c%s "$out_file" 2>/dev/null || echo 0)
+                if [ "$size" -gt 1048576 ]; then
+                  echo "SUCCESS (curl) — size: $((size/1024/1024)) MB"
+                  downloaded=1
+                  break
+                else
+                  echo "SKIP: curl file too small ($size bytes)"
+                  rm -f "$out_file"
+                fi
+              fi
+
+            fi
+
+            echo "FAILED: $url"
+
+          done
+
+          if [ "$downloaded" -eq 0 ]; then
+            echo ""
+            echo "ERROR: All URLs failed — nothing downloaded"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Downloaded files ==="
+          ls -lh downloads/
+
+      - name: Create ZIP
+        if: github.event.inputs.upload_mode == 'zip'
+        run: |
+          ts=$(date +"%Y%m%d_%H%M%S")
+          zip -r \
+            -P "${{ secrets.ZIP_PASSWORD }}" \
+            "buddy_media_${ts}.zip" \
+            downloads/
+
+      - name: Delete old releases
+        if: github.event.inputs.delete_old_releases == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          releases=$(gh release list --limit 100 | awk '{print $1}')
+          for tag in $releases; do
+            gh release delete "$tag" -y || true
+          done
+
+      - name: Upload Direct Release
+        if: github.event.inputs.upload_mode == 'direct'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: buddy-${{ github.run_number }}
+          files: "downloads/*"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload ZIP Release
+        if: github.event.inputs.upload_mode == 'zip'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: buddy-${{ github.run_number }}
+          files: "*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
