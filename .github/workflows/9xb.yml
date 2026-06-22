@@ -41,17 +41,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            zip \
-            curl \
-            aria2 \
-            jq \
-            gh
-
+          sudo apt-get install -y ffmpeg zip curl aria2 jq gh
           npm init -y
           npm install playwright
-
           npx playwright install chromium --with-deps
 
       - name: Prepare folders
@@ -63,18 +55,12 @@ jobs:
         run: |
           cat > buddy_dl.js << 'EOF'
 
-          const fs      = require('fs');
-          const path    = require('path');
-          const https   = require('https');
-          const http    = require('http');
+          const fs   = require('fs');
+          const path = require('path');
           const { chromium } = require('playwright');
 
           const PAGE_URL = process.argv[2];
-
-          if (!PAGE_URL) {
-            console.error('No URL provided');
-            process.exit(1);
-          }
+          if (!PAGE_URL) { console.error('No URL'); process.exit(1); }
 
           function sanitize(str) {
             return (str || 'video')
@@ -84,73 +70,27 @@ jobs:
               .slice(0, 80) || 'video';
           }
 
-          // Download using Node's http/https — carries the same headers
-          // Playwright used when it resolved the URL
-          function downloadFile(url, destPath, extraHeaders = {}) {
-            return new Promise((resolve, reject) => {
+          // domains that are NOT video files — skip these
+          const JUNK_DOMAINS = [
+            '123sudo.com', 'offmp3.com', 'savegif.com',
+            '9xbuddy.site', '9xbuddy.org', '9xbuddy.app',
+            'google.com', 'facebook.com', 'twitter.com'
+          ];
 
-              const follow = (u, redirects) => {
+          function isJunk(url) {
+            try {
+              const host = new URL(url).hostname;
+              return JUNK_DOMAINS.some(d => host.includes(d));
+            } catch { return true; }
+          }
 
-                if (redirects > 10) return reject(new Error('Too many redirects'));
-
-                const mod     = u.startsWith('https') ? https : http;
-                const options = {
-                  headers: {
-                    'User-Agent':
-                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                      'Chrome/122.0.0.0 Safari/537.36',
-                    'Referer': 'https://9xbuddy.site/',
-                    ...extraHeaders
-                  }
-                };
-
-                const req = mod.get(u, options, (res) => {
-
-                  if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-                    const loc = res.headers['location'];
-                    console.log(`  REDIRECT ${res.statusCode} -> ${loc}`);
-                    return follow(loc, redirects + 1);
-                  }
-
-                  if (res.statusCode !== 200) {
-                    res.resume();
-                    return reject(new Error(`HTTP ${res.statusCode}`));
-                  }
-
-                  const total = parseInt(res.headers['content-length'] || '0', 10);
-                  let received = 0;
-                  let lastLog  = 0;
-
-                  const out = fs.createWriteStream(destPath);
-
-                  res.on('data', (chunk) => {
-                    received += chunk.length;
-                    const now = Date.now();
-                    if (now - lastLog > 5000) {
-                      const pct = total ? ((received / total) * 100).toFixed(1) : '?';
-                      console.log(`  ... ${(received/1024/1024).toFixed(1)} MB / ${(total/1024/1024).toFixed(1)} MB (${pct}%)`);
-                      lastLog = now;
-                    }
-                  });
-
-                  res.pipe(out);
-                  out.on('finish', () => resolve(received));
-                  out.on('error', reject);
-
-                });
-
-                req.on('error', reject);
-              };
-
-              follow(url, 0);
-            });
+          function isVideoUrl(url) {
+            return /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(url.split('?')[0]);
           }
 
           (async () => {
 
             const browser = await chromium.launch({ headless: true });
-
             const context = await browser.newContext({
               userAgent:
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -161,146 +101,122 @@ jobs:
 
             const page = await context.newPage();
 
-            // intercept all responses to catch direct video URLs early
-            const interceptedVideoUrls = [];
-
+            // intercept network responses to catch video URLs
+            const intercepted = [];
             page.on('response', async (response) => {
               try {
-                const u   = response.url();
-                const ct  = response.headers()['content-type'] || '';
+                const u  = response.url();
+                const ct = response.headers()['content-type'] || '';
                 if (
-                  /\.(mp4|m3u8|mkv|webm|vid)(\?|$)/i.test(u) ||
-                  ct.includes('video/')
+                  (isVideoUrl(u) || ct.startsWith('video/')) &&
+                  !isJunk(u) &&
+                  !intercepted.includes(u)
                 ) {
-                  if (!interceptedVideoUrls.includes(u)) {
-                    console.log('INTERCEPTED VIDEO RESPONSE:', u);
-                    interceptedVideoUrls.push(u);
-                  }
+                  console.log('INTERCEPTED:', u);
+                  intercepted.push(u);
                 }
               } catch (e) {}
             });
 
             console.log('Opening:', PAGE_URL);
+            await page.goto(PAGE_URL, { waitUntil: 'networkidle', timeout: 60000 });
 
-            await page.goto(PAGE_URL, {
-              waitUntil: 'networkidle',
-              timeout: 60000
-            });
-
-            // wait for download rows to render
-            console.log('Waiting for content...');
+            console.log('Waiting for page to render...');
             try {
               await page.waitForSelector('a[href], button', { timeout: 20000 });
             } catch (e) {}
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(4000);
 
             const rawTitle = (await page.title()).trim();
             const title    = sanitize(rawTitle);
-            console.log('PAGE TITLE:', rawTitle, '→', title);
+            console.log('TITLE:', rawTitle, '->', title);
 
-            // collect ALL cookies from this session
-            const cookies = await context.cookies();
-            const cookieHeader = cookies
-              .map(c => `${c.name}=${c.value}`)
-              .join('; ');
+            // collect direct .mp4 links from DOM (before any clicks)
+            const domVideoUrls = await page.$$eval('a', els =>
+              els.map(a => a.href || '').filter(Boolean)
+            ).then(hrefs => hrefs.filter(h => !isJunk(h) && isVideoUrl(h)));
 
-            console.log(`Session cookies: ${cookies.length}`);
+            console.log('DOM video links:', domVideoUrls.length);
 
-            // find candidate download links from the DOM
-            const domUrls = await page.$$eval('a', (els) =>
-              els
-                .map(a => a.href || '')
-                .filter(href =>
-                  href.startsWith('http') &&
-                  (
-                    /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href) ||
-                    /\/download\//i.test(href)  ||
-                    /[?&]url=/i.test(href)
-                  )
-                )
-            );
-
-            // also click download buttons and capture where they navigate
+            // click only buttons whose text says "download" but NOT "app"/"software"/"extension"
+            const buttons = await page.$$('a, button');
             const clickedUrls = [];
 
-            const downloadButtons = await page.$$('a, button');
-
-            for (const btn of downloadButtons) {
+            for (const btn of buttons) {
               try {
                 const txt  = (await btn.innerText()).trim().toLowerCase();
-                const href = (await btn.getAttribute('href')) || '';
+                const href = (await btn.getAttribute('href') || '').toLowerCase();
+
+                // skip "download app / download software / download extension"
+                if (/app|software|extension|program/.test(txt)) continue;
 
                 if (!txt.includes('download') && !href.includes('download')) continue;
 
-                // skip obvious non-file links
-                if (href.startsWith('javascript') || href === '#') continue;
-
-                if (
-                  href.startsWith('http') &&
-                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href) &&
-                  !clickedUrls.includes(href)
-                ) {
-                  console.log('Direct link from DOM:', href);
-                  clickedUrls.push(href);
+                // if it's already a direct video link, grab it without clicking
+                const fullHref = (await btn.getAttribute('href')) || '';
+                if (fullHref.startsWith('http') && isVideoUrl(fullHref) && !isJunk(fullHref)) {
+                  if (!clickedUrls.includes(fullHref)) {
+                    console.log('Direct href:', fullHref);
+                    clickedUrls.push(fullHref);
+                  }
                   continue;
                 }
 
-                console.log('Clicking button:', txt || href);
+                console.log('Clicking:', txt || href);
 
-                // open in new tab to avoid navigating away
+                // open in new tab so we don't navigate away
                 const [newPage] = await Promise.all([
-                  context.waitForEvent('page', { timeout: 10000 }).catch(() => null),
+                  context.waitForEvent('page', { timeout: 12000 }).catch(() => null),
                   btn.click({ modifiers: ['Meta'] }).catch(async () => {
                     await btn.click().catch(() => {});
                   })
                 ]);
 
-                // wait for anti-bot loader (9xbuddy shows spinner ~3-8s)
+                // wait for anti-bot spinner (9xbuddy ~3-8s)
                 await page.waitForTimeout(10000);
 
                 if (newPage) {
                   try {
                     await newPage.waitForLoadState('networkidle', { timeout: 15000 });
                     const u = newPage.url();
-                    console.log('NEW TAB URL:', u);
-                    if (u && u !== 'about:blank' && !clickedUrls.includes(u)) {
-                      clickedUrls.push(u);
+                    if (u && u !== 'about:blank' && !isJunk(u)) {
+                      console.log('NEW TAB:', u);
+                      if (!clickedUrls.includes(u)) clickedUrls.push(u);
                     }
                     await newPage.close();
-                  } catch (e) {}
+                  } catch (e) { try { await newPage.close(); } catch {} }
                 }
 
-                // check if the button href was updated after click
+                // re-check href after click (9xbuddy sometimes updates it)
                 const newHref = (await btn.getAttribute('href').catch(() => '')) || '';
-                if (
-                  newHref.startsWith('http') &&
-                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(newHref) &&
-                  !clickedUrls.includes(newHref)
-                ) {
-                  console.log('RESOLVED after click:', newHref);
-                  clickedUrls.push(newHref);
+                if (newHref.startsWith('http') && isVideoUrl(newHref) && !isJunk(newHref)) {
+                  if (!clickedUrls.includes(newHref)) {
+                    console.log('RESOLVED after click:', newHref);
+                    clickedUrls.push(newHref);
+                  }
                 }
 
               } catch (e) {}
             }
 
-            // merge all URL sources; intercepted first (most reliable)
+            // merge: intercepted first (most trustworthy), then DOM, then clicked
             const allUrls = [
-              ...interceptedVideoUrls,
-              ...clickedUrls,
-              ...domUrls
+              ...intercepted,
+              ...domVideoUrls,
+              ...clickedUrls.filter(u => isVideoUrl(u) && !isJunk(u))
             ].filter((u, i, arr) => u && arr.indexOf(u) === i);
 
-            console.log(`\nTotal candidate URLs: ${allUrls.length}`);
+            console.log('\nCandidate URLs:', allUrls.length);
             allUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
 
             if (allUrls.length === 0) {
-              console.error('No download URLs found!');
+              console.error('No video URLs found!');
               await browser.close();
               process.exit(1);
             }
 
-            // --- attempt download with session cookies ---
+            // --- download using Playwright's own request context ---
+            // This carries the exact same session (cookies, headers) as the browser
             let downloaded = false;
 
             for (const url of allUrls) {
@@ -313,35 +229,54 @@ jobs:
               let ext = extMatch ? extMatch[1].toLowerCase() : 'mp4';
               if (ext === 'vid') ext = 'mp4';
 
-              const destPath = path.join('downloads', `${title}.${ext}`);
-
               if (ext === 'm3u8') {
-                // for HLS write a helper file; ffmpeg step will handle it
-                fs.writeFileSync('grabbed/hls_url.txt', url);
-                fs.writeFileSync('grabbed/hls_title.txt', title);
-                fs.writeFileSync('grabbed/hls_cookies.txt', cookieHeader);
-                console.log('HLS URL written — will use ffmpeg');
+                // HLS: hand off to ffmpeg — write cookies separately
+                const cookies  = await context.cookies();
+                const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+                fs.writeFileSync('grabbed/hls_url.txt',     url);
+                fs.writeFileSync('grabbed/hls_title.txt',   title);
+                fs.writeFileSync('grabbed/hls_cookies.txt', cookieStr);
+                console.log('HLS — will use ffmpeg');
                 downloaded = true;
                 break;
               }
 
+              const destPath = path.join('downloads', `${title}.${ext}`);
+
               try {
-                const bytes = await downloadFile(url, destPath, {
-                  'Cookie': cookieHeader
+
+                // page.request keeps the same browser session (IP, TLS fingerprint, cookies)
+                const response = await page.request.get(url, {
+                  headers: {
+                    'Referer':        'https://9xbuddy.site/',
+                    'Origin':         'https://9xbuddy.site',
+                    'Accept':         '*/*',
+                    'Accept-Language':'en-US,en;q=0.9',
+                  },
+                  timeout: 0   // no timeout for large files
                 });
 
-                if (bytes > 1_048_576) {
-                  console.log(`SUCCESS: ${(bytes/1024/1024).toFixed(1)} MB -> ${destPath}`);
-                  downloaded = true;
-                  break;
-                } else {
-                  console.log(`SKIP: too small (${bytes} bytes)`);
-                  fs.unlinkSync(destPath);
+                console.log('Status:', response.status());
+
+                if (!response.ok()) {
+                  console.log('SKIP: non-200 status', response.status());
+                  continue;
                 }
+
+                const body = await response.body();
+
+                if (body.length < 1_048_576) {
+                  console.log(`SKIP: too small (${body.length} bytes)`);
+                  continue;
+                }
+
+                fs.writeFileSync(destPath, body);
+                console.log(`SUCCESS: ${(body.length/1024/1024).toFixed(1)} MB -> ${destPath}`);
+                downloaded = true;
+                break;
 
               } catch (err) {
                 console.log('FAILED:', err.message);
-                if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
               }
             }
 
@@ -356,7 +291,7 @@ jobs:
 
           EOF
 
-      - name: Run Playwright (download inside browser session)
+      - name: Run Playwright
         run: |
           node buddy_dl.js "${{ github.event.inputs.page_url }}"
 
@@ -366,9 +301,7 @@ jobs:
             url=$(cat grabbed/hls_url.txt)
             title=$(cat grabbed/hls_title.txt)
             cookies=$(cat grabbed/hls_cookies.txt)
-
             echo "HLS download: $url"
-
             ffmpeg -y \
               -user_agent "Mozilla/5.0" \
               -headers "Cookie: ${cookies}" \
@@ -420,3 +353,4 @@ jobs:
           files: "*.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
