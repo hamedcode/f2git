@@ -3,8 +3,8 @@ name: 6 - 9xBuddy Downloader
 on:
   workflow_dispatch:
     inputs:
-      page_url:
-        description: "9xbuddy process URL (e.g. https://9xbuddy.site/process?url=...)"
+      source_url:
+        description: "لینک مستقیم فایل (مثلاً https://miixdrop.net/f/7k38ql4zid1vkr9)"
         required: true
 
       upload_mode:
@@ -59,8 +59,11 @@ jobs:
           const path = require('path');
           const { chromium } = require('playwright');
 
-          const PAGE_URL = process.argv[2];
-          if (!PAGE_URL) { console.error('No URL'); process.exit(1); }
+          const SOURCE_URL = process.argv[2];
+          if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
+
+          // 9xbuddy process page URL
+          const BUDDY_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
 
           function sanitize(str) {
             return (str || 'video')
@@ -73,14 +76,64 @@ jobs:
           const JUNK_DOMAINS = [
             '123sudo.com','offmp3.com','savegif.com',
             '9xbuddy.site','9xbuddy.org','9xbuddy.app',
-            'google.com','facebook.com','twitter.com'
+            'google.com','facebook.com','twitter.com','youtube.com'
           ];
           function isJunk(url) {
             try { const h = new URL(url).hostname; return JUNK_DOMAINS.some(d => h.includes(d)); }
             catch { return true; }
           }
-          function isVideoUrl(url) {
+          function isVideoFile(url) {
             return /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(url.split('?')[0]);
+          }
+
+          async function tryDownload(page, context, url, title) {
+            const extMatch = url.split('?')[0].match(/\.(mp4|m3u8|mkv|avi|mov|webm|vid)$/i);
+            let ext = extMatch ? extMatch[1].toLowerCase() : 'mp4';
+            if (ext === 'vid') ext = 'mp4';
+
+            if (ext === 'm3u8') {
+              const cookies = await context.cookies();
+              fs.writeFileSync('grabbed/hls_url.txt',     url);
+              fs.writeFileSync('grabbed/hls_title.txt',   title);
+              fs.writeFileSync('grabbed/hls_cookies.txt', cookies.map(c=>`${c.name}=${c.value}`).join('; '));
+              console.log('HLS URL saved for ffmpeg');
+              return 'hls';
+            }
+
+            const dest = path.join('downloads', `${title}.${ext}`);
+
+            try {
+              console.log('  Requesting with browser session...');
+              const resp = await page.request.get(url, {
+                headers: {
+                  'Referer':        'https://9xbuddy.site/',
+                  'Origin':         'https://9xbuddy.site',
+                  'Accept':         '*/*',
+                  'Accept-Language':'en-US,en;q=0.9',
+                },
+                timeout: 0
+              });
+
+              console.log('  HTTP Status:', resp.status());
+
+              if (!resp.ok()) return false;
+
+              const body = await resp.body();
+              console.log('  Size:', (body.length / 1024 / 1024).toFixed(2), 'MB');
+
+              if (body.length < 1_048_576) {
+                console.log('  Too small — skip');
+                return false;
+              }
+
+              fs.writeFileSync(dest, body);
+              console.log('  SAVED ->', dest);
+              return true;
+
+            } catch (err) {
+              console.log('  ERROR:', err.message);
+              return false;
+            }
           }
 
           (async () => {
@@ -96,204 +149,139 @@ jobs:
 
             const page = await context.newPage();
 
-            // ── KEY STRATEGY ─────────────────────────────────────────────
-            // Intercept network responses.
-            // The moment a real video URL appears → download it immediately
-            // using page.request (same browser session/IP/TLS fingerprint).
-            // Do NOT wait for all buttons to be clicked first.
-            // ─────────────────────────────────────────────────────────────
-
-            let downloadPromiseResolve = null;
-            const downloadPromise = new Promise(res => { downloadPromiseResolve = res; });
-            let downloaded = false;
-
-            page.on('response', async (response) => {
-              if (downloaded) return;
-              try {
-                const u  = response.url();
-                const ct = response.headers()['content-type'] || '';
-                const status = response.status();
-
-                // catch actual video being streamed (content-type video/*)
-                if ((ct.startsWith('video/') || ct === 'application/octet-stream') && status === 200) {
-                  if (isJunk(u)) return;
-                  console.log('STREAMING RESPONSE CAUGHT:', u);
-                  console.log('Content-Type:', ct, '| Status:', status);
-                  // try to read the body directly from this response
-                  try {
-                    const body = await response.body();
-                    if (body.length > 1_048_576) {
-                      const title = sanitize((await page.title()).trim());
-                      const ext   = u.split('?')[0].match(/\.(mp4|mkv|webm|mov)/i)?.[1] || 'mp4';
-                      const dest  = path.join('downloads', `${title}.${ext}`);
-                      fs.writeFileSync(dest, body);
-                      console.log(`SAVED from stream: ${(body.length/1024/1024).toFixed(1)} MB -> ${dest}`);
-                      downloaded = true;
-                      downloadPromiseResolve('done');
-                    }
-                  } catch (e) {
-                    console.log('Could not read stream body:', e.message);
-                  }
-                }
-              } catch (e) {}
+            // ── STEP 1: go to 9xbuddy homepage, paste URL, submit ────────
+            console.log('=== Step 1: Opening 9xbuddy ===');
+            await page.goto('https://9xbuddy.site/', {
+              waitUntil: 'networkidle',
+              timeout: 30000
             });
 
-            console.log('Opening:', PAGE_URL);
-            await page.goto(PAGE_URL, { waitUntil: 'networkidle', timeout: 60000 });
+            // find the input box and type the source URL
+            console.log('Entering source URL:', SOURCE_URL);
+            try {
+              // 9xbuddy has an input with placeholder like "Paste link here"
+              const input = await page.waitForSelector(
+                'input[type="text"], input[type="url"], input[placeholder*="link"], input[placeholder*="url"], input[placeholder*="URL"], input[placeholder*="paste"]',
+                { timeout: 10000 }
+              );
+              await input.fill(SOURCE_URL);
+              console.log('URL entered in input box');
 
-            console.log('Waiting for page to render...');
-            try { await page.waitForSelector('a[href], button', { timeout: 20000 }); } catch (e) {}
+              // submit: press Enter or click the download/go button
+              await Promise.race([
+                page.keyboard.press('Enter'),
+                page.click('button[type="submit"], button:has-text("Download"), button:has-text("Go")').catch(() => {})
+              ]);
+
+            } catch (e) {
+              // fallback: navigate directly to process URL
+              console.log('Input not found, navigating directly to process URL');
+              console.log('Process URL:', BUDDY_URL);
+            }
+
+            // ── STEP 2: wait on the process page for links to appear ─────
+            console.log('\n=== Step 2: Waiting for process page ===');
+            await page.waitForURL('**/process**', { timeout: 15000 }).catch(async () => {
+              // if page didn't navigate to /process, go there directly
+              console.log('Navigating directly to:', BUDDY_URL);
+              await page.goto(BUDDY_URL, { waitUntil: 'networkidle', timeout: 60000 });
+            });
+
+            // wait for download links to render (JS-heavy page)
+            console.log('Waiting for download links to render...');
+            try {
+              await page.waitForSelector(
+                'a[href*="download"], a[href*=".mp4"], a[href*=".m3u8"], button:has-text("Download")',
+                { timeout: 30000 }
+              );
+            } catch (e) {
+              console.log('Selector timeout, continuing anyway...');
+            }
             await page.waitForTimeout(3000);
 
             const rawTitle = (await page.title()).trim();
             const title    = sanitize(rawTitle);
-            console.log('TITLE:', rawTitle, '->', title);
+            console.log('PAGE TITLE:', rawTitle, '->', title);
 
-            // collect direct video links from DOM (before any clicks)
+            // ── STEP 3: collect DOM video links and try immediately ───────
+            console.log('\n=== Step 3: Checking DOM links ===');
+
             const domVideoUrls = (await page.$$eval('a', els => els.map(a => a.href || '')))
-              .filter(h => isVideoUrl(h) && !isJunk(h));
+              .filter(h => isVideoFile(h) && !isJunk(h));
 
-            console.log('DOM video links found:', domVideoUrls.length);
+            console.log('DOM video links:', domVideoUrls.length);
 
-            // try DOM links immediately — before clicking anything
             for (const url of domVideoUrls) {
-              if (downloaded) break;
-              console.log('\nTRYING DOM link immediately:', url);
-              try {
-                const resp = await page.request.get(url, {
-                  headers: {
-                    'Referer':        'https://9xbuddy.site/',
-                    'Origin':         'https://9xbuddy.site',
-                    'Accept':         '*/*',
-                    'Accept-Language':'en-US,en;q=0.9',
-                  },
-                  timeout: 0
-                });
-                console.log('Status:', resp.status());
-                if (resp.ok()) {
-                  const body = await resp.body();
-                  if (body.length > 1_048_576) {
-                    const extMatch = url.split('?')[0].match(/\.(mp4|m3u8|mkv|avi|mov|webm|vid)$/i);
-                    let ext = extMatch ? extMatch[1].toLowerCase() : 'mp4';
-                    if (ext === 'vid') ext = 'mp4';
-                    if (ext === 'm3u8') {
-                      // HLS fallback
-                      const cookies = await context.cookies();
-                      fs.writeFileSync('grabbed/hls_url.txt',     url);
-                      fs.writeFileSync('grabbed/hls_title.txt',   title);
-                      fs.writeFileSync('grabbed/hls_cookies.txt', cookies.map(c=>`${c.name}=${c.value}`).join('; '));
-                      downloaded = true;
-                      downloadPromiseResolve('hls');
-                    } else {
-                      const dest = path.join('downloads', `${title}.${ext}`);
-                      fs.writeFileSync(dest, body);
-                      console.log(`SUCCESS: ${(body.length/1024/1024).toFixed(1)} MB -> ${dest}`);
-                      downloaded = true;
-                      downloadPromiseResolve('done');
-                    }
-                  } else {
-                    console.log('Too small, skip:', body.length, 'bytes');
-                  }
-                }
-              } catch (err) {
-                console.log('FAILED:', err.message);
+              console.log('\nTRYING:', url);
+              const result = await tryDownload(page, context, url, title);
+              if (result) {
+                await browser.close();
+                process.exit(0);
               }
             }
 
-            if (downloaded) {
-              await browser.close();
-              process.exit(0);
-            }
+            // ── STEP 4: click each download button → try resolved URL ─────
+            console.log('\n=== Step 4: Clicking download buttons ===');
 
-            // if DOM links didn't work, click download buttons one at a time
-            // and try each resolved URL immediately (don't collect all first)
             const buttons = await page.$$('a, button');
 
             for (const btn of buttons) {
-              if (downloaded) break;
               try {
                 const txt  = (await btn.innerText()).trim().toLowerCase();
                 const href = (await btn.getAttribute('href') || '').toLowerCase();
 
+                // skip junk buttons
                 if (/app|software|extension|program/.test(txt)) continue;
                 if (!txt.includes('download') && !href.includes('download')) continue;
 
                 const fullHref = (await btn.getAttribute('href')) || '';
 
-                // if it's already a direct video link, try it now
-                if (fullHref.startsWith('http') && isVideoUrl(fullHref) && !isJunk(fullHref)) {
-                  console.log('\nTRYING direct href:', fullHref);
-                  try {
-                    const resp = await page.request.get(fullHref, {
-                      headers: { 'Referer': 'https://9xbuddy.site/', 'Accept': '*/*' },
-                      timeout: 0
-                    });
-                    console.log('Status:', resp.status());
-                    if (resp.ok()) {
-                      const body = await resp.body();
-                      if (body.length > 1_048_576) {
-                        const extM = fullHref.split('?')[0].match(/\.(mp4|mkv|webm|mov|vid)$/i);
-                        let ext = extM ? extM[1].toLowerCase() : 'mp4';
-                        if (ext === 'vid') ext = 'mp4';
-                        const dest = path.join('downloads', `${title}.${ext}`);
-                        fs.writeFileSync(dest, body);
-                        console.log(`SUCCESS: ${(body.length/1024/1024).toFixed(1)} MB -> ${dest}`);
-                        downloaded = true;
-                        break;
-                      }
-                    }
-                  } catch (e) { console.log('FAILED:', e.message); }
+                // if already a resolved video link
+                if (fullHref.startsWith('http') && isVideoFile(fullHref) && !isJunk(fullHref)) {
+                  console.log('\nDirect href button:', fullHref);
+                  const result = await tryDownload(page, context, fullHref, title);
+                  if (result) { await browser.close(); process.exit(0); }
                   continue;
                 }
 
-                console.log('\nClicking:', txt || href);
+                console.log('\nClicking button:', txt || href);
 
-                // click button, wait for anti-bot loader, then check resolved href
-                await btn.click({ modifiers: ['Meta'] }).catch(async () => {
-                  await btn.click().catch(() => {});
-                });
+                // click (Cmd+click to open new tab, preventing navigation away)
+                const [newPage] = await Promise.all([
+                  context.waitForEvent('page', { timeout: 5000 }).catch(() => null),
+                  btn.click({ modifiers: ['Meta'] }).catch(async () => {
+                    await btn.click().catch(() => {});
+                  })
+                ]);
 
-                // wait for 9xbuddy's anti-bot spinner (usually 3-8s, we give 12s)
+                // wait for anti-bot spinner (9xbuddy: ~3–8s, we give 12s)
                 await page.waitForTimeout(12000);
 
+                // close any new tab that opened (likely software download page)
+                if (newPage) {
+                  const newUrl = newPage.url();
+                  if (newUrl && newUrl !== 'about:blank' && isVideoFile(newUrl) && !isJunk(newUrl)) {
+                    console.log('New tab has video URL:', newUrl);
+                    const result = await tryDownload(page, context, newUrl, title);
+                    if (result) { await browser.close(); process.exit(0); }
+                  }
+                  await newPage.close().catch(() => {});
+                }
+
+                // check if button href was updated after click
                 const resolvedHref = (await btn.getAttribute('href').catch(() => '')) || '';
-                if (resolvedHref.startsWith('http') && isVideoUrl(resolvedHref) && !isJunk(resolvedHref)) {
-                  console.log('RESOLVED:', resolvedHref);
-                  try {
-                    const resp = await page.request.get(resolvedHref, {
-                      headers: { 'Referer': 'https://9xbuddy.site/', 'Accept': '*/*' },
-                      timeout: 0
-                    });
-                    console.log('Status:', resp.status());
-                    if (resp.ok()) {
-                      const body = await resp.body();
-                      if (body.length > 1_048_576) {
-                        const extM = resolvedHref.split('?')[0].match(/\.(mp4|mkv|webm|mov|vid)$/i);
-                        let ext = extM ? extM[1].toLowerCase() : 'mp4';
-                        if (ext === 'vid') ext = 'mp4';
-                        const dest = path.join('downloads', `${title}.${ext}`);
-                        fs.writeFileSync(dest, body);
-                        console.log(`SUCCESS: ${(body.length/1024/1024).toFixed(1)} MB -> ${dest}`);
-                        downloaded = true;
-                        break;
-                      } else {
-                        console.log('Too small:', body.length, 'bytes');
-                      }
-                    } else {
-                      console.log('Non-200:', resp.status());
-                    }
-                  } catch (e) { console.log('FAILED:', e.message); }
+                if (resolvedHref.startsWith('http') && isVideoFile(resolvedHref) && !isJunk(resolvedHref)) {
+                  console.log('Resolved href:', resolvedHref);
+                  const result = await tryDownload(page, context, resolvedHref, title);
+                  if (result) { await browser.close(); process.exit(0); }
                 }
 
               } catch (e) {}
             }
 
             await browser.close();
-
-            if (!downloaded) {
-              console.error('All URLs failed!');
-              process.exit(1);
-            }
+            console.error('\nAll attempts failed!');
+            process.exit(1);
 
           })();
 
@@ -301,7 +289,7 @@ jobs:
 
       - name: Run Playwright
         run: |
-          node buddy_dl.js "${{ github.event.inputs.page_url }}"
+          node buddy_dl.js "${{ github.event.inputs.source_url }}"
 
       - name: Download HLS if needed
         run: |
