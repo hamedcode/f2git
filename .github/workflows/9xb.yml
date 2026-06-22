@@ -63,8 +63,10 @@ jobs:
         run: |
           cat > buddy_dl.js << 'EOF'
 
-          const fs   = require('fs');
-          const path = require('path');
+          const fs      = require('fs');
+          const path    = require('path');
+          const https   = require('https');
+          const http    = require('http');
           const { chromium } = require('playwright');
 
           const PAGE_URL = process.argv[2];
@@ -74,13 +76,75 @@ jobs:
             process.exit(1);
           }
 
-          // sanitize a string for use as filename (max 80 chars)
           function sanitize(str) {
             return (str || 'video')
               .replace(/[^a-zA-Z0-9 ._-]/g, '_')
               .replace(/[_ ]+/g, '_')
               .replace(/^_|_$/g, '')
               .slice(0, 80) || 'video';
+          }
+
+          // Download using Node's http/https — carries the same headers
+          // Playwright used when it resolved the URL
+          function downloadFile(url, destPath, extraHeaders = {}) {
+            return new Promise((resolve, reject) => {
+
+              const follow = (u, redirects) => {
+
+                if (redirects > 10) return reject(new Error('Too many redirects'));
+
+                const mod     = u.startsWith('https') ? https : http;
+                const options = {
+                  headers: {
+                    'User-Agent':
+                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                      'Chrome/122.0.0.0 Safari/537.36',
+                    'Referer': 'https://9xbuddy.site/',
+                    ...extraHeaders
+                  }
+                };
+
+                const req = mod.get(u, options, (res) => {
+
+                  if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+                    const loc = res.headers['location'];
+                    console.log(`  REDIRECT ${res.statusCode} -> ${loc}`);
+                    return follow(loc, redirects + 1);
+                  }
+
+                  if (res.statusCode !== 200) {
+                    res.resume();
+                    return reject(new Error(`HTTP ${res.statusCode}`));
+                  }
+
+                  const total = parseInt(res.headers['content-length'] || '0', 10);
+                  let received = 0;
+                  let lastLog  = 0;
+
+                  const out = fs.createWriteStream(destPath);
+
+                  res.on('data', (chunk) => {
+                    received += chunk.length;
+                    const now = Date.now();
+                    if (now - lastLog > 5000) {
+                      const pct = total ? ((received / total) * 100).toFixed(1) : '?';
+                      console.log(`  ... ${(received/1024/1024).toFixed(1)} MB / ${(total/1024/1024).toFixed(1)} MB (${pct}%)`);
+                      lastLog = now;
+                    }
+                  });
+
+                  res.pipe(out);
+                  out.on('finish', () => resolve(received));
+                  out.on('error', reject);
+
+                });
+
+                req.on('error', reject);
+              };
+
+              follow(url, 0);
+            });
           }
 
           (async () => {
@@ -91,10 +155,30 @@ jobs:
               userAgent:
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                'Chrome/122.0.0.0 Safari/537.36'
+                'Chrome/122.0.0.0 Safari/537.36',
+              acceptDownloads: true
             });
 
             const page = await context.newPage();
+
+            // intercept all responses to catch direct video URLs early
+            const interceptedVideoUrls = [];
+
+            page.on('response', async (response) => {
+              try {
+                const u   = response.url();
+                const ct  = response.headers()['content-type'] || '';
+                if (
+                  /\.(mp4|m3u8|mkv|webm|vid)(\?|$)/i.test(u) ||
+                  ct.includes('video/')
+                ) {
+                  if (!interceptedVideoUrls.includes(u)) {
+                    console.log('INTERCEPTED VIDEO RESPONSE:', u);
+                    interceptedVideoUrls.push(u);
+                  }
+                }
+              } catch (e) {}
+            });
 
             console.log('Opening:', PAGE_URL);
 
@@ -103,254 +187,202 @@ jobs:
               timeout: 60000
             });
 
-            // wait for download buttons to appear
-            // 9xbuddy renders a list of quality/server rows
-            console.log('Waiting for download links to render...');
-
+            // wait for download rows to render
+            console.log('Waiting for content...');
             try {
-              await page.waitForSelector('a[href*="download"], a.download-btn, button:has-text("Download")', {
-                timeout: 30000
-              });
-            } catch (e) {
-              console.log('Selector timeout — trying anyway...');
-            }
-
-            // extra wait for any lazy-loaded content
+              await page.waitForSelector('a[href], button', { timeout: 20000 });
+            } catch (e) {}
             await page.waitForTimeout(5000);
 
-            // grab page title for filename
             const rawTitle = (await page.title()).trim();
             const title    = sanitize(rawTitle);
-            console.log('PAGE TITLE:', rawTitle);
+            console.log('PAGE TITLE:', rawTitle, '→', title);
 
-            // collect all candidate download anchors
-            // 9xbuddy puts direct links in <a> tags with download attribute
-            // or href pointing to the actual file
-            const anchors = await page.$$eval('a', (els) =>
+            // collect ALL cookies from this session
+            const cookies = await context.cookies();
+            const cookieHeader = cookies
+              .map(c => `${c.name}=${c.value}`)
+              .join('; ');
+
+            console.log(`Session cookies: ${cookies.length}`);
+
+            // find candidate download links from the DOM
+            const domUrls = await page.$$eval('a', (els) =>
               els
-                .map(a => ({
-                  href:  a.href  || '',
-                  text:  (a.innerText || a.textContent || '').trim(),
-                  dl:    a.hasAttribute('download')
-                }))
-                .filter(a =>
-                  a.href &&
-                  !a.href.startsWith('javascript') &&
+                .map(a => a.href || '')
+                .filter(href =>
+                  href.startsWith('http') &&
                   (
-                    a.dl ||
-                    /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(a.href) ||
-                    /download/i.test(a.href)
+                    /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href) ||
+                    /\/download\//i.test(href)  ||
+                    /[?&]url=/i.test(href)
                   )
                 )
             );
 
-            console.log(`Found ${anchors.length} candidate anchor(s)`);
-
-            // also intercept any navigation / new-tab URLs triggered by clicks
+            // also click download buttons and capture where they navigate
             const clickedUrls = [];
 
-            context.on('page', async (newPage) => {
+            const downloadButtons = await page.$$('a, button');
+
+            for (const btn of downloadButtons) {
               try {
-                await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 });
-                const u = newPage.url();
-                console.log('NEW TAB:', u);
-                if (u && u !== 'about:blank') clickedUrls.push(u);
-                await newPage.close();
-              } catch (e) {}
-            });
+                const txt  = (await btn.innerText()).trim().toLowerCase();
+                const href = (await btn.getAttribute('href')) || '';
 
-            // build list of direct file URLs from anchors
-            const directUrls = anchors
-              .map(a => a.href)
-              .filter(href =>
-                /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href) ||
-                href.includes('/download')
-              );
+                if (!txt.includes('download') && !href.includes('download')) continue;
 
-            // also try clicking each button that has a loading delay
-            // to force 9xbuddy to resolve the real link
-            const buttons = await page.$$('a, button');
-            for (const btn of buttons) {
-              try {
-                const txt = (await btn.innerText()).trim().toLowerCase();
-                if (!txt.includes('download')) continue;
+                // skip obvious non-file links
+                if (href.startsWith('javascript') || href === '#') continue;
 
-                const href = await btn.getAttribute('href') || '';
                 if (
                   href.startsWith('http') &&
-                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href)
+                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(href) &&
+                  !clickedUrls.includes(href)
                 ) {
-                  // already a direct link — no need to click
-                  if (!directUrls.includes(href)) directUrls.push(href);
+                  console.log('Direct link from DOM:', href);
+                  clickedUrls.push(href);
                   continue;
                 }
 
-                console.log('Clicking download button:', txt, href);
+                console.log('Clicking button:', txt || href);
 
-                // click and wait for the anti-bot loader to finish
-                await btn.click({ timeout: 5000 }).catch(() => {});
-                await page.waitForTimeout(8000);
+                // open in new tab to avoid navigating away
+                const [newPage] = await Promise.all([
+                  context.waitForEvent('page', { timeout: 10000 }).catch(() => null),
+                  btn.click({ modifiers: ['Meta'] }).catch(async () => {
+                    await btn.click().catch(() => {});
+                  })
+                ]);
 
-                // check if href changed or a redirect happened
-                const newHref = await btn.getAttribute('href').catch(() => '');
+                // wait for anti-bot loader (9xbuddy shows spinner ~3-8s)
+                await page.waitForTimeout(10000);
+
+                if (newPage) {
+                  try {
+                    await newPage.waitForLoadState('networkidle', { timeout: 15000 });
+                    const u = newPage.url();
+                    console.log('NEW TAB URL:', u);
+                    if (u && u !== 'about:blank' && !clickedUrls.includes(u)) {
+                      clickedUrls.push(u);
+                    }
+                    await newPage.close();
+                  } catch (e) {}
+                }
+
+                // check if the button href was updated after click
+                const newHref = (await btn.getAttribute('href').catch(() => '')) || '';
                 if (
-                  newHref &&
                   newHref.startsWith('http') &&
                   /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(newHref) &&
-                  !directUrls.includes(newHref)
+                  !clickedUrls.includes(newHref)
                 ) {
-                  console.log('RESOLVED LINK:', newHref);
-                  directUrls.push(newHref);
+                  console.log('RESOLVED after click:', newHref);
+                  clickedUrls.push(newHref);
                 }
 
               } catch (e) {}
             }
 
-            // merge clicked new-tab URLs
-            for (const u of clickedUrls) {
-              if (!directUrls.includes(u)) directUrls.push(u);
+            // merge all URL sources; intercepted first (most reliable)
+            const allUrls = [
+              ...interceptedVideoUrls,
+              ...clickedUrls,
+              ...domUrls
+            ].filter((u, i, arr) => u && arr.indexOf(u) === i);
+
+            console.log(`\nTotal candidate URLs: ${allUrls.length}`);
+            allUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
+
+            if (allUrls.length === 0) {
+              console.error('No download URLs found!');
+              await browser.close();
+              process.exit(1);
             }
 
-            console.log(`\nTotal candidate download URLs: ${directUrls.length}`);
+            // --- attempt download with session cookies ---
+            let downloaded = false;
 
-            // write results for the shell step
-            const out = {
-              title,
-              urls: directUrls
-            };
+            for (const url of allUrls) {
 
-            fs.writeFileSync('grabbed/candidates.json', JSON.stringify(out, null, 2));
-            console.log('Wrote grabbed/candidates.json');
+              console.log('\n========================================');
+              console.log('TRYING:', url);
+              console.log('========================================');
+
+              const extMatch = url.split('?')[0].match(/\.(mp4|m3u8|mkv|avi|mov|webm|vid)$/i);
+              let ext = extMatch ? extMatch[1].toLowerCase() : 'mp4';
+              if (ext === 'vid') ext = 'mp4';
+
+              const destPath = path.join('downloads', `${title}.${ext}`);
+
+              if (ext === 'm3u8') {
+                // for HLS write a helper file; ffmpeg step will handle it
+                fs.writeFileSync('grabbed/hls_url.txt', url);
+                fs.writeFileSync('grabbed/hls_title.txt', title);
+                fs.writeFileSync('grabbed/hls_cookies.txt', cookieHeader);
+                console.log('HLS URL written — will use ffmpeg');
+                downloaded = true;
+                break;
+              }
+
+              try {
+                const bytes = await downloadFile(url, destPath, {
+                  'Cookie': cookieHeader
+                });
+
+                if (bytes > 1_048_576) {
+                  console.log(`SUCCESS: ${(bytes/1024/1024).toFixed(1)} MB -> ${destPath}`);
+                  downloaded = true;
+                  break;
+                } else {
+                  console.log(`SKIP: too small (${bytes} bytes)`);
+                  fs.unlinkSync(destPath);
+                }
+
+              } catch (err) {
+                console.log('FAILED:', err.message);
+                if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+              }
+            }
 
             await browser.close();
+
+            if (!downloaded) {
+              console.error('All URLs failed!');
+              process.exit(1);
+            }
 
           })();
 
           EOF
 
-      - name: Run Playwright
+      - name: Run Playwright (download inside browser session)
         run: |
           node buddy_dl.js "${{ github.event.inputs.page_url }}"
 
-      - name: Show candidates
+      - name: Download HLS if needed
         run: |
-          echo "=== candidates.json ==="
-          cat grabbed/candidates.json
+          if [ -f grabbed/hls_url.txt ]; then
+            url=$(cat grabbed/hls_url.txt)
+            title=$(cat grabbed/hls_title.txt)
+            cookies=$(cat grabbed/hls_cookies.txt)
 
-      - name: Try download links
-        run: |
+            echo "HLS download: $url"
 
-          if [ ! -f grabbed/candidates.json ]; then
-            echo "No candidates.json found"
-            exit 1
+            ffmpeg -y \
+              -user_agent "Mozilla/5.0" \
+              -headers "Cookie: ${cookies}" \
+              -i "$url" \
+              -c copy \
+              "downloads/${title}.mp4"
+          else
+            echo "No HLS — skipping"
           fi
 
-          title=$(jq -r '.title' grabbed/candidates.json)
-          mapfile -t urls < <(jq -r '.urls[]' grabbed/candidates.json)
-
-          echo "Title  : $title"
-          echo "URLs   : ${#urls[@]}"
-
-          downloaded=0
-
-          for url in "${urls[@]}"; do
-
-            [ -z "$url" ] && continue
-
-            echo ""
-            echo "========================================"
-            echo "TRYING: $url"
-            echo "========================================"
-
-            clean_url=$(echo "$url" | cut -d'?' -f1)
-            ext=$(echo "$clean_url" | grep -oiE '\.(mp4|m3u8|mkv|avi|mov|webm|vid)' | head -1 | tr -d '.')
-            [ "$ext" = "vid" ] && ext="mp4"
-            [ -z "$ext" ] && ext="mp4"
-
-            out_file="downloads/${title}.${ext}"
-
-            if [[ "$ext" == "m3u8" ]]; then
-
-              echo "[FFMPEG] HLS download"
-
-              ffmpeg -y \
-                -user_agent "Mozilla/5.0" \
-                -i "$url" \
-                -c copy \
-                "$out_file" && {
-                  echo "SUCCESS (ffmpeg)"
-                  downloaded=1
-                  break
-                }
-
-            else
-
-              echo "[ARIA2] trying..."
-
-              aria2c \
-                -x 16 -s 16 -k 1M \
-                -c \
-                --summary-interval=0 \
-                --download-result=hide \
-                --console-log-level=warn \
-                --max-tries=3 \
-                --retry-wait=5 \
-                --dir=downloads \
-                --out="${title}.${ext}" \
-                "$url"
-
-              result=$?
-
-              # verify file is not empty / too small (< 1 MB = probably error page)
-              if [ $result -eq 0 ] && [ -f "$out_file" ]; then
-                size=$(stat -c%s "$out_file" 2>/dev/null || echo 0)
-                if [ "$size" -gt 1048576 ]; then
-                  echo "SUCCESS (aria2) — size: $((size/1024/1024)) MB"
-                  downloaded=1
-                  break
-                else
-                  echo "SKIP: file too small ($size bytes), probably error page"
-                  rm -f "$out_file"
-                fi
-              fi
-
-              echo "[CURL] fallback..."
-
-              curl -L \
-                --retry 3 \
-                --connect-timeout 30 \
-                --max-time 3600 \
-                -A "Mozilla/5.0" \
-                -o "$out_file" \
-                "$url"
-
-              if [ -f "$out_file" ]; then
-                size=$(stat -c%s "$out_file" 2>/dev/null || echo 0)
-                if [ "$size" -gt 1048576 ]; then
-                  echo "SUCCESS (curl) — size: $((size/1024/1024)) MB"
-                  downloaded=1
-                  break
-                else
-                  echo "SKIP: curl file too small ($size bytes)"
-                  rm -f "$out_file"
-                fi
-              fi
-
-            fi
-
-            echo "FAILED: $url"
-
-          done
-
-          if [ "$downloaded" -eq 0 ]; then
-            echo ""
-            echo "ERROR: All URLs failed — nothing downloaded"
-            exit 1
-          fi
-
-          echo ""
-          echo "=== Downloaded files ==="
-          ls -lh downloads/
+      - name: Show results
+        run: |
+          echo "=== downloads/ ==="
+          ls -lh downloads/ || echo "(empty)"
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
@@ -388,4 +420,3 @@ jobs:
           files: "*.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
