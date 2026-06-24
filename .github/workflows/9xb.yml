@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_url:
-        description: "لینک مستقیم فایل (مثلاً https://miixdrop.net/f/abc123)"
+        description: "لینک فایل برای دانلود"
         required: true
 
       upload_mode:
@@ -62,7 +62,7 @@ jobs:
           const SOURCE_URL = process.argv[2];
           if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
 
-          const BUDDY_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
+          const PROCESS_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
 
           function sanitize(str) {
             return (str || 'video')
@@ -72,27 +72,13 @@ jobs:
               .slice(0, 80) || 'video';
           }
 
-          const JUNK_DOMAINS = [
-            '123sudo.com','offmp3.com','savegif.com',
-            '9xbuddy.site','9xbuddy.org','9xbuddy.app',
-            'google.com','facebook.com','twitter.com','youtube.com'
-          ];
-          function isJunk(url) {
-            try { const h = new URL(url).hostname; return JUNK_DOMAINS.some(d => h.includes(d)); }
-            catch { return true; }
-          }
           function isVideoFile(url) {
             return /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(url.split('?')[0]);
           }
 
           (async () => {
 
-            const browser = await chromium.launch({
-              headless: true,
-              // allow downloads to go to our downloads/ folder
-              downloadsPath: path.resolve('downloads')
-            });
-
+            const browser = await chromium.launch({ headless: true });
             const context = await browser.newContext({
               userAgent:
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -103,250 +89,190 @@ jobs:
 
             const page = await context.newPage();
 
-            // ── Watch ALL requests to log headers sent by the browser ─────
-            // This helps us capture the real Referer/Cookie the CDN expects
-            const videoRequests = [];
-            page.on('request', req => {
-              const u = req.url();
-              if (isVideoFile(u) && !isJunk(u)) {
-                console.log('VIDEO REQUEST:', u);
-                console.log('  headers:', JSON.stringify(req.headers(), null, 2));
-                videoRequests.push({ url: u, headers: req.headers() });
-              }
+            // ── intercept ALL responses ───────────────────────────────────
+            // هر چیزی که از شبکه رد می‌شه رو لاگ می‌کنیم
+            // هدف: پیدا کردن API call که لینک دانلود رو برمی‌گردونه
+            const capturedDownloadUrls = [];
+            const capturedApiResponses = [];
+
+            page.on('response', async (resp) => {
+              try {
+                const u  = resp.url();
+                const ct = resp.headers()['content-type'] || '';
+                const st = resp.status();
+
+                // لینک مستقیم ویدیو
+                if (isVideoFile(u) && !u.includes('9xbuddy')) {
+                  console.log(`[VIDEO RESPONSE ${st}] ${u}`);
+                  if (!capturedDownloadUrls.includes(u)) capturedDownloadUrls.push(u);
+                  return;
+                }
+
+                // JSON responses (API calls)
+                if (ct.includes('json') && u.includes('9xbuddy')) {
+                  const text = await resp.text().catch(() => '');
+                  console.log(`[JSON ${st}] ${u}`);
+                  console.log(`  body: ${text.slice(0, 300)}`);
+                  capturedApiResponses.push({ url: u, status: st, body: text });
+                }
+
+              } catch (e) {}
             });
 
-            // ── Watch for Playwright download events ──────────────────────
-            // When the browser triggers a file download, capture it
-            let downloadedFile = null;
-            context.on('page', newPage => {
-              newPage.on('download', async dl => {
-                console.log('DOWNLOAD EVENT on new page:', dl.url());
-                const dest = path.join('downloads', dl.suggestedFilename() || 'video.mp4');
-                await dl.saveAs(dest);
-                console.log('Saved:', dest);
-                downloadedFile = dest;
+            // ── باز کردن صفحه 9xbuddy ────────────────────────────────────
+            console.log('Opening:', PROCESS_URL);
+            await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
+
+            // صبر می‌کنیم تا همه JS calls تموم بشن
+            await page.waitForTimeout(8000);
+
+            const title = sanitize((await page.title()).trim());
+            console.log('Title:', title);
+
+            // ── بررسی API responses برای لینک دانلود ─────────────────────
+            console.log('\n=== API Responses captured:', capturedApiResponses.length, '===');
+            for (const r of capturedApiResponses) {
+              // دنبال URL های ویدیو توی body می‌گردیم
+              try {
+                const json = JSON.parse(r.body);
+                const str  = JSON.stringify(json);
+                const matches = str.match(/https?:\/\/[^"]+\.(mp4|m3u8|mkv|webm)(\?[^"]*)?/gi) || [];
+                for (const m of matches) {
+                  console.log('Found in API response:', m);
+                  if (!capturedDownloadUrls.includes(m)) capturedDownloadUrls.push(m);
+                }
+              } catch (e) {}
+            }
+
+            console.log('\n=== Video URLs found so far:', capturedDownloadUrls.length, '===');
+            capturedDownloadUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
+
+            // ── اگه هنوز لینک نداریم، روی دکمه‌ها کلیک کن ───────────────
+            if (capturedDownloadUrls.length === 0) {
+              console.log('\n=== Clicking download buttons ===');
+
+              // listen for popups
+              context.on('page', async (popup) => {
+                try {
+                  await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
+                  const u = popup.url();
+                  console.log('[POPUP]', u);
+                  if (isVideoFile(u) && !capturedDownloadUrls.includes(u)) {
+                    capturedDownloadUrls.push(u);
+                  }
+                  // listen inside popup too
+                  popup.on('response', async (resp) => {
+                    const pu = resp.url();
+                    if (isVideoFile(pu) && !capturedDownloadUrls.includes(pu)) {
+                      console.log('[POPUP VIDEO]', pu);
+                      capturedDownloadUrls.push(pu);
+                    }
+                  });
+                  await popup.waitForTimeout(5000);
+                } catch (e) {}
               });
-            });
-            page.on('download', async dl => {
-              console.log('DOWNLOAD EVENT:', dl.url());
-              const dest = path.join('downloads', dl.suggestedFilename() || 'video.mp4');
-              await dl.saveAs(dest);
-              console.log('Saved:', dest);
-              downloadedFile = dest;
-            });
 
-            // ── Watch responses for actual video data (200 + video/*) ─────
-            let interceptedVideoUrl  = null;
-            let interceptedHeaders   = null;
-            page.on('response', async resp => {
-              try {
-                const u   = resp.url();
-                const ct  = resp.headers()['content-type'] || '';
-                const st  = resp.status();
-                if (
-                  st === 200 &&
-                  (ct.startsWith('video/') || ct === 'application/octet-stream') &&
-                  !isJunk(u)
-                ) {
-                  console.log('VIDEO RESPONSE INTERCEPTED:', u, ct);
-                  interceptedVideoUrl = u;
-                  // capture the request headers that succeeded
-                  const req = resp.request();
-                  interceptedHeaders = req.headers();
-                }
-              } catch (e) {}
-            });
+              const buttons = await page.$$('a, button');
+              for (const btn of buttons) {
+                if (capturedDownloadUrls.length > 0) break;
+                try {
+                  const txt  = (await btn.innerText()).trim().toLowerCase();
+                  const href = (await btn.getAttribute('href') || '');
 
-            // ── Step 1: go to 9xbuddy, enter URL ─────────────────────────
-            console.log('=== Step 1: Opening 9xbuddy ===');
-            await page.goto('https://9xbuddy.site/', {
-              waitUntil: 'networkidle',
-              timeout: 30000
-            });
+                  if (/app|software|extension|program/.test(txt)) continue;
+                  if (!txt.includes('download') && !href.toLowerCase().includes('download')) continue;
 
-            console.log('Entering source URL:', SOURCE_URL);
-            try {
-              const input = await page.waitForSelector(
-                'input[type="text"], input[type="url"], input[placeholder*="link" i], input[placeholder*="url" i], input[placeholder*="paste" i]',
-                { timeout: 10000 }
-              );
-              await input.fill(SOURCE_URL);
+                  console.log('Clicking:', txt || href.slice(0, 60));
+                  await btn.click().catch(() => {});
+                  await page.waitForTimeout(10000);
 
-              await Promise.race([
-                page.keyboard.press('Enter'),
-                page.click('button[type="submit"], button:has-text("Download"), button:has-text("Go")').catch(() => {})
-              ]);
-              console.log('Submitted');
-            } catch (e) {
-              console.log('Input submit failed, going direct:', e.message);
-              await page.goto(BUDDY_URL, { waitUntil: 'networkidle', timeout: 60000 });
-            }
-
-            // ── Step 2: wait for process page + download links ────────────
-            console.log('\n=== Step 2: Waiting for process page ===');
-            await page.waitForURL('**/process**', { timeout: 15000 }).catch(async () => {
-              console.log('Still not on process page, navigating directly...');
-              await page.goto(BUDDY_URL, { waitUntil: 'networkidle', timeout: 60000 });
-            });
-
-            try {
-              await page.waitForSelector(
-                'a[href*=".mp4"], a[href*=".m3u8"], button:has-text("Download")',
-                { timeout: 30000 }
-              );
-            } catch (e) { console.log('Selector timeout, continuing...'); }
-
-            await page.waitForTimeout(3000);
-
-            const rawTitle = (await page.title()).trim();
-            const title    = sanitize(rawTitle);
-            console.log('TITLE:', rawTitle, '->', title);
-
-            // ── Step 3: click each download button ────────────────────────
-            // Strategy: let the BROWSER do the actual navigation/download
-            // so the CDN sees a real browser request with correct headers
-            console.log('\n=== Step 3: Clicking download buttons ===');
-
-            const buttons = await page.$$('a, button');
-
-            for (const btn of buttons) {
-              if (downloadedFile) break;
-
-              try {
-                const txt  = (await btn.innerText()).trim().toLowerCase();
-                const href = (await btn.getAttribute('href') || '');
-
-                if (/app|software|extension|program/.test(txt)) continue;
-                if (!txt.includes('download') && !href.toLowerCase().includes('download')) continue;
-
-                console.log('\nClicking:', txt || href.slice(0, 80));
-
-                // Normal left-click — let the browser navigate/download naturally
-                // Wrap in downloadEvent race so we catch if it triggers a download
-                const dlPromise = page.waitForEvent('download', { timeout: 15000 }).catch(() => null);
-
-                await btn.click().catch(() => {});
-
-                // wait for anti-bot spinner and potential navigation
-                await page.waitForTimeout(10000);
-
-                // check if a download was triggered
-                const dl = await dlPromise;
-                if (dl) {
-                  const dest = path.join('downloads', dl.suggestedFilename() || `${title}.mp4`);
-                  console.log('Download triggered! Saving to:', dest);
-                  await dl.saveAs(dest);
-                  downloadedFile = dest;
-                  break;
-                }
-
-                // check if href resolved to a video URL after click
-                const resolvedHref = (await btn.getAttribute('href').catch(() => '')) || '';
-                if (resolvedHref.startsWith('http') && isVideoFile(resolvedHref) && !isJunk(resolvedHref)) {
-                  console.log('Resolved href after click:', resolvedHref);
-
-                  // navigate the page directly to the video URL
-                  // this makes the browser send ALL the same headers it would
-                  // if a user clicked the link
-                  const dlPromise2 = page.waitForEvent('download', { timeout: 30000 }).catch(() => null);
-
-                  await page.goto(resolvedHref, { waitUntil: 'commit', timeout: 30000 }).catch(() => {});
-
-                  const dl2 = await dlPromise2;
-                  if (dl2) {
-                    const dest = path.join('downloads', dl2.suggestedFilename() || `${title}.mp4`);
-                    console.log('Download from navigation! Saving:', dest);
-                    await dl2.saveAs(dest);
-                    downloadedFile = dest;
-                    break;
+                  // بررسی href بعد از کلیک
+                  const newHref = (await btn.getAttribute('href').catch(() => '')) || '';
+                  if (isVideoFile(newHref) && !capturedDownloadUrls.includes(newHref)) {
+                    console.log('Resolved href:', newHref);
+                    capturedDownloadUrls.push(newHref);
                   }
-
-                  // if no download event but we have intercepted request headers, use aria2c
-                  if (interceptedHeaders) {
-                    console.log('Using intercepted headers with aria2c');
-                    fs.writeFileSync('grabbed/dl_url.txt', resolvedHref);
-                    fs.writeFileSync('grabbed/dl_title.txt', title);
-                    fs.writeFileSync('grabbed/dl_headers.json', JSON.stringify(interceptedHeaders));
-                    downloadedFile = 'aria2c';
-                    break;
-                  }
-                }
-
-              } catch (e) {}
+                } catch (e) {}
+              }
             }
 
-            // if we intercepted a video URL with working headers, save for aria2c
-            if (!downloadedFile && interceptedVideoUrl && interceptedHeaders) {
-              console.log('Using intercepted video URL with captured headers');
-              fs.writeFileSync('grabbed/dl_url.txt', interceptedVideoUrl);
-              fs.writeFileSync('grabbed/dl_title.txt', title);
-              fs.writeFileSync('grabbed/dl_headers.json', JSON.stringify(interceptedHeaders));
-              downloadedFile = 'aria2c';
-            }
+            // ── ذخیره نتایج برای debug ────────────────────────────────────
+            const result = { title, urls: capturedDownloadUrls, apiResponses: capturedApiResponses };
+            fs.writeFileSync('grabbed/result.json', JSON.stringify(result, null, 2));
 
-            // also save all video request info for debugging
-            fs.writeFileSync('grabbed/video_requests.json', JSON.stringify(videoRequests, null, 2));
+            console.log('\n=== Final URLs:', capturedDownloadUrls.length, '===');
+            capturedDownloadUrls.forEach((u,i) => console.log(` [${i+1}] ${u}`));
 
-            await browser.close();
-
-            if (!downloadedFile) {
-              console.error('All attempts failed!');
-              // print video requests for debugging
-              console.log('\nVideo requests seen:', videoRequests.length);
-              videoRequests.forEach((r,i) => console.log(`[${i+1}]`, r.url));
+            if (capturedDownloadUrls.length === 0) {
+              await browser.close();
+              console.error('No video URLs found!');
               process.exit(1);
             }
 
-            console.log('Done! downloadedFile =', downloadedFile);
+            // ── دانلود با همان browser session ───────────────────────────
+            let downloaded = false;
+
+            for (const url of capturedDownloadUrls) {
+              console.log('\nDownloading:', url);
+
+              const extM = url.split('?')[0].match(/\.(mp4|m3u8|mkv|webm|mov|vid)$/i);
+              let ext = extM ? extM[1].toLowerCase() : 'mp4';
+              if (ext === 'vid') ext = 'mp4';
+
+              if (ext === 'm3u8') {
+                const cookies = await context.cookies();
+                fs.writeFileSync('grabbed/hls_url.txt', url);
+                fs.writeFileSync('grabbed/hls_title.txt', title);
+                fs.writeFileSync('grabbed/hls_cookies.txt', cookies.map(c=>`${c.name}=${c.value}`).join('; '));
+                console.log('HLS — saved for ffmpeg');
+                downloaded = true;
+                break;
+              }
+
+              try {
+                const resp = await page.request.get(url, {
+                  headers: { 'Referer': 'https://9xbuddy.site/', 'Accept': '*/*' },
+                  timeout: 0
+                });
+                console.log('Status:', resp.status());
+                if (!resp.ok()) { console.log('Non-200, skip'); continue; }
+                const body = await resp.body();
+                console.log('Size:', (body.length/1024/1024).toFixed(2), 'MB');
+                if (body.length < 1_048_576) { console.log('Too small, skip'); continue; }
+                const dest = path.join('downloads', `${title}.${ext}`);
+                fs.writeFileSync(dest, body);
+                console.log('Saved:', dest);
+                downloaded = true;
+                break;
+              } catch (e) {
+                console.log('Error:', e.message);
+              }
+            }
+
+            await browser.close();
+            if (!downloaded) { console.error('Download failed!'); process.exit(1); }
 
           })();
 
           EOF
 
       - name: Run Playwright
+        run: node buddy_dl.js "${{ github.event.inputs.source_url }}"
+
+      - name: Download HLS if needed
         run: |
-          node buddy_dl.js "${{ github.event.inputs.source_url }}"
-
-      - name: Download with aria2c (if Playwright captured headers)
-        run: |
-          if [ ! -f grabbed/dl_url.txt ]; then
-            echo "No aria2c download needed"
-            exit 0
-          fi
-
-          url=$(cat grabbed/dl_url.txt)
-          title=$(cat grabbed/dl_title.txt)
-          ext=$(echo "$url" | grep -oiE '\.(mp4|mkv|webm|mov|vid)' | head -1 | tr -d '.' | sed 's/vid/mp4/')
-          ext=${ext:-mp4}
-
-          echo "aria2c download: $url"
-
-          # build header args from captured headers JSON
-          header_args=""
-          while IFS= read -r line; do
-            name=$(echo "$line" | jq -r '.name')
-            value=$(echo "$line" | jq -r '.value')
-            [ -z "$name" ] || [ "$name" = "null" ] && continue
-            header_args="$header_args --header=\"${name}: ${value}\""
-          done < <(jq -c 'to_entries[] | {name: .key, value: .value}' grabbed/dl_headers.json)
-
-          eval aria2c \
-            -x 16 -s 16 -k 1M \
-            -c \
-            --summary-interval=10 \
-            --console-log-level=warn \
-            $header_args \
-            --dir=downloads \
-            --out="${title}.${ext}" \
-            "\"$url\""
+          if [ ! -f grabbed/hls_url.txt ]; then echo "No HLS"; exit 0; fi
+          url=$(cat grabbed/hls_url.txt)
+          title=$(cat grabbed/hls_title.txt)
+          cookies=$(cat grabbed/hls_cookies.txt)
+          ffmpeg -y -user_agent "Mozilla/5.0" \
+            -headers "Cookie: ${cookies}" \
+            -i "$url" -c copy "downloads/${title}.mp4"
 
       - name: Show results
         run: |
-          echo "=== downloads/ ==="
-          ls -lh downloads/ || echo "(empty)"
-          echo ""
-          echo "=== video requests seen ==="
-          cat grabbed/video_requests.json 2>/dev/null || echo "(none)"
+          echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
+          echo "=== result.json ===" && cat grabbed/result.json 2>/dev/null || true
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
