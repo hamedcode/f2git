@@ -89,162 +89,148 @@ jobs:
 
             const page = await context.newPage();
 
-            // ── Step 1: صفحه رو باز کن تا session و JS bundle لود بشه ───
-            console.log('Opening process page:', PROCESS_URL);
+            // ── intercept همه responses از ab.9xbud.com ──────────────────
+            // وقتی صفحه خودش /token و /extract رو صدا می‌زنه،
+            // ما body رو می‌خونیم — بدون اینکه خودمون request بزنیم
+            let tokenData   = null;
+            let extractData = null;
+            const videoUrls = [];
+
+            page.on('response', async (resp) => {
+              try {
+                const u  = resp.url();
+                const ct = resp.headers()['content-type'] || '';
+                const st = resp.status();
+
+                // /token response
+                if (u.includes('9xbud.com/token')) {
+                  const text = await resp.text();
+                  console.log(`[TOKEN] status=${st} body=${text.slice(0, 300)}`);
+                  try { tokenData = JSON.parse(text); } catch (e) {}
+                  return;
+                }
+
+                // /extract response
+                if (u.includes('9xbud.com/extract')) {
+                  const text = await resp.text();
+                  console.log(`[EXTRACT] status=${st} body=${text.slice(0, 500)}`);
+                  try { extractData = JSON.parse(text); } catch (e) {}
+                  fs.writeFileSync('grabbed/extract_response.json', text);
+
+                  // لینک‌های ویدیو رو از body استخراج کن
+                  const matches = text.match(/https?:\/\/[^"\\]+\.(mp4|m3u8|mkv|webm|mov|vid)(\?[^"\\]*)?/gi) || [];
+                  for (const m of matches) {
+                    const clean = m.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                    if (!videoUrls.includes(clean)) {
+                      console.log('[EXTRACT VIDEO URL]', clean);
+                      videoUrls.push(clean);
+                    }
+                  }
+                  return;
+                }
+
+                // لینک مستقیم ویدیو
+                if (
+                  st === 200 &&
+                  (isVideoFile(u) || ct.startsWith('video/')) &&
+                  !u.includes('9xbuddy')
+                ) {
+                  if (!videoUrls.includes(u)) {
+                    console.log('[VIDEO RESPONSE]', u);
+                    videoUrls.push(u);
+                  }
+                }
+
+              } catch (e) {}
+            });
+
+            // popup listener
+            context.on('page', async (popup) => {
+              try {
+                await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
+                const u = popup.url();
+                console.log('[POPUP]', u);
+                if (isVideoFile(u) && !videoUrls.includes(u)) videoUrls.push(u);
+                popup.on('response', async (resp) => {
+                  const pu = resp.url();
+                  const ct = resp.headers()['content-type'] || '';
+                  if ((isVideoFile(pu) || ct.startsWith('video/')) && !videoUrls.includes(pu)) {
+                    console.log('[POPUP VIDEO]', pu);
+                    videoUrls.push(pu);
+                  }
+                  if (pu.includes('9xbud.com/extract')) {
+                    const text = await resp.text().catch(() => '');
+                    const matches = text.match(/https?:\/\/[^"\\]+\.(mp4|m3u8|mkv|webm)/gi) || [];
+                    matches.forEach(m => { if (!videoUrls.includes(m)) videoUrls.push(m); });
+                  }
+                });
+              } catch (e) {}
+            });
+
+            // ── Step 1: صفحه رو باز کن ───────────────────────────────────
+            // صفحه خودش /token می‌گیره و لینک‌ها رو نمایش می‌ده
+            console.log('Opening:', PROCESS_URL);
             await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
-            await page.waitForTimeout(3000);
+            await page.waitForTimeout(4000);
 
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
+            console.log('Video URLs so far:', videoUrls.length);
 
-            // ── Step 2: GET /token از داخل browser context ────────────────
-            // این request رو browser می‌زنه — session، IP، و TLS fingerprint
-            // دقیقاً همون چیزیه که سرور انتظار داره
-            console.log('\n=== Step 2: Getting token ===');
+            // ── Step 2: کلیک روی Extract/Download buttons ────────────────
+            // صفحه برای هر سرور جداگانه /extract صدا می‌زنه — وقتی کلیک می‌کنیم
+            // ما response رو از intercept می‌گیریم
+            console.log('\n=== Clicking Extract/Download buttons ===');
 
-            const tokenResult = await page.evaluate(async () => {
+            const buttons = await page.$$('a, button');
+
+            for (const btn of buttons) {
+              if (videoUrls.length > 0) break;
+
               try {
-                const r = await fetch('https://ab.9xbud.com/token', {
-                  method: 'GET',
-                  headers: {
-                    'Accept': 'application/json, text/plain, */*',
-                    'Referer': 'https://9xbuddy.site/',
-                    'x-requested-with': 'xmlhttprequest',
-                    'x-requested-domain': '9xbuddy.site'
-                  }
-                });
-                const text = await r.text();
-                return { status: r.status, body: text };
-              } catch (e) {
-                return { error: e.message };
-              }
-            });
+                const txt  = (await btn.innerText()).trim().toLowerCase();
+                const href = (await btn.getAttribute('href') || '');
 
-            console.log('Token response:', JSON.stringify(tokenResult));
+                if (/app|software|extension|program|home|support/.test(txt)) continue;
+                if (
+                  !txt.includes('download') &&
+                  !txt.includes('extract') &&
+                  !txt.includes('get link') &&
+                  !href.toLowerCase().includes('download')
+                ) continue;
 
-            let authToken   = null;
-            let accessToken = null;
-
-            if (tokenResult.body) {
-              try {
-                const parsed = JSON.parse(tokenResult.body);
-                // token ها ممکنه توی فیلدهای مختلف باشن
-                authToken   = parsed['x-auth-token']   || parsed.authToken   || parsed.auth_token   || parsed.token || null;
-                accessToken = parsed['x-access-token'] || parsed.accessToken || parsed.access_token || null;
-                console.log('Auth token:', authToken ? authToken.slice(0,30) + '...' : 'not found');
-                console.log('Access token:', accessToken ? accessToken.slice(0,30) + '...' : 'not found');
-                fs.writeFileSync('grabbed/token_response.json', JSON.stringify(parsed, null, 2));
-              } catch (e) {
-                console.log('Token parse error:', e.message);
-                fs.writeFileSync('grabbed/token_raw.txt', tokenResult.body);
-              }
-            }
-
-            // ── Step 3: POST /extract با توکن ────────────────────────────
-            console.log('\n=== Step 3: Calling extract API ===');
-
-            const extractHeaders = {
-              'Accept': 'application/json, text/plain, */*',
-              'Content-Type': 'application/json; charset=UTF-8',
-              'Referer': 'https://9xbuddy.site/',
-              'x-requested-with': 'xmlhttprequest',
-              'x-requested-domain': '9xbuddy.site'
-            };
-            if (authToken)   extractHeaders['x-auth-token']   = authToken;
-            if (accessToken) extractHeaders['x-access-token'] = accessToken;
-
-            // body احتمالی: url یا link
-            const extractResult = await page.evaluate(async ({ url, headers }) => {
-              try {
-                const r = await fetch('https://ab.9xbud.com/extract', {
-                  method: 'POST',
-                  headers: headers,
-                  body: JSON.stringify({ url: url })
-                });
-                const text = await r.text();
-                return { status: r.status, body: text };
-              } catch (e) {
-                return { error: e.message };
-              }
-            }, { url: SOURCE_URL, headers: extractHeaders });
-
-            console.log('Extract status:', extractResult.status);
-            console.log('Extract body:', (extractResult.body || '').slice(0, 1000));
-            fs.writeFileSync('grabbed/extract_response.json', extractResult.body || '{}');
-
-            // ── Step 4: لینک‌های ویدیو رو از response پیدا کن ────────────
-            const videoUrls = [];
-
-            if (extractResult.body) {
-              try {
-                const parsed = JSON.parse(extractResult.body);
-                const str = JSON.stringify(parsed);
-
-                // regex برای پیدا کردن هر URL ویدیویی
-                const matches = str.match(/https?:\/\/[^"\\]+\.(mp4|m3u8|mkv|webm|mov|vid)(\?[^"\\]*)?/gi) || [];
-                for (const m of matches) {
-                  const clean = m.replace(/\\u0026/g, '&');
-                  if (!videoUrls.includes(clean)) videoUrls.push(clean);
+                // اگه href مستقیم به ویدیو اشاره داره
+                if (isVideoFile(href) && !href.includes('9xbuddy')) {
+                  console.log('Direct href:', href);
+                  if (!videoUrls.includes(href)) videoUrls.push(href);
+                  break;
                 }
 
-                // همچنین دنبال فیلدهای url/link/download بگرد
-                const findUrls = (obj) => {
-                  if (!obj || typeof obj !== 'object') return;
-                  for (const [k, v] of Object.entries(obj)) {
-                    if (typeof v === 'string' && v.startsWith('http') && isVideoFile(v)) {
-                      if (!videoUrls.includes(v)) videoUrls.push(v);
-                    } else if (typeof v === 'object') {
-                      findUrls(v);
-                    }
-                  }
-                };
-                findUrls(parsed);
+                console.log('Clicking:', txt || href.slice(0, 60));
 
-              } catch (e) {
-                // اگه JSON نبود، regex مستقیم روی text
-                const matches = (extractResult.body || '').match(/https?:\/\/[^\s"'<>]+\.(mp4|m3u8|mkv|webm)/gi) || [];
-                videoUrls.push(...matches);
-              }
+                // کلیک و صبر برای /extract response
+                const extractPromise = page.waitForResponse(
+                  r => r.url().includes('9xbud.com/extract'),
+                  { timeout: 20000 }
+                ).catch(() => null);
+
+                await btn.click().catch(() => {});
+
+                const extractResp = await extractPromise;
+                if (extractResp) {
+                  console.log('[EXTRACT RESPONSE caught after click]', extractResp.status());
+                }
+
+                // صبر اضافه برای DOM update
+                await page.waitForTimeout(5000);
+
+                if (videoUrls.length > 0) break;
+
+              } catch (e) {}
             }
 
-            console.log('\nVideo URLs found:', videoUrls.length);
+            console.log('\nTotal video URLs found:', videoUrls.length);
             videoUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
-
-            if (videoUrls.length === 0) {
-              console.log('\nNo URLs from API — falling back to network intercept + click');
-
-              // fallback: کلیک روی extract links و intercept response
-              const intercepted = [];
-              page.on('response', async (resp) => {
-                try {
-                  const u = resp.url();
-                  const ct = resp.headers()['content-type'] || '';
-                  if ((isVideoFile(u) || ct.startsWith('video/')) && !u.includes('9xbuddy')) {
-                    if (!intercepted.includes(u)) {
-                      console.log('[INTERCEPTED]', u);
-                      intercepted.push(u);
-                    }
-                  }
-                  // هر JSON از ab.9xbud.com رو capture کن
-                  if (u.includes('9xbud.com') && ct.includes('json')) {
-                    const text = await resp.text().catch(() => '');
-                    console.log('[9XBUD API]', u, text.slice(0, 500));
-                    const urls = text.match(/https?:\/\/[^"\\]+\.(mp4|m3u8|mkv|webm)/gi) || [];
-                    intercepted.push(...urls);
-                  }
-                } catch (e) {}
-              });
-
-              const extractBtn = await page.$('button:has-text("Extract"), a:has-text("Extract")');
-              if (extractBtn) {
-                console.log('Clicking Extract button...');
-                await extractBtn.click().catch(() => {});
-                await page.waitForTimeout(15000);
-              }
-
-              videoUrls.push(...intercepted.filter(u => !videoUrls.includes(u)));
-              console.log('After fallback, URLs:', videoUrls.length);
-            }
 
             fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, urls: videoUrls }, null, 2));
 
@@ -254,7 +240,7 @@ jobs:
               process.exit(1);
             }
 
-            // ── Step 5: دانلود با همان browser session ───────────────────
+            // ── Step 3: دانلود با همان browser session ───────────────────
             let downloaded = false;
 
             for (const url of videoUrls) {
@@ -316,14 +302,9 @@ jobs:
 
       - name: Show results
         run: |
-          echo "=== downloads/ ==="
-          ls -lh downloads/ || echo "(empty)"
-          echo "=== result.json ==="
-          cat grabbed/result.json 2>/dev/null || true
-          echo "=== token_response.json ==="
-          cat grabbed/token_response.json 2>/dev/null || true
-          echo "=== extract_response (first 500 chars) ==="
-          head -c 500 grabbed/extract_response.json 2>/dev/null || true
+          echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
+          echo "=== result.json ===" && cat grabbed/result.json 2>/dev/null || true
+          echo "=== extract_response ===" && cat grabbed/extract_response.json 2>/dev/null || true
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
