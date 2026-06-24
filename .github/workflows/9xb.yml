@@ -1,4 +1,4 @@
-name: 6 - 9xBuddy Downloader
+name: 6 - 9xBuddy DEBUG
 
 on:
   workflow_dispatch:
@@ -7,31 +7,13 @@ on:
         description: "لینک فایل برای دانلود"
         required: true
 
-      upload_mode:
-        description: "Upload mode"
-        required: true
-        default: "direct"
-        type: choice
-        options:
-          - "direct"
-          - "zip"
-
-      delete_old_releases:
-        description: "Delete old releases?"
-        required: true
-        default: "no"
-        type: choice
-        options:
-          - "yes"
-          - "no"
-
 permissions:
   contents: write
 
 jobs:
-  download:
+  debug:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
 
@@ -40,334 +22,180 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg zip curl aria2 jq gh
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
           npm init -y
           npm install playwright
           npx playwright install chromium --with-deps
 
       - name: Prepare folders
-        run: |
-          mkdir -p downloads
-          mkdir -p grabbed
+        run: mkdir -p grabbed
 
-      - name: Create Playwright script
+      - name: Create debug script
         run: |
-          cat > buddy_dl.js << 'EOF'
+          cat > debug.js << 'EOF'
 
           const fs   = require('fs');
-          const path = require('path');
           const { chromium } = require('playwright');
 
           const SOURCE_URL = process.argv[2];
-          if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
-
           const PROCESS_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
-
-          function sanitize(str) {
-            return (str || 'video')
-              .replace(/[^a-zA-Z0-9 ._-]/g, '_')
-              .replace(/[_ ]+/g, '_')
-              .replace(/^_|_$/g, '')
-              .slice(0, 80) || 'video';
-          }
-
-          function isVideoFile(url) {
-            return /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(url.split('?')[0]);
-          }
-
-          // همه لینک‌های ویدیو رو از DOM فعلی جمع می‌کنه
-          async function collectVideoLinksFromDOM(page) {
-            const links = await page.$$eval('a', els =>
-              els.map(a => a.href || '').filter(Boolean)
-            );
-            return links.filter(h => isVideoFile(h) && !h.includes('9xbuddy'));
-          }
-
-          // بعد از کلیک، منتظر می‌مونه تا لینک جدیدی در DOM ظاهر بشه
-          async function waitForNewLink(page, existingLinks, timeoutMs = 15000) {
-            const start = Date.now();
-            while (Date.now() - start < timeoutMs) {
-              await page.waitForTimeout(1000);
-              const current = await collectVideoLinksFromDOM(page);
-              const newLinks = current.filter(u => !existingLinks.includes(u));
-              if (newLinks.length > 0) return newLinks;
-            }
-            return [];
-          }
 
           (async () => {
 
             const browser = await chromium.launch({ headless: true });
             const context = await browser.newContext({
-              userAgent:
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-                'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-                'Chrome/122.0.0.0 Safari/537.36',
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
               acceptDownloads: true
             });
 
             const page = await context.newPage();
 
-            // intercept همه network responses
-            const capturedVideoUrls = [];
+            // ── همه network requests رو لاگ کن ──────────────────────────
+            const networkLog = [];
 
-            page.on('response', async (resp) => {
+            page.on('request', req => {
+              networkLog.push({
+                type: 'REQUEST',
+                method: req.method(),
+                url: req.url(),
+                headers: req.headers()
+              });
+            });
+
+            page.on('response', async resp => {
+              const entry = {
+                type: 'RESPONSE',
+                status: resp.status(),
+                url: resp.url(),
+                headers: resp.headers()
+              };
+              // body رو فقط برای JSON و کوچیک بخون
               try {
-                const u  = resp.url();
                 const ct = resp.headers()['content-type'] || '';
-                const st = resp.status();
-
-                if (
-                  st === 200 &&
-                  (isVideoFile(u) || ct.startsWith('video/')) &&
-                  !u.includes('9xbuddy') &&
-                  !capturedVideoUrls.includes(u)
-                ) {
-                  console.log(`[NETWORK VIDEO] ${u}`);
-                  capturedVideoUrls.push(u);
+                const cl = parseInt(resp.headers()['content-length'] || '999999');
+                if (ct.includes('json') && cl < 50000) {
+                  entry.body = await resp.text();
                 }
               } catch (e) {}
+              networkLog.push(entry);
             });
 
             // popup listener
             context.on('page', async (popup) => {
+              const u = popup.url();
+              console.log('[POPUP OPENED]', u);
+              networkLog.push({ type: 'POPUP', url: u });
+              popup.on('request', req => {
+                networkLog.push({ type: 'POPUP_REQUEST', url: req.url() });
+              });
               try {
-                await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
-                const u = popup.url();
-                console.log('[POPUP]', u);
-                if (isVideoFile(u) && !u.includes('9xbuddy') && !capturedVideoUrls.includes(u)) {
-                  capturedVideoUrls.push(u);
-                }
-                popup.on('response', async (resp) => {
-                  const pu = resp.url();
-                  const ct = resp.headers()['content-type'] || '';
-                  if ((isVideoFile(pu) || ct.startsWith('video/')) && !capturedVideoUrls.includes(pu)) {
-                    console.log('[POPUP VIDEO]', pu);
-                    capturedVideoUrls.push(pu);
-                  }
-                });
-                await popup.waitForTimeout(8000);
-                await popup.close().catch(() => {});
+                await popup.waitForLoadState('networkidle', { timeout: 10000 });
+                const finalUrl = popup.url();
+                console.log('[POPUP FINAL URL]', finalUrl);
+                const html = await popup.content();
+                fs.writeFileSync('grabbed/popup_html.txt', html);
+                networkLog.push({ type: 'POPUP_FINAL', url: finalUrl });
               } catch (e) {}
             });
 
-            // ── باز کردن صفحه ────────────────────────────────────────────
             console.log('Opening:', PROCESS_URL);
             await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(4000);
 
-            const title = sanitize((await page.title()).trim());
-            console.log('Title:', title);
+            // HTML قبل از کلیک
+            const htmlBefore = await page.content();
+            fs.writeFileSync('grabbed/html_before.txt', htmlBefore);
+            console.log('HTML before saved, size:', htmlBefore.length);
 
-            // snapshot از لینک‌های فعلی DOM (قبل از هر کلیک)
-            let knownLinks = await collectVideoLinksFromDOM(page);
-            console.log('DOM video links before clicks:', knownLinks.length);
-
-            if (capturedVideoUrls.length > 0 || knownLinks.length > 0) {
-              console.log('Already have links from network intercept!');
-            }
-
-            // ── پیدا کردن همه دکمه‌های قابل کلیک ───────────────────────
-            // شامل: download, download now, extract link, get link, و غیره
-            console.log('\n=== Finding all action buttons ===');
-
-            const allButtons = await page.$$('a, button');
-            const actionButtons = [];
-
-            for (const btn of allButtons) {
-              try {
-                const txt  = (await btn.innerText()).trim().toLowerCase();
-                const href = (await btn.getAttribute('href') || '').toLowerCase();
-
-                // skip: navigation, app download, و دکمه‌های بی‌ربط
-                if (/app|software|extension|program|home|support|about/.test(txt)) continue;
-                if (txt.length === 0 && href.length === 0) continue;
-
-                // دکمه‌های مرتبط با دانلود یا extract
-                const isRelevant =
-                  txt.includes('download') ||
-                  txt.includes('extract') ||
-                  txt.includes('get link') ||
-                  txt.includes('get video') ||
-                  txt.includes('fetch') ||
-                  href.includes('download');
-
-                if (!isRelevant) continue;
-
-                console.log(`  Button: "${txt || href.slice(0, 60)}"`);
-                actionButtons.push(btn);
-              } catch (e) {}
-            }
-
-            console.log('Action buttons found:', actionButtons.length);
-
-            // ── کلیک روی هر دکمه و بررسی نتیجه ─────────────────────────
-            for (const btn of actionButtons) {
-              if (capturedVideoUrls.length > 0) break;
-
-              try {
-                const txt  = (await btn.innerText()).trim();
-                const href = (await btn.getAttribute('href') || '');
-
-                // اگه href مستقیماً به ویدیو اشاره می‌کنه
-                if (isVideoFile(href) && !href.includes('9xbuddy')) {
-                  console.log('\nDirect video href:', href);
-                  if (!capturedVideoUrls.includes(href)) capturedVideoUrls.push(href);
-                  continue;
-                }
-
-                console.log(`\nClicking: "${txt}"`);
-
-                // کلیک + صبر برای resolve شدن لینک
-                const dlPromise = page.waitForEvent('download', { timeout: 12000 }).catch(() => null);
-                await btn.click().catch(() => {});
-
-                // صبر می‌کنیم و هم download event و هم DOM تغییر رو چک می‌کنیم
-                const [dl, newDomLinks] = await Promise.all([
-                  dlPromise,
-                  waitForNewLink(page, knownLinks, 12000)
-                ]);
-
-                if (dl) {
-                  const dest = path.join('downloads', dl.suggestedFilename() || `${title}.mp4`);
-                  console.log('  DOWNLOAD EVENT! Saving:', dest);
-                  await dl.saveAs(dest);
-                  fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, direct_download: dest }, null, 2));
-                  await browser.close();
-                  process.exit(0);
-                }
-
-                if (newDomLinks.length > 0) {
-                  console.log('  NEW DOM LINKS after click:');
-                  newDomLinks.forEach(u => console.log('   ', u));
-                  capturedVideoUrls.push(...newDomLinks);
-                  knownLinks = [...knownLinks, ...newDomLinks];
-                  break;
-                }
-
-                // بررسی href بعد از کلیک (بعضی سایت‌ها href رو آپدیت می‌کنن)
-                const resolvedHref = (await btn.getAttribute('href').catch(() => '')) || '';
-                if (isVideoFile(resolvedHref) && !resolvedHref.includes('9xbuddy')) {
-                  console.log('  Resolved href:', resolvedHref);
-                  capturedVideoUrls.push(resolvedHref);
-                  break;
-                }
-
-                console.log('  No new links found after click');
-
-              } catch (e) {
-                console.log('  Error:', e.message);
+            // همه دکمه‌ها رو لیست کن
+            const buttons = await page.$$eval('a, button', els =>
+              els.map(el => ({
+                tag:  el.tagName,
+                txt:  el.innerText?.trim() || '',
+                href: el.getAttribute('href') || '',
+                cls:  el.className || ''
+              }))
+            );
+            fs.writeFileSync('grabbed/buttons.json', JSON.stringify(buttons, null, 2));
+            console.log('\nAll buttons/links:');
+            buttons.forEach((b, i) => {
+              if (b.txt || b.href) {
+                console.log(` [${i}] ${b.tag} txt="${b.txt}" href="${b.href.slice(0,80)}" cls="${b.cls.slice(0,40)}"`);
               }
-            }
+            });
 
-            // ── merge همه منابع ───────────────────────────────────────────
-            const allUrls = [...new Set([...capturedVideoUrls, ...knownLinks])];
+            // فقط روی اولین "extract links" کلیک کن
+            const extractBtn = await page.$('button:has-text("Extract"), a:has-text("Extract"), button:has-text("extract"), a:has-text("extract")');
 
-            console.log('\n=== All video URLs:', allUrls.length, '===');
-            allUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
+            if (extractBtn) {
+              console.log('\nClicking first Extract button...');
 
-            fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, urls: allUrls }, null, 2));
+              // network log reset برای بعد از کلیک
+              const networkBefore = networkLog.length;
 
-            if (allUrls.length === 0) {
-              await browser.close();
-              console.error('No video URLs found!');
-              process.exit(1);
-            }
+              await extractBtn.click().catch(() => {});
 
-            // ── دانلود ───────────────────────────────────────────────────
-            let downloaded = false;
+              // صبر می‌کنیم و هر ثانیه چک می‌کنیم
+              for (let i = 0; i < 20; i++) {
+                await page.waitForTimeout(1000);
 
-            for (const url of allUrls) {
-              console.log('\nDownloading:', url);
+                const newRequests = networkLog.slice(networkBefore).filter(e =>
+                  e.type === 'REQUEST' || e.type === 'RESPONSE'
+                );
 
-              const extM = url.split('?')[0].match(/\.(mp4|m3u8|mkv|webm|mov|vid)$/i);
-              let ext = extM ? extM[1].toLowerCase() : 'mp4';
-              if (ext === 'vid') ext = 'mp4';
+                if (newRequests.length > 0) {
+                  console.log(`\nSecond ${i+1}: ${newRequests.length} new network events`);
+                  newRequests.forEach(r => {
+                    console.log(`  ${r.type} ${r.status || ''} ${r.url}`);
+                    if (r.body) console.log(`  BODY: ${r.body.slice(0, 300)}`);
+                  });
+                }
 
-              if (ext === 'm3u8') {
-                const cookies = await context.cookies();
-                fs.writeFileSync('grabbed/hls_url.txt', url);
-                fs.writeFileSync('grabbed/hls_title.txt', title);
-                fs.writeFileSync('grabbed/hls_cookies.txt', cookies.map(c=>`${c.name}=${c.value}`).join('; '));
-                console.log('HLS saved for ffmpeg');
-                downloaded = true;
-                break;
+                // HTML تغییر کرده؟
+                const htmlNow = await page.content();
+                if (htmlNow.length !== htmlBefore.length) {
+                  console.log(`\nDOM changed at second ${i+1}! Size: ${htmlBefore.length} -> ${htmlNow.length}`);
+                  fs.writeFileSync(`grabbed/html_after_${i+1}s.txt`, htmlNow);
+
+                  // لینک‌های جدید
+                  const allLinks = [...htmlNow.matchAll(/https?:\/\/[^\s"'<>]+\.(mp4|m3u8|mkv|webm)/gi)];
+                  if (allLinks.length > 0) {
+                    console.log('VIDEO LINKS FOUND IN HTML:');
+                    allLinks.forEach(m => console.log(' ', m[0]));
+                    break;
+                  }
+                }
               }
 
-              try {
-                const resp = await page.request.get(url, {
-                  headers: { 'Referer': 'https://9xbuddy.site/', 'Accept': '*/*' },
-                  timeout: 0
-                });
-                console.log('Status:', resp.status());
-                if (!resp.ok()) { console.log('Non-200, skip'); continue; }
-                const body = await resp.body();
-                console.log('Size:', (body.length / 1024 / 1024).toFixed(2), 'MB');
-                if (body.length < 1_048_576) { console.log('Too small, skip'); continue; }
-                const dest = path.join('downloads', `${title}.${ext}`);
-                fs.writeFileSync(dest, body);
-                console.log('Saved:', dest);
-                downloaded = true;
-                break;
-              } catch (e) {
-                console.log('Error:', e.message);
-              }
+            } else {
+              console.log('No Extract button found!');
             }
+
+            // network log کامل
+            fs.writeFileSync('grabbed/network_log.json', JSON.stringify(networkLog, null, 2));
+            console.log('\nNetwork log entries:', networkLog.length);
+
+            // فقط JSON responses رو نشون بده
+            const jsonResponses = networkLog.filter(e => e.body);
+            console.log('JSON responses:', jsonResponses.length);
+            jsonResponses.forEach(r => {
+              console.log('\n---');
+              console.log('URL:', r.url);
+              console.log('Body:', r.body.slice(0, 500));
+            });
 
             await browser.close();
-            if (!downloaded) { console.error('Download failed!'); process.exit(1); }
 
           })();
 
           EOF
 
-      - name: Run Playwright
-        run: node buddy_dl.js "${{ github.event.inputs.source_url }}"
+      - name: Run debug script
+        run: node debug.js "${{ github.event.inputs.source_url }}"
 
-      - name: Download HLS if needed
-        run: |
-          if [ ! -f grabbed/hls_url.txt ]; then echo "No HLS"; exit 0; fi
-          url=$(cat grabbed/hls_url.txt)
-          title=$(cat grabbed/hls_title.txt)
-          cookies=$(cat grabbed/hls_cookies.txt)
-          ffmpeg -y -user_agent "Mozilla/5.0" \
-            -headers "Cookie: ${cookies}" \
-            -i "$url" -c copy "downloads/${title}.mp4"
-
-      - name: Show results
-        run: |
-          echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
-          echo "=== result.json ===" && cat grabbed/result.json 2>/dev/null || true
-
-      - name: Create ZIP
-        if: github.event.inputs.upload_mode == 'zip'
-        run: |
-          ts=$(date +"%Y%m%d_%H%M%S")
-          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "buddy_media_${ts}.zip" downloads/
-
-      - name: Delete old releases
-        if: github.event.inputs.delete_old_releases == 'yes'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          releases=$(gh release list --limit 100 | awk '{print $1}')
-          for tag in $releases; do gh release delete "$tag" -y || true; done
-
-      - name: Upload Direct Release
-        if: github.event.inputs.upload_mode == 'direct'
-        uses: softprops/action-gh-release@v2
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: buddy-${{ github.run_number }}
-          files: "downloads/*"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload ZIP Release
-        if: github.event.inputs.upload_mode == 'zip'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: buddy-${{ github.run_number }}
-          files: "*.zip"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: debug-files
+          path: grabbed/
