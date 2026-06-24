@@ -76,6 +76,26 @@ jobs:
             return /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(url.split('?')[0]);
           }
 
+          // همه لینک‌های ویدیو رو از DOM فعلی جمع می‌کنه
+          async function collectVideoLinksFromDOM(page) {
+            const links = await page.$$eval('a', els =>
+              els.map(a => a.href || '').filter(Boolean)
+            );
+            return links.filter(h => isVideoFile(h) && !h.includes('9xbuddy'));
+          }
+
+          // بعد از کلیک، منتظر می‌مونه تا لینک جدیدی در DOM ظاهر بشه
+          async function waitForNewLink(page, existingLinks, timeoutMs = 15000) {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+              await page.waitForTimeout(1000);
+              const current = await collectVideoLinksFromDOM(page);
+              const newLinks = current.filter(u => !existingLinks.includes(u));
+              if (newLinks.length > 0) return newLinks;
+            }
+            return [];
+          }
+
           (async () => {
 
             const browser = await chromium.launch({ headless: true });
@@ -89,11 +109,8 @@ jobs:
 
             const page = await context.newPage();
 
-            // ── intercept ALL responses ───────────────────────────────────
-            // هر چیزی که از شبکه رد می‌شه رو لاگ می‌کنیم
-            // هدف: پیدا کردن API call که لینک دانلود رو برمی‌گردونه
-            const capturedDownloadUrls = [];
-            const capturedApiResponses = [];
+            // intercept همه network responses
+            const capturedVideoUrls = [];
 
             page.on('response', async (resp) => {
               try {
@@ -101,118 +118,167 @@ jobs:
                 const ct = resp.headers()['content-type'] || '';
                 const st = resp.status();
 
-                // لینک مستقیم ویدیو
-                if (isVideoFile(u) && !u.includes('9xbuddy')) {
-                  console.log(`[VIDEO RESPONSE ${st}] ${u}`);
-                  if (!capturedDownloadUrls.includes(u)) capturedDownloadUrls.push(u);
-                  return;
+                if (
+                  st === 200 &&
+                  (isVideoFile(u) || ct.startsWith('video/')) &&
+                  !u.includes('9xbuddy') &&
+                  !capturedVideoUrls.includes(u)
+                ) {
+                  console.log(`[NETWORK VIDEO] ${u}`);
+                  capturedVideoUrls.push(u);
                 }
-
-                // JSON responses (API calls)
-                if (ct.includes('json') && u.includes('9xbuddy')) {
-                  const text = await resp.text().catch(() => '');
-                  console.log(`[JSON ${st}] ${u}`);
-                  console.log(`  body: ${text.slice(0, 300)}`);
-                  capturedApiResponses.push({ url: u, status: st, body: text });
-                }
-
               } catch (e) {}
             });
 
-            // ── باز کردن صفحه 9xbuddy ────────────────────────────────────
+            // popup listener
+            context.on('page', async (popup) => {
+              try {
+                await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
+                const u = popup.url();
+                console.log('[POPUP]', u);
+                if (isVideoFile(u) && !u.includes('9xbuddy') && !capturedVideoUrls.includes(u)) {
+                  capturedVideoUrls.push(u);
+                }
+                popup.on('response', async (resp) => {
+                  const pu = resp.url();
+                  const ct = resp.headers()['content-type'] || '';
+                  if ((isVideoFile(pu) || ct.startsWith('video/')) && !capturedVideoUrls.includes(pu)) {
+                    console.log('[POPUP VIDEO]', pu);
+                    capturedVideoUrls.push(pu);
+                  }
+                });
+                await popup.waitForTimeout(8000);
+                await popup.close().catch(() => {});
+              } catch (e) {}
+            });
+
+            // ── باز کردن صفحه ────────────────────────────────────────────
             console.log('Opening:', PROCESS_URL);
             await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
-
-            // صبر می‌کنیم تا همه JS calls تموم بشن
-            await page.waitForTimeout(8000);
+            await page.waitForTimeout(5000);
 
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
 
-            // ── بررسی API responses برای لینک دانلود ─────────────────────
-            console.log('\n=== API Responses captured:', capturedApiResponses.length, '===');
-            for (const r of capturedApiResponses) {
-              // دنبال URL های ویدیو توی body می‌گردیم
+            // snapshot از لینک‌های فعلی DOM (قبل از هر کلیک)
+            let knownLinks = await collectVideoLinksFromDOM(page);
+            console.log('DOM video links before clicks:', knownLinks.length);
+
+            if (capturedVideoUrls.length > 0 || knownLinks.length > 0) {
+              console.log('Already have links from network intercept!');
+            }
+
+            // ── پیدا کردن همه دکمه‌های قابل کلیک ───────────────────────
+            // شامل: download, download now, extract link, get link, و غیره
+            console.log('\n=== Finding all action buttons ===');
+
+            const allButtons = await page.$$('a, button');
+            const actionButtons = [];
+
+            for (const btn of allButtons) {
               try {
-                const json = JSON.parse(r.body);
-                const str  = JSON.stringify(json);
-                const matches = str.match(/https?:\/\/[^"]+\.(mp4|m3u8|mkv|webm)(\?[^"]*)?/gi) || [];
-                for (const m of matches) {
-                  console.log('Found in API response:', m);
-                  if (!capturedDownloadUrls.includes(m)) capturedDownloadUrls.push(m);
-                }
+                const txt  = (await btn.innerText()).trim().toLowerCase();
+                const href = (await btn.getAttribute('href') || '').toLowerCase();
+
+                // skip: navigation, app download, و دکمه‌های بی‌ربط
+                if (/app|software|extension|program|home|support|about/.test(txt)) continue;
+                if (txt.length === 0 && href.length === 0) continue;
+
+                // دکمه‌های مرتبط با دانلود یا extract
+                const isRelevant =
+                  txt.includes('download') ||
+                  txt.includes('extract') ||
+                  txt.includes('get link') ||
+                  txt.includes('get video') ||
+                  txt.includes('fetch') ||
+                  href.includes('download');
+
+                if (!isRelevant) continue;
+
+                console.log(`  Button: "${txt || href.slice(0, 60)}"`);
+                actionButtons.push(btn);
               } catch (e) {}
             }
 
-            console.log('\n=== Video URLs found so far:', capturedDownloadUrls.length, '===');
-            capturedDownloadUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
+            console.log('Action buttons found:', actionButtons.length);
 
-            // ── اگه هنوز لینک نداریم، روی دکمه‌ها کلیک کن ───────────────
-            if (capturedDownloadUrls.length === 0) {
-              console.log('\n=== Clicking download buttons ===');
+            // ── کلیک روی هر دکمه و بررسی نتیجه ─────────────────────────
+            for (const btn of actionButtons) {
+              if (capturedVideoUrls.length > 0) break;
 
-              // listen for popups
-              context.on('page', async (popup) => {
-                try {
-                  await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
-                  const u = popup.url();
-                  console.log('[POPUP]', u);
-                  if (isVideoFile(u) && !capturedDownloadUrls.includes(u)) {
-                    capturedDownloadUrls.push(u);
-                  }
-                  // listen inside popup too
-                  popup.on('response', async (resp) => {
-                    const pu = resp.url();
-                    if (isVideoFile(pu) && !capturedDownloadUrls.includes(pu)) {
-                      console.log('[POPUP VIDEO]', pu);
-                      capturedDownloadUrls.push(pu);
-                    }
-                  });
-                  await popup.waitForTimeout(5000);
-                } catch (e) {}
-              });
+              try {
+                const txt  = (await btn.innerText()).trim();
+                const href = (await btn.getAttribute('href') || '');
 
-              const buttons = await page.$$('a, button');
-              for (const btn of buttons) {
-                if (capturedDownloadUrls.length > 0) break;
-                try {
-                  const txt  = (await btn.innerText()).trim().toLowerCase();
-                  const href = (await btn.getAttribute('href') || '');
+                // اگه href مستقیماً به ویدیو اشاره می‌کنه
+                if (isVideoFile(href) && !href.includes('9xbuddy')) {
+                  console.log('\nDirect video href:', href);
+                  if (!capturedVideoUrls.includes(href)) capturedVideoUrls.push(href);
+                  continue;
+                }
 
-                  if (/app|software|extension|program/.test(txt)) continue;
-                  if (!txt.includes('download') && !href.toLowerCase().includes('download')) continue;
+                console.log(`\nClicking: "${txt}"`);
 
-                  console.log('Clicking:', txt || href.slice(0, 60));
-                  await btn.click().catch(() => {});
-                  await page.waitForTimeout(10000);
+                // کلیک + صبر برای resolve شدن لینک
+                const dlPromise = page.waitForEvent('download', { timeout: 12000 }).catch(() => null);
+                await btn.click().catch(() => {});
 
-                  // بررسی href بعد از کلیک
-                  const newHref = (await btn.getAttribute('href').catch(() => '')) || '';
-                  if (isVideoFile(newHref) && !capturedDownloadUrls.includes(newHref)) {
-                    console.log('Resolved href:', newHref);
-                    capturedDownloadUrls.push(newHref);
-                  }
-                } catch (e) {}
+                // صبر می‌کنیم و هم download event و هم DOM تغییر رو چک می‌کنیم
+                const [dl, newDomLinks] = await Promise.all([
+                  dlPromise,
+                  waitForNewLink(page, knownLinks, 12000)
+                ]);
+
+                if (dl) {
+                  const dest = path.join('downloads', dl.suggestedFilename() || `${title}.mp4`);
+                  console.log('  DOWNLOAD EVENT! Saving:', dest);
+                  await dl.saveAs(dest);
+                  fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, direct_download: dest }, null, 2));
+                  await browser.close();
+                  process.exit(0);
+                }
+
+                if (newDomLinks.length > 0) {
+                  console.log('  NEW DOM LINKS after click:');
+                  newDomLinks.forEach(u => console.log('   ', u));
+                  capturedVideoUrls.push(...newDomLinks);
+                  knownLinks = [...knownLinks, ...newDomLinks];
+                  break;
+                }
+
+                // بررسی href بعد از کلیک (بعضی سایت‌ها href رو آپدیت می‌کنن)
+                const resolvedHref = (await btn.getAttribute('href').catch(() => '')) || '';
+                if (isVideoFile(resolvedHref) && !resolvedHref.includes('9xbuddy')) {
+                  console.log('  Resolved href:', resolvedHref);
+                  capturedVideoUrls.push(resolvedHref);
+                  break;
+                }
+
+                console.log('  No new links found after click');
+
+              } catch (e) {
+                console.log('  Error:', e.message);
               }
             }
 
-            // ── ذخیره نتایج برای debug ────────────────────────────────────
-            const result = { title, urls: capturedDownloadUrls, apiResponses: capturedApiResponses };
-            fs.writeFileSync('grabbed/result.json', JSON.stringify(result, null, 2));
+            // ── merge همه منابع ───────────────────────────────────────────
+            const allUrls = [...new Set([...capturedVideoUrls, ...knownLinks])];
 
-            console.log('\n=== Final URLs:', capturedDownloadUrls.length, '===');
-            capturedDownloadUrls.forEach((u,i) => console.log(` [${i+1}] ${u}`));
+            console.log('\n=== All video URLs:', allUrls.length, '===');
+            allUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
 
-            if (capturedDownloadUrls.length === 0) {
+            fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, urls: allUrls }, null, 2));
+
+            if (allUrls.length === 0) {
               await browser.close();
               console.error('No video URLs found!');
               process.exit(1);
             }
 
-            // ── دانلود با همان browser session ───────────────────────────
+            // ── دانلود ───────────────────────────────────────────────────
             let downloaded = false;
 
-            for (const url of capturedDownloadUrls) {
+            for (const url of allUrls) {
               console.log('\nDownloading:', url);
 
               const extM = url.split('?')[0].match(/\.(mp4|m3u8|mkv|webm|mov|vid)$/i);
@@ -224,7 +290,7 @@ jobs:
                 fs.writeFileSync('grabbed/hls_url.txt', url);
                 fs.writeFileSync('grabbed/hls_title.txt', title);
                 fs.writeFileSync('grabbed/hls_cookies.txt', cookies.map(c=>`${c.name}=${c.value}`).join('; '));
-                console.log('HLS — saved for ffmpeg');
+                console.log('HLS saved for ffmpeg');
                 downloaded = true;
                 break;
               }
@@ -237,7 +303,7 @@ jobs:
                 console.log('Status:', resp.status());
                 if (!resp.ok()) { console.log('Non-200, skip'); continue; }
                 const body = await resp.body();
-                console.log('Size:', (body.length/1024/1024).toFixed(2), 'MB');
+                console.log('Size:', (body.length / 1024 / 1024).toFixed(2), 'MB');
                 if (body.length < 1_048_576) { console.log('Too small, skip'); continue; }
                 const dest = path.join('downloads', `${title}.${ext}`);
                 fs.writeFileSync(dest, body);
