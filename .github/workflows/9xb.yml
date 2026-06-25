@@ -47,9 +47,7 @@ jobs:
           npx playwright install chromium --with-deps
 
       - name: Prepare folders
-        run: |
-          mkdir -p downloads
-          mkdir -p grabbed
+        run: mkdir -p downloads grabbed
 
       - name: Create Playwright script
         run: |
@@ -77,24 +75,20 @@ jobs:
             return /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(url.split('?')[0]);
           }
 
-          // بعد از /extract response، صفحه JS رو اجرا می‌کنه و لینک‌ها رو decode می‌کنه
-          // ما باید صبر کنیم تا href های واقعی توی DOM ظاهر بشن
-          async function waitForDecodedLinks(page, timeoutMs = 15000) {
+          // هر 500ms DOM رو چک می‌کنه تا لینک ویدیو پیدا بشه
+          async function pollDomForLinks(page, timeoutMs = 20000) {
             const start = Date.now();
             while (Date.now() - start < timeoutMs) {
-              await page.waitForTimeout(500);
-
+              // همه href ها از DOM
               const links = await page.$$eval('a[href]', els =>
-                els.map(a => a.href).filter(h =>
-                  h.startsWith('http') &&
-                  /\.(mp4|m3u8|mkv|avi|mov|webm|vid)(\?|$)/i.test(h.split('?')[0]) &&
-                  !h.includes('9xbuddy')
-                )
+                els.map(a => a.href).filter(Boolean)
               );
-
-              if (links.length > 0) {
-                return links;
+              const videoLinks = links.filter(h => isVideoUrl(h) && !h.includes('9xbuddy'));
+              if (videoLinks.length > 0) {
+                console.log(`  Found ${videoLinks.length} video link(s) in DOM`);
+                return videoLinks;
               }
+              await page.waitForTimeout(500);
             }
             return [];
           }
@@ -112,7 +106,8 @@ jobs:
 
             const page = await context.newPage();
 
-            // intercept برای لاگ و catch مستقیم
+            // intercept: وقتی /extract response اومد، body رو ذخیره کن
+            let extractBody = null;
             const interceptedVideoUrls = [];
 
             page.on('response', async (resp) => {
@@ -121,10 +116,17 @@ jobs:
                 const ct = resp.headers()['content-type'] || '';
                 const st = resp.status();
 
-                if (u.includes('9xbud.com/token'))   console.log(`[TOKEN] ${st}`);
-                if (u.includes('9xbud.com/extract'))  console.log(`[EXTRACT] ${st}`);
+                if (u.includes('9xbud.com/token'))  console.log(`[TOKEN] ${st}`);
+                if (u.includes('9xbud.com/extract')) {
+                  console.log(`[EXTRACT] ${st}`);
+                  extractBody = await resp.text().catch(() => null);
+                  if (extractBody) {
+                    fs.writeFileSync('grabbed/extract_body.json', extractBody);
+                    console.log('  extract body saved, length:', extractBody.length);
+                  }
+                }
 
-                if (st === 200 && (isVideoUrl(u) || ct.startsWith('video/'))) {
+                if (st === 200 && (isVideoUrl(u) || ct.startsWith('video/')) && !u.includes('9xbuddy')) {
                   if (!interceptedVideoUrls.includes(u)) {
                     console.log('[VIDEO INTERCEPTED]', u);
                     interceptedVideoUrls.push(u);
@@ -133,101 +135,97 @@ jobs:
               } catch (e) {}
             });
 
-            // popup listener
             context.on('page', async (popup) => {
               try {
                 await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
                 const u = popup.url();
                 console.log('[POPUP]', u);
-                if (isVideoUrl(u) && !interceptedVideoUrls.includes(u)) {
-                  interceptedVideoUrls.push(u);
-                }
+                if (isVideoUrl(u) && !interceptedVideoUrls.includes(u)) interceptedVideoUrls.push(u);
               } catch (e) {}
             });
 
-            // ── Step 1: صفحه رو باز کن ───────────────────────────────────
+            // ── Step 1: صفحه رو باز کن و صبر کن ─────────────────────────
             console.log('Opening:', PROCESS_URL);
             await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
-            await page.waitForTimeout(3000);
 
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
 
-            // ── Step 2: روی اولین Extract/Download کلیک کن ───────────────
-            // بعد از کلیک، صفحه /extract می‌زنه و JS آدرس decode شده رو
-            // توی DOM می‌نویسه — ما با waitForDecodedLinks منتظر می‌مونیم
-            console.log('\n=== Clicking first actionable button ===');
+            // صبر بیشتر برای اینکه JS همه /extract ها رو بزنه و DOM رو آپدیت کنه
+            console.log('\n=== Waiting for page to process all links ===');
+            await page.waitForTimeout(5000);
 
-            const buttons = await page.$$('a, button');
-            let domLinks = [];
+            // ── Step 2: لینک‌ها رو از DOM بخون (بدون کلیک) ──────────────
+            console.log('=== Reading DOM links (no click needed) ===');
+            let domLinks = await pollDomForLinks(page, 10000);
+            console.log('DOM links after page load:', domLinks.length);
+            domLinks.forEach(u => console.log(' ', u));
 
-            for (const btn of buttons) {
-              try {
-                const txt  = (await btn.innerText()).trim().toLowerCase();
-                const href = (await btn.getAttribute('href') || '');
+            // ── Step 3: اگه DOM link نداشت، روی دکمه‌ها کلیک کن ──────────
+            if (domLinks.length === 0) {
+              console.log('\n=== No DOM links yet — clicking buttons ===');
 
-                if (/app|software|extension|program|home|support|about/.test(txt)) continue;
-                if (
-                  !txt.includes('download') &&
-                  !txt.includes('extract') &&
-                  !txt.includes('get link') &&
-                  !href.toLowerCase().includes('download')
-                ) continue;
+              const buttons = await page.$$('a, button');
 
-                // اگه href مستقیماً به ویدیو اشاره داره
-                if (isVideoUrl(href)) {
-                  console.log('Direct href found:', href);
-                  domLinks = [href];
-                  break;
-                }
+              for (const btn of buttons) {
+                if (domLinks.length > 0 || interceptedVideoUrls.length > 0) break;
+                try {
+                  const txt  = (await btn.innerText()).trim().toLowerCase();
+                  const href = (await btn.getAttribute('href') || '');
 
-                console.log('Clicking:', txt || href.slice(0, 60));
+                  if (/app|software|extension|program|home|support/.test(txt)) continue;
+                  if (
+                    !txt.includes('download') &&
+                    !txt.includes('extract') &&
+                    !txt.includes('get link') &&
+                    !href.toLowerCase().includes('download')
+                  ) continue;
 
-                // کلیک کن و صبر کن تا /extract response بیاد و JS لینک رو decode کنه
-                const extractResponsePromise = page.waitForResponse(
-                  r => r.url().includes('9xbud.com/extract'),
-                  { timeout: 20000 }
-                ).catch(() => null);
+                  if (isVideoUrl(href) && !href.includes('9xbuddy')) {
+                    console.log('Direct href:', href);
+                    domLinks = [href];
+                    break;
+                  }
 
-                await btn.click().catch(() => {});
+                  console.log('Clicking:', txt || href.slice(0, 60));
+                  await btn.click().catch(() => {});
 
-                const extractResp = await extractResponsePromise;
-                if (extractResp) {
-                  console.log('[EXTRACT response received, status:', extractResp.status(), ']');
-                  // صبر کن JS لینک‌ها رو decode و توی DOM بنویسه
-                  console.log('Waiting for DOM to update with decoded links...');
-                  domLinks = await waitForDecodedLinks(page, 15000);
-                  console.log('DOM links found:', domLinks.length);
+                  // صبر می‌کنیم و DOM رو poll می‌کنیم
+                  domLinks = await pollDomForLinks(page, 15000);
                   if (domLinks.length > 0) break;
-                } else {
-                  // اگه /extract نیومد، ممکنه لینک مستقیم باشه
-                  await page.waitForTimeout(5000);
-                  domLinks = await waitForDecodedLinks(page, 3000);
-                  if (domLinks.length > 0) break;
-                }
 
-              } catch (e) {}
+                } catch (e) {}
+              }
             }
 
-            // ── Step 3: merge همه منابع ───────────────────────────────────
+            // ── Step 4: merge همه منابع ───────────────────────────────────
             const allUrls = [...new Set([...domLinks, ...interceptedVideoUrls])];
 
             console.log('\n=== All video URLs:', allUrls.length, '===');
             allUrls.forEach((u, i) => console.log(` [${i+1}] ${u}`));
 
+            // ── dump HTML برای debug اگه لینک پیدا نشد ───────────────────
+            if (allUrls.length === 0) {
+              const html = await page.content();
+              fs.writeFileSync('grabbed/final_html.txt', html);
+              console.log('Dumped HTML for debug');
+              // همه لینک‌های صفحه رو لاگ کن
+              const allLinks = await page.$$eval('a[href]', els =>
+                els.map(a => ({ txt: a.innerText?.trim(), href: a.href })).filter(a => a.href)
+              );
+              console.log('\nAll <a> tags in page:');
+              allLinks.forEach(a => console.log(`  "${a.txt}" -> ${a.href}`));
+            }
+
             fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, urls: allUrls }, null, 2));
 
             if (allUrls.length === 0) {
-              // آخرین تلاش: dump کامل HTML برای debug
-              const html = await page.content();
-              fs.writeFileSync('grabbed/final_html.txt', html);
-              console.log('Saved final HTML for debug');
               await browser.close();
               console.error('No video URLs found!');
               process.exit(1);
             }
 
-            // ── Step 4: دانلود ───────────────────────────────────────────
+            // ── Step 5: دانلود ───────────────────────────────────────────
             let downloaded = false;
 
             for (const url of allUrls) {
@@ -291,6 +289,14 @@ jobs:
         run: |
           echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
           echo "=== result.json ===" && cat grabbed/result.json 2>/dev/null || true
+          echo "=== extract_body (first 800 chars) ===" && head -c 800 grabbed/extract_body.json 2>/dev/null || true
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-grabbed
+          path: grabbed/
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
@@ -323,3 +329,4 @@ jobs:
           files: "*.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
