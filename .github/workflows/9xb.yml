@@ -7,18 +7,6 @@ on:
         description: "لینک فایل برای دانلود"
         required: true
 
-      preferred_quality:
-        description: "کیفیت ترجیحی"
-        required: true
-        default: "720p"
-        type: choice
-        options:
-          - "1080p"
-          - "720p"
-          - "480p"
-          - "360p"
-          - "best"
-
       upload_mode:
         description: "Upload mode"
         required: true
@@ -70,8 +58,6 @@ jobs:
           const { chromium } = require('playwright');
 
           const SOURCE_URL = process.argv[2];
-          const QUALITY    = process.argv[3] || '720p';
-
           if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
 
           const PROCESS_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
@@ -84,20 +70,18 @@ jobs:
               .slice(0, 80) || 'video';
           }
 
-          // video stream URL ها — googlevideo, CDN ها، و هر URL که content-type: video داشته باشه
-          function isStreamUrl(url, contentType = '') {
-            if (contentType.startsWith('video/')) return true;
-            if (url.includes('googlevideo.com')) return true;
-            if (url.includes('videoplayback')) return true;
+          function isVideoStream(url, ct = '') {
+            if (ct.startsWith('video/')) return true;
+            if (url.includes('googlevideo.com/videoplayback')) return true;
             if (/\.(mp4|m3u8|mkv|webm|mov)(\?|$)/i.test(url.split('?')[0])) return true;
             return false;
           }
 
-          function isAudioOnly(url) {
-            // itag 140, 251, 171 = audio only در YouTube
-            const audioItags = ['140','141','171','251','250','249','139'];
-            const itagMatch = url.match(/[?&]itag=(\d+)/);
-            if (itagMatch && audioItags.includes(itagMatch[1])) return true;
+          function isAudioOnly(url, ct = '') {
+            if (ct.startsWith('audio/')) return true;
+            const audioItags = ['139','140','141','171','249','250','251'];
+            const m = url.match(/[?&]itag=(\d+)/);
+            if (m && audioItags.includes(m[1])) return true;
             if (url.includes('mime=audio')) return true;
             return false;
           }
@@ -114,35 +98,29 @@ jobs:
             });
 
             const page = await context.newPage();
+            const capturedStreams = [];
 
-            // ── همه stream URL هایی که از network رد می‌شن رو capture کن ─
-            const capturedStreams = [];  // { url, itag, mime, quality }
-
+            // ── intercept همه network responses ──────────────────────────
             page.on('response', async (resp) => {
               try {
                 const u  = resp.url();
                 const ct = resp.headers()['content-type'] || '';
                 const st = resp.status();
 
-                if (u.includes('9xbud.com/token'))   console.log(`[TOKEN] ${st}`);
-                if (u.includes('9xbud.com/extract'))  console.log(`[EXTRACT] ${st}`);
+                if (u.includes('9xbud.com/token'))  console.log(`[TOKEN] ${st}`);
+                if (u.includes('9xbud.com/extract')) console.log(`[EXTRACT] ${st}`);
 
-                if ((st === 200 || st === 206) && isStreamUrl(u, ct)) {
-                  if (isAudioOnly(u)) {
-                    console.log('[AUDIO STREAM - skip]', u.slice(0, 80));
-                    return;
-                  }
+                if ((st === 200 || st === 206) && isVideoStream(u, ct) && !isAudioOnly(u, ct)) {
                   if (!capturedStreams.find(s => s.url === u)) {
-                    const itag  = (u.match(/[?&]itag=(\d+)/) || [])[1] || '';
-                    const mime  = (u.match(/[?&]mime=([^&]+)/) || [])[1] || ct;
-                    console.log(`[VIDEO STREAM] itag=${itag} mime=${mime}`);
-                    console.log(`  url: ${u.slice(0, 120)}`);
-                    capturedStreams.push({ url: u, itag, mime });
+                    const itag = (u.match(/[?&]itag=(\d+)/) || [])[1] || '';
+                    console.log(`[VIDEO STREAM] itag=${itag} ct=${ct} url=${u.slice(0,100)}`);
+                    capturedStreams.push({ url: u, itag, ct });
                   }
                 }
               } catch (e) {}
             });
 
+            // popup listener
             context.on('page', async (popup) => {
               try {
                 await popup.waitForLoadState('domcontentloaded', { timeout: 10000 });
@@ -152,10 +130,10 @@ jobs:
                   const pu = resp.url();
                   const ct = resp.headers()['content-type'] || '';
                   const st = resp.status();
-                  if ((st === 200 || st === 206) && isStreamUrl(pu, ct) && !isAudioOnly(pu)) {
+                  if ((st === 200 || st === 206) && isVideoStream(pu, ct) && !isAudioOnly(pu, ct)) {
                     if (!capturedStreams.find(s => s.url === pu)) {
-                      console.log('[POPUP VIDEO STREAM]', pu.slice(0, 100));
-                      capturedStreams.push({ url: pu, itag: '', mime: ct });
+                      console.log('[POPUP VIDEO STREAM]', pu.slice(0,100));
+                      capturedStreams.push({ url: pu, itag: '', ct });
                     }
                   }
                 });
@@ -169,143 +147,99 @@ jobs:
 
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
-            console.log('Quality preference:', QUALITY);
 
-            // ── کلیک روی دکمه دانلود با کیفیت مناسب ─────────────────────
-            // 9xbuddy یه جدول داره با rows برای هر کیفیت
-            // هر row یه دکمه download داره
-            console.log('\n=== Finding download button for quality:', QUALITY, '===');
+            // ── کلیک روی دکمه‌های download/extract ───────────────────────
+            console.log('\n=== Clicking download buttons ===');
 
-            // همه rows/sections رو پیدا کن
-            const allText = await page.$$eval('*', els =>
-              els.map(el => ({
-                tag: el.tagName,
-                txt: (el.innerText || '').trim().toLowerCase().slice(0, 50),
-                cls: (el.className || '').slice(0, 50)
-              })).filter(e => e.txt.includes('download') || e.txt.includes(QUALITY.toLowerCase()) || e.txt.includes('1080') || e.txt.includes('720') || e.txt.includes('480'))
-            );
-            console.log('Relevant elements:', JSON.stringify(allText.slice(0, 10), null, 2));
+            // همه <a> و <button> رو ساده بگیر (بدون $$eval پیچیده)
+            const btnHandles = await page.$$('a, button');
 
-            // روش ساده‌تر: همه دکمه‌های download رو پیدا کن
-            // و اون‌ایی که نزدیک quality text هستن رو کلیک کن
-            let clicked = false;
-
-            // ابتدا دنبال دکمه‌ای بگرد که در کنارش quality مورد نظر نوشته
-            const qualityNums = ['1080', '720', '480', '360', '240', '144'];
-            const preferredNum = QUALITY.replace('p', '');
-
-            // تمام element هایی که متن quality دارن
-            for (const qNum of [preferredNum, ...qualityNums.filter(q => q !== preferredNum)]) {
-              if (clicked || capturedStreams.length > 0) break;
-
+            for (const btn of btnHandles) {
+              if (capturedStreams.length > 0) break;
               try {
-                // پیدا کردن element با این quality text
-                const qEl = await page.$(`text="${qNum}p"`) ||
-                            await page.$(`text="${qNum}"`) ||
-                            await page.$(`:has-text("${qNum}p")`);
+                const txt  = (await btn.innerText().catch(() => '')).toLowerCase().trim();
+                const href = (await btn.getAttribute('href').catch(() => '')) || '';
 
-                if (!qEl) continue;
-                console.log(`Found quality element for ${qNum}p`);
+                // skip: external redirect links و app download
+                if (/app|software|extension|program|home|support|about/.test(txt)) continue;
+                if (href.includes('offmp3') || href.includes('savegif') || href.includes('123sudo')) continue;
+                if (!txt.includes('download') && !txt.includes('extract') && !href.toLowerCase().includes('download')) continue;
 
-                // دکمه download نزدیک به این element
-                const downloadBtn = await qEl.$('xpath=ancestor::*[3]//button | ancestor::*[3]//a[contains(text(),"Download")] | ancestor::*[3]//a[contains(@class,"download")]').catch(() => null) ||
-                                    await page.$(`text="${qNum}p" >> xpath=../following-sibling::*//button`).catch(() => null);
-
-                if (downloadBtn) {
-                  console.log(`Clicking download for ${qNum}p`);
-                  await downloadBtn.click().catch(() => {});
-                  await page.waitForTimeout(5000);
-                  clicked = true;
+                // اگه href مستقیم به ویدیو اشاره داره
+                if (/\.(mp4|m3u8|mkv|webm)(\?|$)/i.test(href) && !href.includes('9xbuddy')) {
+                  console.log('Direct video href:', href.slice(0, 80));
+                  capturedStreams.push({ url: href, itag: '', ct: '' });
+                  break;
                 }
+
+                console.log('Clicking:', txt || href.slice(0, 50));
+                await btn.click().catch(() => {});
+                await page.waitForTimeout(8000);
+
               } catch (e) {}
             }
 
-            // اگه هیچ کلیکی نشد، همه دکمه‌های download رو کلیک کن
-            if (!clicked || capturedStreams.length === 0) {
-              console.log('\n=== Clicking all download buttons ===');
-              const buttons = await page.$$('button, a');
-              for (const btn of buttons) {
-                if (capturedStreams.length > 0) break;
-                try {
-                  const txt = (await btn.innerText()).trim().toLowerCase();
-                  if (
-                    (txt.includes('download') && !txt.includes('app') && !txt.includes('software')) ||
-                    txt.includes('extract')
-                  ) {
-                    const href = await btn.getAttribute('href') || '';
-                    // skip redirect links
-                    if (href.includes('offmp3') || href.includes('savegif') || href.includes('9xbuddy.site')) continue;
-                    console.log('Clicking:', txt.slice(0, 40));
-                    await btn.click().catch(() => {});
-                    await page.waitForTimeout(8000);
-                  }
-                } catch (e) {}
-              }
-            }
-
-            // کمی صبر کن تا stream شروع بشه
+            // صبر بیشتر اگه هنوز stream نداریم
             if (capturedStreams.length === 0) {
-              console.log('Waiting for streams...');
+              console.log('Waiting extra 10s for streams...');
               await page.waitForTimeout(10000);
             }
 
-            console.log('\n=== Captured streams:', capturedStreams.length, '===');
-            capturedStreams.forEach((s, i) => console.log(` [${i+1}] itag=${s.itag} mime=${s.mime} url=${s.url.slice(0, 100)}`));
-
-            // ── اگه stream URL پیدا شد، با ffmpeg دانلود کن ─────────────
-            // ffmpeg می‌تونه از یه URL که streaming شروع شده دانلود کنه
-            if (capturedStreams.length > 0) {
-              const stream = capturedStreams[0];
-              fs.writeFileSync('grabbed/stream_url.txt', stream.url);
-              fs.writeFileSync('grabbed/stream_title.txt', title);
-              const cookies = await context.cookies();
-              fs.writeFileSync('grabbed/stream_cookies.txt', cookies.map(c => `${c.name}=${c.value}`).join('; '));
-              console.log('\nStream URL saved for ffmpeg download');
-            }
-
-            // همچنین دنبال URL مستقیم در HTML بگرد
+            // ── همچنین دنبال URL های مستقیم در HTML بگرد ─────────────────
             const html = await page.content();
             fs.writeFileSync('grabbed/final_html.txt', html);
 
-            // googlevideo URLs توی HTML
-            const googlevideoMatches = html.match(/https?:\/\/[^\s"<>]+googlevideo[^\s"<>]+/g) || [];
-            const videoGooglevideo = googlevideoMatches
-              .map(u => u.replace(/&amp;/g, '&'))
-              .filter(u => !isAudioOnly(u));
+            const htmlVideoUrls = [
+              ...(html.match(/https?:\/\/[^\s"<>]+googlevideo[^\s"<>]+/g) || []),
+              ...(html.match(/https?:\/\/[^\s"<>]+\.mp4[^\s"<>]*/g) || []),
+              ...(html.match(/https?:\/\/[^\s"<>]+\.m3u8[^\s"<>]*/g) || []),
+            ].map(u => u.replace(/&amp;/g, '&'))
+             .filter(u => !isAudioOnly(u));
 
-            console.log('googlevideo video URLs in HTML:', videoGooglevideo.length);
-            videoGooglevideo.forEach(u => console.log(' ', u.slice(0, 100)));
+            console.log('\nHTML video URLs:', htmlVideoUrls.length);
+            htmlVideoUrls.slice(0, 3).forEach(u => console.log(' ', u.slice(0, 100)));
 
-            if (videoGooglevideo.length > 0 && capturedStreams.length === 0) {
-              fs.writeFileSync('grabbed/stream_url.txt', videoGooglevideo[0]);
-              fs.writeFileSync('grabbed/stream_title.txt', title);
+            // merge
+            for (const u of htmlVideoUrls) {
+              if (!capturedStreams.find(s => s.url === u)) {
+                capturedStreams.push({ url: u, itag: '', ct: '' });
+              }
             }
 
-            fs.writeFileSync('grabbed/result.json', JSON.stringify({
-              title,
-              streams: capturedStreams,
-              htmlVideoUrls: videoGooglevideo
-            }, null, 2));
+            console.log('\n=== Total streams found:', capturedStreams.length, '===');
+            capturedStreams.forEach((s, i) =>
+              console.log(` [${i+1}] itag=${s.itag} url=${s.url.slice(0, 120)}`)
+            );
 
-            await browser.close();
+            fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, streams: capturedStreams }, null, 2));
 
-            const hasStream = capturedStreams.length > 0 || videoGooglevideo.length > 0;
-            if (!hasStream) {
-              console.error('No stream URLs found!');
+            if (capturedStreams.length === 0) {
+              await browser.close();
+              console.error('No streams found!');
               process.exit(1);
             }
+
+            // ذخیره برای ffmpeg step
+            const best = capturedStreams[0];
+            const cookies = await context.cookies();
+            fs.writeFileSync('grabbed/stream_url.txt', best.url);
+            fs.writeFileSync('grabbed/stream_title.txt', title);
+            fs.writeFileSync('grabbed/stream_cookies.txt', cookies.map(c => `${c.name}=${c.value}`).join('; '));
+
+            await browser.close();
+            console.log('\nDone. Stream URL saved.');
 
           })();
 
           EOF
 
       - name: Run Playwright
-        run: node buddy_dl.js "${{ github.event.inputs.source_url }}" "${{ github.event.inputs.preferred_quality }}"
+        run: node buddy_dl.js "${{ github.event.inputs.source_url }}"
 
-      - name: Download stream with ffmpeg
+      - name: Download with ffmpeg
         run: |
           if [ ! -f grabbed/stream_url.txt ]; then
-            echo "No stream URL found"
+            echo "No stream URL"
             exit 1
           fi
 
@@ -313,32 +247,28 @@ jobs:
           title=$(cat grabbed/stream_title.txt)
           cookies=$(cat grabbed/stream_cookies.txt 2>/dev/null || echo "")
 
-          echo "Stream URL: ${url:0:100}..."
+          echo "URL: ${url:0:120}..."
           echo "Title: $title"
 
-          ext="mp4"
-
-          # ffmpeg با همون headers که browser استفاده کرده
           ffmpeg -y \
             -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" \
             ${cookies:+-headers "Cookie: ${cookies}"} \
             -i "$url" \
             -c copy \
-            "downloads/${title}.${ext}" \
-            && echo "SUCCESS" \
-            || {
-              echo "ffmpeg failed, trying aria2c..."
-              aria2c \
-                -x 16 -s 16 -k 1M \
-                -c \
-                --summary-interval=10 \
-                --console-log-level=warn \
-                --header="User-Agent: Mozilla/5.0" \
-                ${cookies:+--header="Cookie: ${cookies}"} \
-                --dir=downloads \
-                --out="${title}.${ext}" \
-                "$url"
-            }
+            "downloads/${title}.mp4" \
+          && echo "SUCCESS" \
+          || {
+            echo "ffmpeg failed, trying aria2c..."
+            aria2c \
+              -x 16 -s 16 -k 1M -c \
+              --summary-interval=10 \
+              --console-log-level=warn \
+              --header="User-Agent: Mozilla/5.0" \
+              ${cookies:+--header="Cookie: ${cookies}"} \
+              --dir=downloads \
+              --out="${title}.mp4" \
+              "$url"
+          }
 
       - name: Show results
         run: |
