@@ -70,9 +70,9 @@ jobs:
               .slice(0, 80) || 'video';
           }
 
-          // ── decoder توابع ─────────────────────────────────────────────
-
-          // workers.dev: هر segment = reversed base64
+          // ── worker.dev decoder ────────────────────────────────────────
+          // هر segment = reversed base64
+          // part1 → URL واقعی، part2 → JSON headers
           function decodeWorkerSegment(seg) {
             try {
               const rev = seg.split('').reverse().join('');
@@ -84,69 +84,82 @@ jobs:
             try {
               const afterDomain = url.split('workers.dev/')[1]?.split('?')[0];
               if (!afterDomain) return null;
-
-              const parts = afterDomain.split('/').filter(p => p && p !== ',');
-              // بخش اول: URL فایل
-              const decoded0 = decodeWorkerSegment(parts[0]);
-              // بخش دوم: JSON با headers
-              const decoded1 = parts[1] ? decodeWorkerSegment(parts[1]) : null;
+              // جداسازی بر اساس / و , و فیلتر empty
+              const parts = afterDomain.split(/[\/,]+/).filter(p => p && p.length > 10);
+              if (parts.length === 0) return null;
 
               let realUrl = null;
               let headers = {};
 
-              // گاهی decoded0 مستقیماً URL هست
-              if (decoded0 && decoded0.startsWith('http')) {
-                realUrl = decoded0;
-              }
-              // گاهی prefix مثل 'klmdu' داره — بدونش decode کن
-              else if (decoded0) {
-                const m = decoded0.match(/https?:\/\/\S+/);
-                if (m) realUrl = m[0];
-              }
-
-              // اگه هنوز پیدا نشد، segment بدون prefix امتحان کن
-              if (!realUrl && parts[0].length > 5) {
-                const withoutPrefix = parts[0].slice(5); // remove 5-char prefix like 'klmdu'
-                const dec = decodeWorkerSegment(withoutPrefix);
-                if (dec && dec.startsWith('http')) realUrl = dec;
-                else if (dec) {
-                  const m = dec.match(/https?:\/\/\S+/);
-                  if (m) realUrl = m[0];
+              // هر part رو امتحان کن
+              for (const p of parts) {
+                const dec = decodeWorkerSegment(p);
+                if (!dec) continue;
+                if (!realUrl && dec.startsWith('http')) {
+                  realUrl = dec.trim();
+                  continue;
                 }
-              }
-
-              // parse headers از بخش دوم
-              if (decoded1) {
-                try {
-                  const json = JSON.parse(decoded1);
-                  headers = json.headers || {};
-                } catch (e) {}
+                // JSON headers
+                if (dec.includes('"headers"') || dec.includes('"user-agent"')) {
+                  try {
+                    const json = JSON.parse(dec);
+                    headers = json.headers || {};
+                  } catch (e) {}
+                }
               }
 
               return realUrl ? { url: realUrl, headers } : null;
             } catch (e) { return null; }
           }
 
-          // p3.9xbud.com/down: base64 → PHP serialized
+          // ── 9xbud/down decoder ────────────────────────────────────────
+          // سه نوع:
+          //   نوع ۱: base64 → worker.dev URL → دوباره parseWorkerUrl
+          //   نوع ۲: base64 → PHP serialized → url + headers
+          //   نوع ۳: base64 → مستقیم URL
           function decode9xbudDown(url) {
             try {
               const match = url.match(/\/down\/([A-Za-z0-9+/=,_-]+)/);
               if (!match) return null;
-              const b64 = match[1].split(',')[0];
+              const b64 = match[1].split('/')[0];
               const decoded = Buffer.from(b64, 'base64').toString('utf-8');
-              const urlMatch = decoded.match(/s:3:"url";s:\d+:"([^"]+)"/);
-              if (!urlMatch) return null;
-              const realUrl = urlMatch[1];
-              const headers = {};
-              const hMatches = decoded.matchAll(/s:\d+:"([^"]+:\s*[^"]+)"/g);
-              for (const m of hMatches) {
-                const ci = m[1].indexOf(':');
-                if (ci > 0) {
-                  headers[m[1].slice(0, ci).trim().toLowerCase()] = m[1].slice(ci + 1).trim();
+              console.log('  9xbud/down decoded preview:', decoded.slice(0, 80));
+
+              // نوع ۱: → worker.dev
+              if (decoded.includes('workers.dev')) {
+                console.log('  → worker.dev chain');
+                return parseWorkerUrl(decoded);
+              }
+
+              // نوع ۲: → PHP serialized
+              if (decoded.includes('s:3:"url"')) {
+                const urlMatch = decoded.match(/s:3:"url";s:\d+:"([^"]+)"/);
+                if (urlMatch) {
+                  const realUrl = urlMatch[1];
+                  const headers = {};
+                  const hMatches = decoded.matchAll(/s:\d+:"([^"]+:\s*[^"]+)"/g);
+                  for (const m of hMatches) {
+                    const ci = m[1].indexOf(':');
+                    if (ci > 0) {
+                      headers[m[1].slice(0, ci).trim().toLowerCase()] = m[1].slice(ci + 1).trim();
+                    }
+                  }
+                  console.log('  → PHP serialized, url:', realUrl.slice(0, 80));
+                  return { url: realUrl, headers };
                 }
               }
-              return { url: realUrl, headers };
-            } catch (e) { return null; }
+
+              // نوع ۳: مستقیم URL
+              if (decoded.startsWith('http')) {
+                console.log('  → direct URL');
+                return { url: decoded.trim(), headers: {} };
+              }
+
+              return null;
+            } catch (e) {
+              console.log('  decode9xbudDown error:', e.message);
+              return null;
+            }
           }
 
           (async () => {
@@ -177,12 +190,11 @@ jobs:
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
 
-            // ── جمع‌آوری همه لینک‌ها از DOM ──────────────────────────────
+            // ── جمع‌آوری همه لینک‌ها ──────────────────────────────────
             const allHrefs = await page.$$eval('a[href]', els => els.map(a => a.href).filter(Boolean));
             const html = await page.content();
             fs.writeFileSync('grabbed/page.html', html);
 
-            // همه URL ها از href و HTML text
             const rawUrls = new Set([
               ...allHrefs,
               ...(html.match(/https?:\/\/[^\s"<>'\\]+workers?\.dev\/[^\s"<>'\\]*/g) || []),
@@ -191,78 +203,77 @@ jobs:
               ...(html.match(/https?:\/\/[^\s"<>'\\]+\.mp4[^\s"<>'\\]*/g) || []),
             ].map(u => u.replace(/&amp;/g, '&')));
 
-            // ── decode و categorize ───────────────────────────────────────
+            // ── decode و categorize ───────────────────────────────────
             const candidates = [];
+            const seenUrls = new Set();
+
+            function addCandidate(url, headers, type, priority) {
+              if (!url || seenUrls.has(url)) return;
+              seenUrls.add(url);
+              candidates.push({ url, headers: headers || {}, type, priority });
+              console.log(`[${type}] ${url.slice(0, 100)}`);
+            }
 
             for (const u of rawUrls) {
-              // worker.dev
-              if (u.includes('workers.dev') || u.includes('worker.dev')) {
-                const parsed = parseWorkerUrl(u);
-                if (parsed && parsed.url) {
-                  console.log(`[worker.dev decoded] ${parsed.url.slice(0, 100)}`);
-                  candidates.push({ url: parsed.url, headers: parsed.headers, type: 'worker', priority: 1, rawUrl: u });
-                } else {
-                  // اگه decode نشد، مستقیم امتحان کن
-                  candidates.push({ url: u, headers: {}, type: 'worker-direct', priority: 2, rawUrl: u });
-                }
-                continue;
-              }
-              // 9xbud/down
+              // 9xbud/down → decode
               if (u.includes('9xbud.com/down')) {
+                console.log('\nDecoding 9xbud/down:', u.slice(0, 80));
                 const parsed = decode9xbudDown(u);
-                if (parsed && parsed.url) {
-                  console.log(`[9xbud/down decoded] ${parsed.url.slice(0, 100)}`);
-                  candidates.push({ url: parsed.url, headers: parsed.headers, type: '9xbud', priority: 1, rawUrl: u });
+                if (parsed?.url) {
+                  addCandidate(parsed.url, parsed.headers, '9xbud-decoded', 1);
                 } else {
-                  candidates.push({ url: u, headers: {}, type: '9xbud-direct', priority: 2, rawUrl: u });
+                  // اگه decode نشد مستقیم امتحان کن
+                  addCandidate(u, {}, '9xbud-raw', 3);
                 }
                 continue;
               }
-              // googlevideo
-              if (u.includes('googlevideo.com')) {
-                const audioItags = ['139','140','141','171','249','250','251'];
-                const itag = (u.match(/[?&]itag=(\d+)/) || [])[1];
-                if (itag && audioItags.includes(itag)) continue; // skip audio
-                if (u.includes('mime=audio')) continue;
-                candidates.push({ url: u, headers: {}, type: 'googlevideo', priority: 3, rawUrl: u });
+
+              // worker.dev → decode
+              if (u.includes('workers.dev')) {
+                const parsed = parseWorkerUrl(u);
+                if (parsed?.url) {
+                  addCandidate(parsed.url, parsed.headers, 'worker-decoded', 1);
+                } else {
+                  addCandidate(u, {}, 'worker-raw', 2);
+                }
                 continue;
               }
+
+              // googlevideo → بدون audio
+              if (u.includes('googlevideo.com')) {
+                const itag = (u.match(/[?&]itag=(\d+)/) || [])[1];
+                const audioItags = ['139','140','141','171','249','250','251'];
+                if (itag && audioItags.includes(itag)) continue;
+                if (u.includes('mime=audio')) continue;
+                addCandidate(u, {}, 'googlevideo', 4);
+                continue;
+              }
+
               // direct mp4
               if (/\.mp4(\?|$)/i.test(u.split('?')[0]) && !u.includes('9xbuddy')) {
-                candidates.push({ url: u, headers: {}, type: 'direct', priority: 2, rawUrl: u });
+                addCandidate(u, {}, 'direct', 2);
               }
             }
 
-            // deduplicate بر اساس decoded url
-            const seen = new Set();
-            const uniqueCandidates = candidates.filter(c => {
-              if (seen.has(c.url)) return false;
-              seen.add(c.url);
-              return true;
-            });
+            candidates.sort((a, b) => a.priority - b.priority);
 
-            uniqueCandidates.sort((a, b) => a.priority - b.priority);
-
-            console.log('\n=== Candidates:', uniqueCandidates.length, '===');
-            uniqueCandidates.forEach((c, i) =>
+            console.log('\n=== Candidates:', candidates.length, '===');
+            candidates.forEach((c, i) =>
               console.log(` [${i+1}][${c.type}] ${c.url.slice(0, 100)}`)
             );
 
-            fs.writeFileSync('grabbed/candidates.json', JSON.stringify(uniqueCandidates, null, 2));
-
-            if (uniqueCandidates.length === 0) {
-              await browser.close();
-              console.error('No candidates!');
-              process.exit(1);
-            }
-
-            // title و cookies ذخیره کن
-            const cookies = await context.cookies();
+            fs.writeFileSync('grabbed/candidates.json', JSON.stringify(candidates, null, 2));
             fs.writeFileSync('grabbed/title.txt', title);
+
+            const cookies = await context.cookies();
             fs.writeFileSync('grabbed/cookies.txt', cookies.map(c => `${c.name}=${c.value}`).join('; '));
 
             await browser.close();
-            console.log('Done.');
+
+            if (candidates.length === 0) {
+              console.error('No candidates found!');
+              process.exit(1);
+            }
 
           })();
 
@@ -273,77 +284,64 @@ jobs:
 
       - name: Download best candidate
         run: |
-          title=$(cat grabbed/title.txt)
-          cookies=$(cat grabbed/cookies.txt 2>/dev/null || echo "")
-
           python3 << 'PYEOF'
           import json, subprocess, sys, os, re
 
           candidates = json.load(open('grabbed/candidates.json'))
-          title = open('grabbed/title.txt').read().strip()
-          cookies = open('grabbed/cookies.txt').read().strip() if os.path.exists('grabbed/cookies.txt') else ''
+          title      = open('grabbed/title.txt').read().strip()
+          cookies    = open('grabbed/cookies.txt').read().strip() if os.path.exists('grabbed/cookies.txt') else ''
 
           def get_ext(url):
-              m = re.search(r'\.(mp4|m3u8|mkv|webm|mov)', url.split('?')[0], re.I)
-              return m.group(1).lower() if m else 'mp4'
+              m = re.search(r'\.(mp4|m3u8|mkv|webm|mov|vid)', url.split('?')[0], re.I)
+              ext = m.group(1).lower() if m else 'mp4'
+              return 'mp4' if ext == 'vid' else ext
 
-          def try_curl(url, headers, dest):
+          def run_curl(url, headers, dest):
               cmd = ['curl', '-L', '--retry', '3', '--connect-timeout', '30',
                      '--max-time', '3600', '-o', dest, '--silent', '--show-error']
-              # headers
-              all_headers = {
-                  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                  'accept': '*/*',
-              }
-              if cookies:
-                  all_headers['cookie'] = cookies
-              all_headers.update({k.lower(): v for k, v in headers.items()})
-              for k, v in all_headers.items():
+              all_h = {'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                       'accept': '*/*'}
+              if cookies: all_h['cookie'] = cookies
+              all_h.update({k.lower(): v for k, v in headers.items()})
+              for k, v in all_h.items():
                   cmd += ['-H', f'{k}: {v}']
-              cmd.append(url)
               print('  curl:', url[:80])
-              r = subprocess.run(cmd)
+              r = subprocess.run(cmd + [url])
               if r.returncode == 0 and os.path.exists(dest):
-                  size = os.path.getsize(dest)
-                  print(f'  size: {size/1024/1024:.1f} MB')
-                  if size > 1_048_576:
-                      return True
+                  sz = os.path.getsize(dest)
+                  print(f'  size: {sz/1024/1024:.1f} MB')
+                  if sz > 1_048_576: return True
               if os.path.exists(dest): os.remove(dest)
               return False
 
-          def try_aria2(url, headers, dest):
+          def run_aria2(url, headers, dest):
               d, f = os.path.dirname(dest), os.path.basename(dest)
               cmd = ['aria2c', '-x', '16', '-s', '16', '-k', '1M', '-c',
                      '--summary-interval=10', '--console-log-level=warn',
                      '--dir', d, '--out', f]
-              all_headers = {
-                  'user-agent': 'Mozilla/5.0',
-                  'accept': '*/*',
-              }
-              if cookies:
-                  all_headers['cookie'] = cookies
-              all_headers.update({k.lower(): v for k, v in headers.items()})
-              for k, v in all_headers.items():
+              all_h = {'user-agent': 'Mozilla/5.0', 'accept': '*/*'}
+              if cookies: all_h['cookie'] = cookies
+              all_h.update({k.lower(): v for k, v in headers.items()})
+              for k, v in all_h.items():
                   cmd += ['--header', f'{k}: {v}']
-              cmd.append(url)
               print('  aria2c:', url[:80])
-              r = subprocess.run(cmd)
+              r = subprocess.run(cmd + [url])
               if r.returncode == 0 and os.path.exists(dest):
-                  size = os.path.getsize(dest)
-                  if size > 1_048_576:
-                      return True
+                  sz = os.path.getsize(dest)
+                  if sz > 1_048_576: return True
               if os.path.exists(dest): os.remove(dest)
               return False
 
-          def try_ffmpeg(url, headers, dest):
-              cmd = ['ffmpeg', '-y',
-                     '-user_agent', 'Mozilla/5.0',
-                     '-i', url, '-c', 'copy', dest]
+          def run_ffmpeg(url, headers, dest):
+              cmd = ['ffmpeg', '-y', '-user_agent', 'Mozilla/5.0']
+              for k, v in headers.items():
+                  if k.lower() in ['referer', 'origin']:
+                      cmd += ['-headers', f'{k}: {v}']
+              cmd += ['-i', url, '-c', 'copy', dest]
               print('  ffmpeg:', url[:80])
               r = subprocess.run(cmd)
               if r.returncode == 0 and os.path.exists(dest):
-                  if os.path.getsize(dest) > 1_048_576:
-                      return True
+                  if os.path.getsize(dest) > 1_048_576: return True
               if os.path.exists(dest): os.remove(dest)
               return False
 
@@ -359,14 +357,14 @@ jobs:
               print(f'\n=== [{ctype}] {url[:80]}')
 
               if ext == 'm3u8':
-                  downloaded = try_ffmpeg(url, headers, f'downloads/{title}.mp4')
+                  downloaded = run_ffmpeg(url, headers, f'downloads/{title}.mp4')
               else:
-                  downloaded = try_curl(url, headers, dest)
+                  downloaded = run_curl(url, headers, dest)
                   if not downloaded:
-                      downloaded = try_aria2(url, headers, dest)
+                      downloaded = run_aria2(url, headers, dest)
 
               if downloaded:
-                  print('SUCCESS!')
+                  print('SUCCESS:', dest)
                   break
 
           if not downloaded:
@@ -379,47 +377,6 @@ jobs:
           echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
           echo "=== candidates ===" && python3 -c "
           import json
-          try:
-            c = json.load(open('grabbed/candidates.json'))
-            for i,x in enumerate(c): print(f'  [{i+1}][{x[\"type\"]}] {x[\"url\"][:80]}')
-          except: pass
-          " || true
-
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-grabbed
-          path: grabbed/
-
-      - name: Create ZIP
-        if: github.event.inputs.upload_mode == 'zip'
-        run: |
-          ts=$(date +"%Y%m%d_%H%M%S")
-          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "buddy_media_${ts}.zip" downloads/
-
-      - name: Delete old releases
-        if: github.event.inputs.delete_old_releases == 'yes'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          releases=$(gh release list --limit 100 | awk '{print $1}')
-          for tag in $releases; do gh release delete "$tag" -y || true; done
-
-      - name: Upload Direct Release
-        if: github.event.inputs.upload_mode == 'direct'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: buddy-${{ github.run_number }}
-          files: "downloads/*"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload ZIP Release
-        if: github.event.inputs.upload_mode == 'zip'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: buddy-${{ github.run_number }}
-          files: "*.zip"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          c = json.load(open('grabbed/candidates.json'))
+          for i,x in enumerate(c): print(f'  [{i+1}][{x[\"type\"]}] {x[\"url\"][:80]}')
+          " 2>
