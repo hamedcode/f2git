@@ -127,35 +127,14 @@ jobs:
             } catch (e) { console.log('  decode error:', e.message); return null; }
           }
 
-          // همه لینک‌های 9xbud/down و worker.dev رو از DOM جمع می‌کنه
-          async function collectLinks(page) {
+          // بررسی DOM برای لینک‌های جدید 9xbud/down یا worker.dev
+          async function getActionLinks(page) {
             const hrefs = await page.$$eval('a[href]', els => els.map(a => a.href).filter(Boolean));
-            const html  = await page.content();
-            const all   = new Set([
-              ...hrefs,
-              ...(html.match(/https?:\/\/[^\s"<>'\\]+9xbud\.com\/down\/[^\s"<>'\\]+/g) || []),
-              ...(html.match(/https?:\/\/[^\s"<>'\\]+workers?\.dev\/[^\s"<>'\\]*/g) || []),
-              ...(html.match(/https?:\/\/[^\s"<>'\\]+\.mp4[^\s"<>'\\]*/g) || []),
-              ...(html.match(/https?:\/\/[^\s"<>'\\]+googlevideo[^\s"<>'\\]+/g) || []),
-            ].map(u => u.replace(/&amp;/g, '&')));
-            return [...all].filter(u =>
+            return hrefs.filter(u =>
               u.includes('9xbud.com/down') ||
-              u.includes('workers.dev') ||
-              /\.mp4(\?|$)/i.test(u.split('?')[0]) ||
-              u.includes('googlevideo.com')
+              (u.includes('workers.dev') && !u.includes('9xbuddy')) ||
+              /\.mp4(\?|$)/i.test(u.split('?')[0])
             );
-          }
-
-          // poll DOM تا لینک جدیدی بیاد یا timeout
-          async function pollForNewLinks(page, known, timeoutMs = 15000) {
-            const start = Date.now();
-            while (Date.now() - start < timeoutMs) {
-              await page.waitForTimeout(800);
-              const current = await collectLinks(page);
-              const newLinks = current.filter(u => !known.has(u));
-              if (newLinks.length > 0) return newLinks;
-            }
-            return [];
           }
 
           (async () => {
@@ -181,75 +160,74 @@ jobs:
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
 
-            // snapshot قبل از کلیک
-            const knownLinks = new Set(await collectLinks(page));
-            console.log('Links before click:', knownLinks.size);
-
-            // ── کلیک روی دکمه‌های Extract/Download یکی یکی ──────────────
-            // بعد از هر کلیک، DOM رو poll می‌کنیم تا لینک جدید بیاد
-            const allFoundLinks = new Set([...knownLinks]);
-
+            // ── کلیک روی دکمه‌ها یکی یکی ────────────────────────────────
+            // به محض پیدا شدن اولین لینک → stop و decode کن
             const buttons = await page.$$('button, a');
+            let foundLinks = [];
+
             for (const btn of buttons) {
               try {
                 const txt  = (await btn.innerText().catch(() => '')).toLowerCase().trim();
                 const href = (await btn.getAttribute('href').catch(() => '')) || '';
 
-                if (/app|software|extension|home|support|language/.test(txt)) continue;
+                if (/app|software|extension|home|support|language|lang/.test(txt)) continue;
                 if (!txt.includes('download') && !txt.includes('extract') && !txt.includes('get link')) continue;
                 if (href.includes('9xbuddy.site') && !href.includes('/down/')) continue;
+                // لینک‌های redirect به سایت‌های دیگه رو skip کن
+                if (href.startsWith('http') && !href.includes('9xbud.com')) continue;
 
-                console.log('\nClicking:', txt.slice(0, 40) || href.slice(0, 40));
-
+                console.log('\nClicking:', txt.slice(0, 40) || href.slice(0, 60));
                 await btn.click().catch(() => {});
 
-                // صبر کن تا /extract response بیاد و DOM آپدیت بشه
-                const newLinks = await pollForNewLinks(page, allFoundLinks, 15000);
-
-                if (newLinks.length > 0) {
-                  console.log('New links after click:', newLinks.length);
-                  newLinks.forEach(l => { console.log(' ', l.slice(0, 100)); allFoundLinks.add(l); });
-                } else {
-                  console.log('No new links after this click');
+                // poll DOM هر 500ms تا 12 ثانیه
+                const start = Date.now();
+                while (Date.now() - start < 12000) {
+                  await page.waitForTimeout(500);
+                  const links = await getActionLinks(page);
+                  if (links.length > 0) {
+                    console.log('Found', links.length, 'link(s) after', Math.round((Date.now()-start)/1000), 's');
+                    links.forEach(l => console.log(' ', l.slice(0, 100)));
+                    foundLinks = links;
+                    break;
+                  }
                 }
+
+                // اگه لینک پیدا شد، دیگه ادامه نده
+                if (foundLinks.length > 0) break;
+                console.log('No links after this click, trying next button...');
 
               } catch(e) {}
             }
 
-            // ── decode همه لینک‌ها ────────────────────────────────────────
-            const candidates = [];
-            const seenUrls   = new Set();
-
-            function addCandidate(url, headers, type, priority) {
-              if (!url || seenUrls.has(url)) return;
-              seenUrls.add(url);
-              candidates.push({ url, headers: headers || {}, type, priority });
-              console.log('[' + type + ']', url.slice(0, 100));
+            if (foundLinks.length === 0) {
+              console.error('No links found after all clicks!');
+              await browser.close();
+              process.exit(1);
             }
 
-            for (const u of allFoundLinks) {
+            // ── decode و ذخیره ────────────────────────────────────────────
+            const candidates = [];
+            const seen = new Set();
+
+            function addCandidate(url, headers, type, priority) {
+              if (!url || seen.has(url)) return;
+              seen.add(url);
+              candidates.push({ url, headers: headers || {}, type, priority });
+              console.log('[' + type + '] ' + url.slice(0, 100));
+            }
+
+            for (const u of foundLinks) {
               if (u.includes('9xbud.com/down')) {
-                console.log('\nDecoding 9xbud/down:', u.slice(0, 80));
+                console.log('\nDecoding:', u.slice(0, 80));
                 const parsed = decode9xbudDown(u);
                 if (parsed && parsed.url) addCandidate(parsed.url, parsed.headers, '9xbud-decoded', 1);
                 else addCandidate(u, {}, '9xbud-raw', 5);
-                continue;
-              }
-              if (u.includes('workers.dev')) {
+              } else if (u.includes('workers.dev')) {
                 const parsed = parseWorkerUrl(u);
                 if (parsed && parsed.url) addCandidate(parsed.url, parsed.headers, 'worker-decoded', 1);
                 else addCandidate(u, {}, 'worker-raw', 4);
-                continue;
-              }
-              if (u.includes('googlevideo.com')) {
-                const itag = (u.match(/[?&]itag=(\d+)/) || [])[1];
-                if (['139','140','141','171','249','250','251'].includes(itag)) continue;
-                if (u.includes('mime=audio')) continue;
-                addCandidate(u, {}, 'googlevideo', 6);
-                continue;
-              }
-              if (/\.mp4(\?|$)/i.test(u.split('?')[0]) && !u.includes('9xbuddy')) {
-                addCandidate(u, {}, 'direct', 3);
+              } else if (/\.mp4(\?|$)/i.test(u.split('?')[0])) {
+                addCandidate(u, {}, 'direct-mp4', 2);
               }
             }
 
@@ -263,7 +241,6 @@ jobs:
             fs.writeFileSync('grabbed/cookies.txt', cookies.map(c => c.name + '=' + c.value).join('; '));
 
             await browser.close();
-            if (candidates.length === 0) { console.error('No candidates!'); process.exit(1); }
           })();
           """
           with open('buddy_dl.js', 'w') as f:
@@ -297,6 +274,8 @@ jobs:
             }
             if cookies: h['cookie'] = cookies
             h.update({k.lower(): v for k, v in headers.items()})
+            # حذف کلیدهای که URL هستن نه header
+            h = {k: v for k, v in h.items() if not v.startswith('http') or k in ('referer','origin')}
             return h
 
           def run_curl(url, headers, dest):
@@ -309,7 +288,7 @@ jobs:
             print('  curl:', url[:80])
             r = subprocess.run(cmd, capture_output=True, text=True)
             code = r.stdout.strip()[-3:] if r.stdout else '?'
-            print(f'  http={code}', r.stderr[:100] if r.stderr else '')
+            print(f'  http={code}', r.stderr.strip()[:80] if r.stderr else '')
             if r.returncode == 0 and os.path.exists(dest):
               sz = os.path.getsize(dest)
               print(f'  size: {sz/1024/1024:.1f} MB')
