@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zip curl aria2 jq gh
+          sudo apt-get install -y ffmpeg zip curl jq gh
           npm init -y
           npm install playwright
           npx playwright install chromium --with-deps
@@ -69,7 +69,6 @@ jobs:
               .slice(0, 80) || 'video';
           }
 
-          // لینک‌های قابل استفاده از DOM
           async function getActionLinks(page) {
             const hrefs = await page.$$eval('a[href]', els => els.map(a => a.href).filter(Boolean));
             return hrefs.filter(u =>
@@ -81,7 +80,7 @@ jobs:
           (async () => {
             const browser = await chromium.launch({ headless: true });
             const context = await browser.newContext({
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
               acceptDownloads: true
             });
             const page = await context.newPage();
@@ -101,7 +100,6 @@ jobs:
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
 
-            // کلیک روی اولین دکمه download/extract
             const buttons = await page.$$('button, a');
             let foundLinks = [];
 
@@ -117,7 +115,6 @@ jobs:
                 console.log('Clicking:', txt.slice(0, 40) || href.slice(0, 60));
                 await btn.click().catch(() => {});
 
-                // poll هر 500ms تا 12 ثانیه
                 const start = Date.now();
                 while (Date.now() - start < 12000) {
                   await page.waitForTimeout(500);
@@ -141,25 +138,18 @@ jobs:
               process.exit(1);
             }
 
-            // ── build candidates ──────────────────────────────────────────
-            // کلید: 9xbud.com/down/ رو مستقیم دانلود کن (proxy هست)
-            // workers.dev رو هم مستقیم دانلود کن (proxy هست)
-            // نیازی به decode نیست!
             const candidates = [];
             const seen = new Set();
 
-            function addCandidate(url, type, priority) {
-              if (!url || seen.has(url)) return;
-              seen.add(url);
-              candidates.push({ url, type, priority });
-              console.log('[' + type + '] ' + url.slice(0, 100));
-            }
-
             for (const u of foundLinks) {
+              if (seen.has(u)) continue;
+              seen.add(u);
               if (u.includes('9xbud.com/down')) {
-                addCandidate(u, '9xbud-direct', 1);
+                candidates.push({ url: u, type: '9xbud-direct', priority: 1 });
+                console.log('[9xbud-direct]', u.slice(0, 100));
               } else if (u.includes('workers.dev')) {
-                addCandidate(u, 'worker-direct', 2);
+                candidates.push({ url: u, type: 'worker-direct', priority: 2 });
+                console.log('[worker-direct]', u.slice(0, 100));
               }
             }
 
@@ -167,10 +157,13 @@ jobs:
             console.log('\n=== Candidates:', candidates.length);
             candidates.forEach((c, i) => console.log(' [' + (i+1) + '][' + c.type + '] ' + c.url.slice(0, 100)));
 
+            // cookies رو ذخیره کن
+            const cookies = await context.cookies();
+            const cookieStr = cookies.map(c => c.name + '=' + c.value).join('; ');
+
             fs.writeFileSync('grabbed/candidates.json', JSON.stringify(candidates, null, 2));
             fs.writeFileSync('grabbed/title.txt', title);
-            const cookies = await context.cookies();
-            fs.writeFileSync('grabbed/cookies.txt', cookies.map(c => c.name + '=' + c.value).join('; '));
+            fs.writeFileSync('grabbed/cookies.txt', cookieStr);
 
             await browser.close();
           })();
@@ -183,10 +176,10 @@ jobs:
       - name: Run Playwright
         run: node buddy_dl.js "${{ github.event.inputs.source_url }}"
 
-      - name: Download candidates
+      - name: Download with single connection curl
         run: |
           python3 - << 'PYEOF'
-          import json, subprocess, sys, os, re
+          import json, subprocess, sys, os
 
           candidates = json.load(open('grabbed/candidates.json'))
           title      = open('grabbed/title.txt').read().strip()
@@ -194,57 +187,44 @@ jobs:
 
           print(f'Total candidates: {len(candidates)}')
 
-          def get_ext(url):
-            # از Content-Disposition میخونیم، ولی پیش‌فرض mp4
-            return 'mp4'
-
           def run_curl(url, dest):
+            # دقیقاً همون headers که browser استفاده کرد (از HAR)
+            # یک کانکشن — بدون parallel
             cmd = [
               'curl', '-L',
               '--retry', '3',
               '--connect-timeout', '30',
               '--max-time', '3600',
               '-o', dest,
-              '--silent', '--show-error',
-              '--write-out', '%{http_code}|%{content_type}',
-              '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              '-H', 'Accept: */*',
+              '--show-error',
+              '--progress-bar',
+              '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+              '-H', 'Accept-Language: en-US,en;q=0.9',
+              '-H', 'Connection: keep-alive',
+              '-H', 'Sec-Fetch-Dest: document',
+              '-H', 'Sec-Fetch-Mode: navigate',
+              '-H', 'Sec-Fetch-Site: cross-site',
+              '-H', 'Sec-Fetch-User: ?1',
+              '-H', 'Upgrade-Insecure-Requests: 1',
+              '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+              '-H', 'sec-ch-ua: "Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+              '-H', 'sec-ch-ua-mobile: ?0',
+              '-H', 'sec-ch-ua-platform: "Windows"',
             ]
             if cookies:
               cmd += ['-H', f'Cookie: {cookies}']
             cmd.append(url)
-            print('  curl:', url[:80])
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            out = r.stdout.strip() if r.stdout else ''
-            parts = out.split('|')
-            code = parts[0][-3:] if parts else '?'
-            ctype = parts[1] if len(parts) > 1 else ''
-            print(f'  http={code} content-type={ctype[:50]}')
+
+            print('  curl (single connection):', url[:80])
+            r = subprocess.run(cmd)
+            print(f'  exit code: {r.returncode}')
+
             if r.returncode == 0 and os.path.exists(dest):
               sz = os.path.getsize(dest)
               print(f'  size: {sz/1024/1024:.1f} MB')
-              if sz > 1_048_576 and code == '200': return True
+              if sz > 1_048_576:
+                return True
             if os.path.exists(dest): os.remove(dest)
-            return False
-
-          def run_aria2(url, dest):
-            d, f = os.path.dirname(dest) or 'downloads', os.path.basename(dest)
-            cmd = [
-              'aria2c', '-x', '16', '-s', '16', '-k', '1M', '-c',
-              '--summary-interval=10', '--console-log-level=warn',
-              '--header', 'User-Agent: Mozilla/5.0',
-              '--header', 'Accept: */*',
-              '--dir', d, '--out', f,
-              url
-            ]
-            print('  aria2c:', url[:80])
-            r = subprocess.run(cmd)
-            full = os.path.join(d, f)
-            if r.returncode == 0 and os.path.exists(full):
-              sz = os.path.getsize(full)
-              print(f'  size: {sz/1024/1024:.1f} MB')
-              if sz > 1_048_576: return True
-            if os.path.exists(full): os.remove(full)
             return False
 
           downloaded = False
@@ -255,12 +235,7 @@ jobs:
 
             print(f'\n=== [{i+1}/{len(candidates)}][{ctype}] {url[:80]}')
 
-            ok = run_curl(url, dest)
-            if not ok:
-              print('  curl failed, trying aria2c...')
-              ok = run_aria2(url, dest)
-
-            if ok:
+            if run_curl(url, dest):
               print('SUCCESS!')
               downloaded = True
               break
@@ -275,13 +250,6 @@ jobs:
       - name: Show results
         run: |
           echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
-          echo "=== candidates ===" && python3 -c "
-          import json
-          try:
-            c = json.load(open('grabbed/candidates.json'))
-            for i,x in enumerate(c): print(f'  [{i+1}][{x[\"type\"]}] {x[\"url\"][:90]}')
-          except: pass
-          "
 
       - name: Upload debug artifacts
         if: always()
