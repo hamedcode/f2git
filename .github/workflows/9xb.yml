@@ -49,34 +49,24 @@ jobs:
       - name: Prepare folders
         run: mkdir -p downloads grabbed
 
-      - name: Write scripts
+      - name: Write Playwright script
         run: |
-          # ── Playwright script ────────────────────────────────────────────
-          cat > buddy_dl.js << 'JSEOF'
-          const fs   = require('fs');
+          python3 -c "
+          content = open('/dev/stdin').read()
+          open('buddy_dl.js','w').write(content)
+          " << 'JSEOF'
+          const fs = require('fs');
           const { chromium } = require('playwright');
-
           const SOURCE_URL = process.argv[2];
           if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
-
           const PROCESS_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
-
           function sanitize(str) {
-            return (str || 'video')
-              .replace(/[^a-zA-Z0-9 ._-]/g, '_')
-              .replace(/[_ ]+/g, '_')
-              .replace(/^_|_$/g, '')
-              .slice(0, 80) || 'video';
+            return (str||'video').replace(/[^a-zA-Z0-9 ._-]/g,'_').replace(/[_ ]+/g,'_').replace(/^_|_$/g,'').slice(0,80)||'video';
           }
-
           async function getActionLinks(page) {
-            const hrefs = await page.$$eval('a[href]', els => els.map(a => a.href).filter(Boolean));
-            return hrefs.filter(u =>
-              u.includes('9xbud.com/down') ||
-              u.includes('workers.dev')
-            );
+            const hrefs = await page.$$eval('a[href]', els => els.map(a=>a.href).filter(Boolean));
+            return hrefs.filter(u => u.includes('9xbud.com/down') || u.includes('workers.dev'));
           }
-
           (async () => {
             const browser = await chromium.launch({ headless: true });
             const context = await browser.newContext({
@@ -84,7 +74,6 @@ jobs:
               acceptDownloads: true
             });
             const page = await context.newPage();
-
             page.on('response', async (resp) => {
               try {
                 const u = resp.url();
@@ -92,148 +81,127 @@ jobs:
                 if (u.includes('9xbud.com/extract')) console.log('[EXTRACT]', resp.status());
               } catch(e) {}
             });
-
             console.log('Opening:', PROCESS_URL);
             await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
             await page.waitForTimeout(3000);
-
             const title = sanitize((await page.title()).trim());
             console.log('Title:', title);
-
             const buttons = await page.$$('button, a');
             let foundLinks = [];
-
             for (const btn of buttons) {
               try {
-                const txt  = (await btn.innerText().catch(() => '')).toLowerCase().trim();
-                const href = (await btn.getAttribute('href').catch(() => '')) || '';
-
+                const txt  = (await btn.innerText().catch(()=>'')).toLowerCase().trim();
+                const href = (await btn.getAttribute('href').catch(()=>'')) || '';
                 if (/app|software|extension|home|support|language/.test(txt)) continue;
                 if (!txt.includes('download') && !txt.includes('extract') && !txt.includes('get link')) continue;
                 if (href.startsWith('http') && !href.includes('9xbud.com') && !href.includes('workers.dev')) continue;
-
-                console.log('Clicking:', txt.slice(0, 40) || href.slice(0, 60));
-                await btn.click().catch(() => {});
-
+                console.log('Clicking:', txt.slice(0,40) || href.slice(0,60));
+                await btn.click().catch(()=>{});
                 const start = Date.now();
-                while (Date.now() - start < 12000) {
+                while (Date.now()-start < 12000) {
                   await page.waitForTimeout(500);
                   const links = await getActionLinks(page);
                   if (links.length > 0) {
                     console.log('Found', links.length, 'link(s) after', Math.round((Date.now()-start)/1000), 's');
-                    links.forEach(l => console.log(' ', l.slice(0, 120)));
+                    links.forEach(l => console.log(' ', l.slice(0,120)));
                     foundLinks = links;
                     break;
                   }
                 }
-
                 if (foundLinks.length > 0) break;
                 console.log('No links, trying next button...');
               } catch(e) {}
             }
-
             if (foundLinks.length === 0) {
               console.error('No links found!');
               await browser.close();
               process.exit(1);
             }
-
             const candidates = [];
             const seen = new Set();
-
             for (const u of foundLinks) {
               if (seen.has(u)) continue;
               seen.add(u);
               if (u.includes('9xbud.com/down')) {
                 candidates.push({ url: u, type: '9xbud-direct', priority: 1 });
-                console.log('[9xbud-direct]', u.slice(0, 100));
+                console.log('[9xbud-direct]', u.slice(0,100));
               } else if (u.includes('workers.dev')) {
                 candidates.push({ url: u, type: 'worker-direct', priority: 2 });
-                console.log('[worker-direct]', u.slice(0, 100));
+                console.log('[worker-direct]', u.slice(0,100));
               }
             }
-
-            candidates.sort((a, b) => a.priority - b.priority);
-            console.log('\n=== Candidates:', candidates.length);
-            candidates.forEach((c, i) => console.log(' [' + (i+1) + '][' + c.type + '] ' + c.url.slice(0, 100)));
-
+            candidates.sort((a,b) => a.priority - b.priority);
+            console.log('Candidates:', candidates.length);
             const cookies = await context.cookies();
             fs.writeFileSync('grabbed/candidates.json', JSON.stringify(candidates, null, 2));
             fs.writeFileSync('grabbed/title.txt', title);
-            fs.writeFileSync('grabbed/cookies.txt', cookies.map(c => c.name + '=' + c.value).join('; '));
-
+            fs.writeFileSync('grabbed/cookies.txt', cookies.map(c=>c.name+'='+c.value).join('; '));
             await browser.close();
           })();
           JSEOF
 
-          # ── Download script ──────────────────────────────────────────────
-          cat > download.py << 'PYEOF'
-import json, subprocess, sys, os
-
-candidates = json.load(open('grabbed/candidates.json'))
-title      = open('grabbed/title.txt').read().strip()
-cookies    = open('grabbed/cookies.txt').read().strip() if os.path.exists('grabbed/cookies.txt') else ''
-
-print(f'Total candidates: {len(candidates)}')
-
-def run_curl(url, dest):
-    # single connection — exact headers from HAR
-    cmd = [
-        'curl', '-L',
-        '--retry', '3',
-        '--connect-timeout', '30',
-        '--max-time', '3600',
-        '-o', dest,
-        '--show-error',
-        '--progress-bar',
-        '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        '-H', 'Accept-Language: en-US,en;q=0.9',
-        '-H', 'Connection: keep-alive',
-        '-H', 'Sec-Fetch-Dest: document',
-        '-H', 'Sec-Fetch-Mode: navigate',
-        '-H', 'Sec-Fetch-Site: cross-site',
-        '-H', 'Sec-Fetch-User: ?1',
-        '-H', 'Upgrade-Insecure-Requests: 1',
-        '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-        '-H', 'sec-ch-ua: "Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-        '-H', 'sec-ch-ua-mobile: ?0',
-        '-H', 'sec-ch-ua-platform: "Windows"',
-    ]
-    if cookies:
-        cmd += ['-H', f'Cookie: {cookies}']
-    cmd.append(url)
-
-    print(f'  curl: {url[:80]}')
-    r = subprocess.run(cmd)
-    print(f'  exit code: {r.returncode}')
-
-    if r.returncode == 0 and os.path.exists(dest):
-        sz = os.path.getsize(dest)
-        print(f'  size: {sz/1024/1024:.1f} MB')
-        if sz > 1_048_576:
-            return True
-    if os.path.exists(dest):
-        os.remove(dest)
-    return False
-
-downloaded = False
-for i, c in enumerate(candidates):
-    url   = c['url']
-    ctype = c['type']
-    dest  = f'downloads/{title}.mp4'
-
-    print(f'\n=== [{i+1}/{len(candidates)}][{ctype}] {url[:80]}')
-
-    if run_curl(url, dest):
-        print('SUCCESS!')
-        downloaded = True
-        break
-    else:
-        print('  failed, next...')
-
-if not downloaded:
-    print('\nAll candidates failed!')
-    sys.exit(1)
+      - name: Write download script
+        run: |
+          python3 -c "
+          content = open('/dev/stdin').read()
+          open('download.py','w').write(content)
+          " << 'PYEOF'
+          import json, subprocess, sys, os
+          candidates = json.load(open('grabbed/candidates.json'))
+          title      = open('grabbed/title.txt').read().strip()
+          cookies    = open('grabbed/cookies.txt').read().strip() if os.path.exists('grabbed/cookies.txt') else ''
+          print(f'Total candidates: {len(candidates)}')
+          def run_curl(url, dest):
+              cmd = [
+                  'curl', '-L',
+                  '--retry', '3',
+                  '--connect-timeout', '30',
+                  '--max-time', '3600',
+                  '-o', dest,
+                  '--show-error',
+                  '--progress-bar',
+                  '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  '-H', 'Accept-Language: en-US,en;q=0.9',
+                  '-H', 'Connection: keep-alive',
+                  '-H', 'Sec-Fetch-Dest: document',
+                  '-H', 'Sec-Fetch-Mode: navigate',
+                  '-H', 'Sec-Fetch-Site: cross-site',
+                  '-H', 'Sec-Fetch-User: ?1',
+                  '-H', 'Upgrade-Insecure-Requests: 1',
+                  '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                  '-H', 'sec-ch-ua: "Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                  '-H', 'sec-ch-ua-mobile: ?0',
+                  '-H', 'sec-ch-ua-platform: "Windows"',
+              ]
+              if cookies:
+                  cmd += ['-H', f'Cookie: {cookies}']
+              cmd.append(url)
+              print(f'  curl: {url[:80]}')
+              r = subprocess.run(cmd)
+              print(f'  exit code: {r.returncode}')
+              if r.returncode == 0 and os.path.exists(dest):
+                  sz = os.path.getsize(dest)
+                  print(f'  size: {sz/1024/1024:.1f} MB')
+                  if sz > 1_048_576:
+                      return True
+              if os.path.exists(dest):
+                  os.remove(dest)
+              return False
+          downloaded = False
+          for i, c in enumerate(candidates):
+              url   = c['url']
+              ctype = c['type']
+              dest  = f'downloads/{title}.mp4'
+              print(f'\n=== [{i+1}/{len(candidates)}][{ctype}] {url[:80]}')
+              if run_curl(url, dest):
+                  print('SUCCESS!')
+                  downloaded = True
+                  break
+              else:
+                  print('  failed, next...')
+          if not downloaded:
+              print('\nAll candidates failed!')
+              sys.exit(1)
           PYEOF
 
       - name: Run Playwright
