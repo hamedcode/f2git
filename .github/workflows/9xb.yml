@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zip curl jq gh
+          sudo apt-get install -y ffmpeg zip curl aria2 jq gh
           npm init -y
           npm install playwright
           npx playwright install chromium --with-deps
@@ -49,15 +49,344 @@ jobs:
       - name: Prepare folders
         run: mkdir -p downloads grabbed
 
+      - name: Write Playwright script
+        run: |
+          python3 - << 'PYEOF'
+          script = r"""
+          const fs   = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright');
+
+          const SOURCE_URL = process.argv[2];
+          if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
+
+          const PROCESS_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
+
+          function sanitize(str) {
+            return (str || 'video')
+              .replace(/[^a-zA-Z0-9 ._-]/g, '_')
+              .replace(/[_ ]+/g, '_')
+              .replace(/^_|_$/g, '')
+              .slice(0, 80) || 'video';
+          }
+
+          function decodeWorkerSegment(seg) {
+            try {
+              const rev = seg.split('').reverse().join('');
+              return Buffer.from(rev, 'base64').toString('utf-8');
+            } catch (e) { return null; }
+          }
+
+          function parseWorkerUrl(url) {
+            try {
+              const afterDomain = url.split('workers.dev/')[1];
+              if (!afterDomain) return null;
+              const parts = afterDomain.split('?')[0].split(/[\/,]+/).filter(p => p && p.length > 10);
+              let realUrl = null, headers = {};
+              for (const p of parts) {
+                const dec = decodeWorkerSegment(p);
+                if (!dec) continue;
+                if (!realUrl && dec.startsWith('http')) { realUrl = dec.trim(); continue; }
+                if (dec.includes('"headers"') || dec.includes('"user-agent"')) {
+                  try { headers = JSON.parse(dec).headers || {}; } catch(e) {}
+                }
+              }
+              return realUrl ? { url: realUrl, headers } : null;
+            } catch (e) { return null; }
+          }
+
+          function decode9xbudDown(url) {
+            try {
+              const match = url.match(/\/down\/([A-Za-z0-9+\/=,_-]+)/);
+              if (!match) return null;
+              const b64 = match[1].split('/')[0];
+              const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+              console.log('  preview:', decoded.slice(0, 80));
+              if (decoded.includes('workers.dev')) {
+                console.log('  -> worker.dev chain');
+                return parseWorkerUrl(decoded);
+              }
+              if (decoded.includes('s:3:"url"')) {
+                const urlMatch = decoded.match(/s:3:"url";s:\d+:"([^"]+)"/);
+                if (urlMatch) {
+                  const realUrl = urlMatch[1];
+                  const headers = {};
+                  for (const m of decoded.matchAll(/s:\d+:"([^"]+:\s*[^"]+)"/g)) {
+                    const ci = m[1].indexOf(':');
+                    if (ci > 0) headers[m[1].slice(0,ci).trim().toLowerCase()] = m[1].slice(ci+1).trim();
+                  }
+                  console.log('  -> PHP serialized:', realUrl.slice(0, 80));
+                  return { url: realUrl, headers };
+                }
+              }
+              if (decoded.startsWith('http')) {
+                console.log('  -> direct URL');
+                return { url: decoded.trim(), headers: {} };
+              }
+              return null;
+            } catch (e) { console.log('  decode error:', e.message); return null; }
+          }
+
+          // همه لینک‌های 9xbud/down و worker.dev رو از DOM جمع می‌کنه
+          async function collectLinks(page) {
+            const hrefs = await page.$$eval('a[href]', els => els.map(a => a.href).filter(Boolean));
+            const html  = await page.content();
+            const all   = new Set([
+              ...hrefs,
+              ...(html.match(/https?:\/\/[^\s"<>'\\]+9xbud\.com\/down\/[^\s"<>'\\]+/g) || []),
+              ...(html.match(/https?:\/\/[^\s"<>'\\]+workers?\.dev\/[^\s"<>'\\]*/g) || []),
+              ...(html.match(/https?:\/\/[^\s"<>'\\]+\.mp4[^\s"<>'\\]*/g) || []),
+              ...(html.match(/https?:\/\/[^\s"<>'\\]+googlevideo[^\s"<>'\\]+/g) || []),
+            ].map(u => u.replace(/&amp;/g, '&')));
+            return [...all].filter(u =>
+              u.includes('9xbud.com/down') ||
+              u.includes('workers.dev') ||
+              /\.mp4(\?|$)/i.test(u.split('?')[0]) ||
+              u.includes('googlevideo.com')
+            );
+          }
+
+          // poll DOM تا لینک جدیدی بیاد یا timeout
+          async function pollForNewLinks(page, known, timeoutMs = 15000) {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+              await page.waitForTimeout(800);
+              const current = await collectLinks(page);
+              const newLinks = current.filter(u => !known.has(u));
+              if (newLinks.length > 0) return newLinks;
+            }
+            return [];
+          }
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+              acceptDownloads: true
+            });
+            const page = await context.newPage();
+
+            page.on('response', async (resp) => {
+              try {
+                const u = resp.url();
+                if (u.includes('9xbud.com/token'))  console.log('[TOKEN]', resp.status());
+                if (u.includes('9xbud.com/extract')) console.log('[EXTRACT]', resp.status());
+              } catch(e) {}
+            });
+
+            console.log('Opening:', PROCESS_URL);
+            await page.goto(PROCESS_URL, { waitUntil: 'networkidle', timeout: 60000 });
+            await page.waitForTimeout(3000);
+
+            const title = sanitize((await page.title()).trim());
+            console.log('Title:', title);
+
+            // snapshot قبل از کلیک
+            const knownLinks = new Set(await collectLinks(page));
+            console.log('Links before click:', knownLinks.size);
+
+            // ── کلیک روی دکمه‌های Extract/Download یکی یکی ──────────────
+            // بعد از هر کلیک، DOM رو poll می‌کنیم تا لینک جدید بیاد
+            const allFoundLinks = new Set([...knownLinks]);
+
+            const buttons = await page.$$('button, a');
+            for (const btn of buttons) {
+              try {
+                const txt  = (await btn.innerText().catch(() => '')).toLowerCase().trim();
+                const href = (await btn.getAttribute('href').catch(() => '')) || '';
+
+                if (/app|software|extension|home|support|language/.test(txt)) continue;
+                if (!txt.includes('download') && !txt.includes('extract') && !txt.includes('get link')) continue;
+                if (href.includes('9xbuddy.site') && !href.includes('/down/')) continue;
+
+                console.log('\nClicking:', txt.slice(0, 40) || href.slice(0, 40));
+
+                await btn.click().catch(() => {});
+
+                // صبر کن تا /extract response بیاد و DOM آپدیت بشه
+                const newLinks = await pollForNewLinks(page, allFoundLinks, 15000);
+
+                if (newLinks.length > 0) {
+                  console.log('New links after click:', newLinks.length);
+                  newLinks.forEach(l => { console.log(' ', l.slice(0, 100)); allFoundLinks.add(l); });
+                } else {
+                  console.log('No new links after this click');
+                }
+
+              } catch(e) {}
+            }
+
+            // ── decode همه لینک‌ها ────────────────────────────────────────
+            const candidates = [];
+            const seenUrls   = new Set();
+
+            function addCandidate(url, headers, type, priority) {
+              if (!url || seenUrls.has(url)) return;
+              seenUrls.add(url);
+              candidates.push({ url, headers: headers || {}, type, priority });
+              console.log('[' + type + ']', url.slice(0, 100));
+            }
+
+            for (const u of allFoundLinks) {
+              if (u.includes('9xbud.com/down')) {
+                console.log('\nDecoding 9xbud/down:', u.slice(0, 80));
+                const parsed = decode9xbudDown(u);
+                if (parsed && parsed.url) addCandidate(parsed.url, parsed.headers, '9xbud-decoded', 1);
+                else addCandidate(u, {}, '9xbud-raw', 5);
+                continue;
+              }
+              if (u.includes('workers.dev')) {
+                const parsed = parseWorkerUrl(u);
+                if (parsed && parsed.url) addCandidate(parsed.url, parsed.headers, 'worker-decoded', 1);
+                else addCandidate(u, {}, 'worker-raw', 4);
+                continue;
+              }
+              if (u.includes('googlevideo.com')) {
+                const itag = (u.match(/[?&]itag=(\d+)/) || [])[1];
+                if (['139','140','141','171','249','250','251'].includes(itag)) continue;
+                if (u.includes('mime=audio')) continue;
+                addCandidate(u, {}, 'googlevideo', 6);
+                continue;
+              }
+              if (/\.mp4(\?|$)/i.test(u.split('?')[0]) && !u.includes('9xbuddy')) {
+                addCandidate(u, {}, 'direct', 3);
+              }
+            }
+
+            candidates.sort((a, b) => a.priority - b.priority);
+            console.log('\n=== Candidates:', candidates.length);
+            candidates.forEach((c, i) => console.log(' [' + (i+1) + '][' + c.type + '] ' + c.url.slice(0, 100)));
+
+            fs.writeFileSync('grabbed/candidates.json', JSON.stringify(candidates, null, 2));
+            fs.writeFileSync('grabbed/title.txt', title);
+            const cookies = await context.cookies();
+            fs.writeFileSync('grabbed/cookies.txt', cookies.map(c => c.name + '=' + c.value).join('; '));
+
+            await browser.close();
+            if (candidates.length === 0) { console.error('No candidates!'); process.exit(1); }
+          })();
+          """
+          with open('buddy_dl.js', 'w') as f:
+              f.write(script)
+          print('Written')
+          PYEOF
+
       - name: Run Playwright
         run: node buddy_dl.js "${{ github.event.inputs.source_url }}"
 
-      - name: Download
-        run: python3 download.py
+      - name: Download all candidates until success
+        run: |
+          python3 - << 'PYEOF'
+          import json, subprocess, sys, os, re
+
+          candidates = json.load(open('grabbed/candidates.json'))
+          title      = open('grabbed/title.txt').read().strip()
+          cookies    = open('grabbed/cookies.txt').read().strip() if os.path.exists('grabbed/cookies.txt') else ''
+
+          print(f'Total candidates: {len(candidates)}')
+
+          def get_ext(url):
+            m = re.search(r'\.(mp4|m3u8|mkv|webm|mov|vid)', url.split('?')[0], re.I)
+            ext = m.group(1).lower() if m else 'mp4'
+            return 'mp4' if ext == 'vid' else ext
+
+          def make_headers(headers):
+            h = {
+              'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'accept': '*/*',
+            }
+            if cookies: h['cookie'] = cookies
+            h.update({k.lower(): v for k, v in headers.items()})
+            return h
+
+          def run_curl(url, headers, dest):
+            cmd = ['curl', '-L', '--retry', '3', '--connect-timeout', '30',
+                   '--max-time', '3600', '-o', dest, '--silent', '--show-error',
+                   '--write-out', '%{http_code}']
+            for k, v in headers.items():
+              cmd += ['-H', f'{k}: {v}']
+            cmd.append(url)
+            print('  curl:', url[:80])
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            code = r.stdout.strip()[-3:] if r.stdout else '?'
+            print(f'  http={code}', r.stderr[:100] if r.stderr else '')
+            if r.returncode == 0 and os.path.exists(dest):
+              sz = os.path.getsize(dest)
+              print(f'  size: {sz/1024/1024:.1f} MB')
+              if sz > 1_048_576 and code == '200': return True
+            if os.path.exists(dest): os.remove(dest)
+            return False
+
+          def run_aria2(url, headers, dest):
+            d, f = os.path.dirname(dest) or 'downloads', os.path.basename(dest)
+            cmd = ['aria2c', '-x', '16', '-s', '16', '-k', '1M', '-c',
+                   '--summary-interval=10', '--console-log-level=warn',
+                   '--dir', d, '--out', f]
+            for k, v in headers.items():
+              cmd += ['--header', f'{k}: {v}']
+            cmd.append(url)
+            print('  aria2c:', url[:80])
+            r = subprocess.run(cmd)
+            full = os.path.join(d, f)
+            if r.returncode == 0 and os.path.exists(full):
+              sz = os.path.getsize(full)
+              print(f'  size: {sz/1024/1024:.1f} MB')
+              if sz > 1_048_576: return True
+            if os.path.exists(full): os.remove(full)
+            return False
+
+          def run_ffmpeg(url, headers, dest):
+            cmd = ['ffmpeg', '-y', '-user_agent', headers.get('user-agent', 'Mozilla/5.0')]
+            ref = headers.get('referer', '')
+            if ref: cmd += ['-headers', f'Referer: {ref}']
+            cmd += ['-i', url, '-c', 'copy', dest]
+            print('  ffmpeg:', url[:80])
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode == 0 and os.path.exists(dest):
+              if os.path.getsize(dest) > 1_048_576: return True
+            if os.path.exists(dest): os.remove(dest)
+            return False
+
+          downloaded = False
+          for i, c in enumerate(candidates):
+            url  = c['url']
+            hdrs = make_headers(c.get('headers', {}))
+            ctype = c['type']
+            ext  = get_ext(url)
+            dest = f'downloads/{title}.{ext}'
+
+            print(f'\n=== [{i+1}/{len(candidates)}][{ctype}] {url[:80]}')
+
+            if ext == 'm3u8':
+              ok = run_ffmpeg(url, hdrs, f'downloads/{title}.mp4')
+            else:
+              ok = run_curl(url, hdrs, dest)
+              if not ok:
+                print('  curl failed, trying aria2c...')
+                ok = run_aria2(url, hdrs, dest)
+
+            if ok:
+              print('SUCCESS!')
+              downloaded = True
+              break
+            else:
+              print('  failed, next...')
+
+          if not downloaded:
+            print('\nAll candidates failed!')
+            sys.exit(1)
+          PYEOF
 
       - name: Show results
         run: |
           echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
+          echo "=== candidates ===" && python3 -c "
+          import json
+          try:
+            c = json.load(open('grabbed/candidates.json'))
+            for i,x in enumerate(c): print(f'  [{i+1}][{x[\"type\"]}] {x[\"url\"][:90]}')
+          except: pass
+          "
 
       - name: Upload debug artifacts
         if: always()
