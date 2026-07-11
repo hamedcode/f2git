@@ -239,10 +239,10 @@ jobs:
               CRF_USED="27"
               ffmpeg -y \
                 -i "$file" \
-                -vf "scale=-2:540" \
+                -vf "scale=-2:720" \
                 -c:v libx265 \
                 -pix_fmt yuv420p10le \
-                -preset fast \
+                -preset veryfast \
                 -crf 27 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
                 -c:a aac -b:a 80k \
