@@ -21,7 +21,7 @@ on:
         type: choice
         options:
           - disabled
-          - x265-fast-27
+          - x265-veryfast-27
           - x265-540p-29-2X
           - x265-360
           - x265-29-80k
@@ -194,7 +194,7 @@ jobs:
             # Determine CRF used by mode
             CRF_USED="N/A"
 
-            if [[ "$MODE" == "x265-fast-27" ]]; then
+            if [[ "$MODE" == "x265-veryfast-27" ]]; then
 
               CRF_USED="27"
               ffmpeg -y \
