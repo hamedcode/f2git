@@ -226,7 +226,7 @@ jobs:
               CRF_USED="26"
               ffmpeg -y \
                 -i "$file" \
-                -vf "scale=-2:480" \
+                -vf "scale=-2:540" \
                 -c:v libx264 \
                 -preset veryfast \
                 -crf 28 \
