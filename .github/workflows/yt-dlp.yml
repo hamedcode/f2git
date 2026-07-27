@@ -23,7 +23,7 @@ on:
           - disabled
           - x265-veryfast-27
           - x265-540p-29-2X
-          - x265-480
+          - x265-540
           - x265-29-80k
         default: x265-veryfast-27
 
@@ -221,7 +221,7 @@ jobs:
                 -c:a aac -b:a 80k \
                 "$output"
 
-            elif [[ "$MODE" == "x265-480" ]]; then
+            elif [[ "$MODE" == "x265-540" ]]; then
 
               CRF_USED="26"
               ffmpeg -y \
