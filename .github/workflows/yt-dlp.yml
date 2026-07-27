@@ -23,9 +23,9 @@ on:
           - disabled
           - x265-veryfast-27
           - x265-540p-29-2X
-          - x265-360
+          - x265-480
           - x265-29-80k
-        default: x265-fast-27
+        default: x265-veryfast-27
 
       min_size_mb:
         description: "Minimum size for encoding (MB)"
@@ -221,15 +221,15 @@ jobs:
                 -c:a aac -b:a 80k \
                 "$output"
 
-            elif [[ "$MODE" == "x265-360" ]]; then
+            elif [[ "$MODE" == "x265-480" ]]; then
 
               CRF_USED="26"
               ffmpeg -y \
                 -i "$file" \
-                -vf "scale=-2:360" \
+                -vf "scale=-2:480" \
                 -c:v libx264 \
-                -preset slow \
-                -crf 25 \
+                -preset veryfast \
+                -crf 28 \
                 -x264-params "cabac=1:ref=3:deblock=1,0,0:analyse=all:me=hex:subme=7:psy=1:psy-rd=1.0,0.0:mixed-refs=1:me-range=16:chroma-me=1:trellis=0:8x8dct=1:fast-pskip=1:chroma-qp-offset=-2:bframes=8:b-pyramid=2:b-adapt=1:weightb=1:weightp=2:keyint=50:min-keyint=5:scenecut=40:rc-lookahead=40:mbtree=1:qcomp=0.60:qpmin=0:qpmax=69:qpstep=4:ipratio=1.40:aq-mode=1:aq-strength=1.0" \
                 -c:a aac -b:a 80k \
                 "$output"
