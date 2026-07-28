@@ -1,7 +1,7 @@
 # f2git
 Just for test
 
-ZIP_PASSWORD
+_**ZIP_PASSWORD**_
 .
 .
 .
