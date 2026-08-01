@@ -6,7 +6,7 @@ on:
       preferred_quality:
         description: "Preferred quality"
         required: true
-        default: "480"
+        default: "720"
         type: choice
         options:
           - "480"
@@ -21,7 +21,7 @@ on:
       upload_mode:
         description: "Upload mode"
         required: true
-        default: "zip"
+        default: "direct"
         type: choice
         options:
           - "zip"
@@ -30,7 +30,7 @@ on:
       delete_old_releases:
         description: "Delete old releases?"
         required: true
-        default: "yes"
+        default: "no"
         type: choice
         options:
           - "yes"
