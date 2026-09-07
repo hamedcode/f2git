@@ -68,7 +68,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg zip jq gh
-          pip install -U yt-dlp
+          pip install --force-reinstall -U yt-dlp
+          echo "yt-dlp version:"
+          yt-dlp --version
 
       - name: Download videos
         run: |
@@ -76,34 +78,106 @@ jobs:
 
           QUALITY="${{ github.event.inputs.quality }}"
 
-          while read url; do
+          if [[ "$QUALITY" == "best" ]]; then
+            FORMAT="bestvideo+bestaudio/best"
+          else
+            FORMAT="bestvideo[height<=$QUALITY]+bestaudio/best[height<=$QUALITY]/best"
+          fi
 
+          FAILED=0
+          TOTAL=0
+
+          while IFS= read -r url; do
+
+            # Skip blank lines and comment lines
             [ -z "$url" ] && continue
+            [[ "$url" == \#* ]] && continue
 
-            echo "Downloading: $url"
+            TOTAL=$((TOTAL+1))
 
-            # Check if URL is a direct file link (ends with video extension)
+            echo "=================================================="
+            echo "Downloading ($TOTAL): $url"
+            echo "=================================================="
+
+            # Case 1: URL is a direct file link (ends with video extension)
             if echo "$url" | grep -qiE '\.(mp4|mkv|webm|avi|mov|m4v)([\?#].*)?$'; then
-              # Use curl for direct file links to preserve original filename
               filename=$(basename "$(echo "$url" | cut -d'?' -f1)")
-              curl -L --output "downloads/${filename}" "$url"
-            else
-              if [[ "$QUALITY" == "best" ]]; then
-                FORMAT="bestvideo+bestaudio/best"
+              if curl -fL --retry 3 --retry-delay 2 --output "downloads/${filename}" "$url"; then
+                echo "OK (direct link): $filename"
               else
-                FORMAT="bestvideo[height<=$QUALITY]+bestaudio/best[height<=$QUALITY]/best"
+                echo "::warning::Direct download failed for $url"
+                FAILED=$((FAILED+1))
               fi
+              continue
+            fi
 
-              yt-dlp \
+            # Case 2: try yt-dlp normally first
+            if yt-dlp \
                 -f "$FORMAT" \
                 --merge-output-format mp4 \
                 --no-part \
                 --restrict-filenames \
+                --retries 3 \
+                --no-abort-on-error \
                 -o "downloads/%(title).80B.%(ext)s" \
-                "$url"
+                "$url"; then
+              echo "OK (yt-dlp): $url"
+              continue
+            fi
+
+            echo "::warning::yt-dlp could not extract $url — trying fallback raw-HTML extraction"
+
+            # Case 3: fallback — pull a direct mp4/m3u8 link straight out of the page HTML.
+            # This is what generic-extractor failures ("Unable to extract flashvars", etc.)
+            # usually need: yt-dlp has no dedicated extractor for the site, so we look for
+            # the raw media URL ourselves.
+            html=$(curl -fsL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$url" || true)
+
+            if [ -z "$html" ]; then
+              echo "::error::Could not even fetch the page HTML for $url"
+              FAILED=$((FAILED+1))
+              continue
+            fi
+
+            direct_url=$(echo "$html" \
+              | grep -oE 'https?://[^"'"'"'[:space:]\\]+\.(mp4|m3u8)[^"'"'"'[:space:]\\]*' \
+              | head -n1)
+
+            if [ -z "$direct_url" ]; then
+              echo "::error::No direct media URL found in HTML for $url — skipping"
+              FAILED=$((FAILED+1))
+              continue
+            fi
+
+            echo "Found candidate direct URL: $direct_url"
+            base_name="downloads/$(date +%s)_$(basename "${direct_url%%\?*}")"
+
+            if [[ "$direct_url" == *.m3u8* ]]; then
+              out_name="${base_name%.m3u8}.mp4"
+              if ffmpeg -y -i "$direct_url" -c copy "$out_name"; then
+                echo "OK (fallback HLS): $out_name"
+              else
+                echo "::error::ffmpeg failed to pull HLS stream for $url"
+                FAILED=$((FAILED+1))
+              fi
+            else
+              if curl -fL --retry 3 --retry-delay 2 --output "$base_name" "$direct_url"; then
+                echo "OK (fallback direct): $base_name"
+              else
+                echo "::error::curl failed to download fallback URL for $url"
+                FAILED=$((FAILED+1))
+              fi
             fi
 
           done < yt.txt
+
+          echo "=================================================="
+          echo "Download summary: $((TOTAL-FAILED))/$TOTAL succeeded"
+          echo "=================================================="
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::warning::$FAILED of $TOTAL URLs failed to download — continuing with whatever succeeded"
+          fi
 
       - name: Encode videos
         run: |
@@ -222,7 +296,7 @@ jobs:
                 -c:a aac -b:a 80k \
                 "$output"
 
-                elif [[ "$MODE" == "x265-540-28" ]]; then
+            elif [[ "$MODE" == "x265-540-28" ]]; then
 
               CRF_USED="28"
               ffmpeg -y \
@@ -249,8 +323,6 @@ jobs:
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
                 -c:a aac -b:a 80k \
                 "$output"
-
-                
 
             elif [[ "$MODE" == "x265-720-27-80k" ]]; then
 
