@@ -71,6 +71,7 @@ jobs:
         run: |
           mkdir -p downloads
           mkdir -p grabbed
+          touch grabbed/failed_pages.txt
 
       - name: Create Playwright script
         run: |
@@ -98,7 +99,8 @@ jobs:
               .readFileSync('browser.txt', 'utf8')
               .split('\n')
               .map(v => v.trim())
-              .filter(Boolean);
+              // skip blank lines AND lines already marked as failed (# comments)
+              .filter(v => v && !v.startsWith('#'));
 
             for (const pageUrl of urls) {
 
@@ -139,16 +141,31 @@ jobs:
                 const title = (await page.title()).trim() || 'video';
                 console.log('TITLE:', title);
 
-                // write all links found on this page with the correct title
-                for (const link of pageLinks) {
+                if (pageLinks.length === 0) {
+                  // nothing found on this page at all -> mark as failed right away
+                  console.log('NO MEDIA FOUND on this page');
                   fs.appendFileSync(
-                    'grabbed/raw_links.txt',
-                    title + '|||' + link + '\n'
+                    'grabbed/failed_pages.txt',
+                    pageUrl + '|||no_media_found\n'
                   );
+                } else {
+                  // write all links found on this page, tagged with their source
+                  // page URL so later steps can select ONE best link PER PAGE
+                  // instead of a global top-N across all pages
+                  for (const link of pageLinks) {
+                    fs.appendFileSync(
+                      'grabbed/raw_links.txt',
+                      pageUrl + '|||' + title + '|||' + link + '\n'
+                    );
+                  }
                 }
 
               } catch (e) {
                 console.log('ERROR:', e);
+                fs.appendFileSync(
+                  'grabbed/failed_pages.txt',
+                  pageUrl + '|||page_error\n'
+                );
               }
 
               page.off('response', onResponse);
@@ -181,89 +198,116 @@ jobs:
           quality = os.environ["QUALITY"]
           min_size = int(os.environ["MIN_SIZE"]) * 1024 * 1024
 
-          links = []
+          # group raw candidate links by the SOURCE PAGE they came from, so we
+          # pick one best-matching link PER PAGE instead of a single global
+          # top-N across every page combined (that was the bug: it silently
+          # dropped every page beyond the first couple).
+          pages = {}
 
-          with open("grabbed/raw_links.txt", "r", encoding="utf-8") as f:
-              lines = [x.strip() for x in f if x.strip()]
+          if os.path.exists("grabbed/raw_links.txt"):
+              with open("grabbed/raw_links.txt", "r", encoding="utf-8") as f:
+                  raw_lines = [x.rstrip("\n") for x in f if x.strip()]
+          else:
+              raw_lines = []
 
-          checked = []
-          seen_sizes = []
-
-          for entry in lines:
-
-              if '|||' in entry:
-                  title, url = entry.split('|||', 1)
+          for entry in raw_lines:
+              parts = entry.split("|||", 2)
+              if len(parts) == 3:
+                  page_url, title, url = parts
+              elif len(parts) == 2:
+                  # backward-compat, shouldn't normally happen
+                  page_url, url = parts
+                  title = "video"
               else:
-                  title = 'video'
-                  url = entry
+                  continue
+              pages.setdefault(page_url, []).append((title, url))
 
-              try:
+          final = []
 
-                  r = requests.head(
-                      url,
-                      allow_redirects=True,
-                      timeout=20,
-                      headers={
-                          "User-Agent": "Mozilla/5.0"
-                      }
-                  )
+          with open("grabbed/failed_pages.txt", "a", encoding="utf-8") as failed_f:
 
-                  size = int(r.headers.get("content-length", 0))
+              for page_url, entries in pages.items():
 
-                  print(f"CHECK: {size/1024/1024:.1f} MB -> {url}")
+                  checked = []
+                  seen_sizes = []  # duplicate-size check scoped to THIS page only
 
-                  if size < min_size:
-                      print("SKIP: too small")
+                  for title, url in entries:
+
+                      try:
+
+                          r = requests.head(
+                              url,
+                              allow_redirects=True,
+                              timeout=20,
+                              headers={
+                                  "User-Agent": "Mozilla/5.0"
+                              }
+                          )
+
+                          size = int(r.headers.get("content-length", 0))
+
+                          print(f"CHECK: {size/1024/1024:.1f} MB -> {url}")
+
+                          if size < min_size:
+                              print("SKIP: too small")
+                              continue
+
+                          duplicate = False
+
+                          for s in seen_sizes:
+                              diff = abs(size - s)
+
+                              if diff < (s * 0.02):
+                                  duplicate = True
+                                  break
+
+                          if duplicate:
+                              print("SKIP: duplicate size (mirror on same page)")
+                              continue
+
+                          seen_sizes.append(size)
+
+                          score = 999
+
+                          url_lower = url.lower()
+
+                          if quality in url_lower:
+                              score = 1
+                          elif "480" in url_lower:
+                              score = 2
+                          elif "720" in url_lower:
+                              score = 3
+                          elif "1080" in url_lower:
+                              score = 4
+                          else:
+                              score = 10
+
+                          checked.append({
+                              "url": url,
+                              "title": title,
+                              "size": size,
+                              "score": score
+                          })
+
+                      except Exception as e:
+                          print("ERROR:", e)
+
+                  if not checked:
+                      print(f"NO VALID CANDIDATE for page: {page_url}")
+                      failed_f.write(page_url + "|||no_valid_candidate\n")
                       continue
 
-                  duplicate = False
+                  checked.sort(key=lambda x: (x["score"], x["size"]))
+                  best = checked[0]
+                  print("SELECTED:", best["url"], "  (page:", page_url, ")")
 
-                  for s in seen_sizes:
-                      diff = abs(size - s)
-
-                      if diff < (s * 0.02):
-                          duplicate = True
-                          break
-
-                  if duplicate:
-                      print("SKIP: duplicate size")
-                      continue
-
-                  seen_sizes.append(size)
-
-                  score = 999
-
-                  url_lower = url.lower()
-
-                  if quality in url_lower:
-                      score = 1
-                  elif "480" in url_lower:
-                      score = 2
-                  elif "720" in url_lower:
-                      score = 3
-                  elif "1080" in url_lower:
-                      score = 4
-                  else:
-                      score = 10
-
-                  checked.append({
-                      "url": url,
-                      "title": title,
-                      "size": size,
-                      "score": score
-                  })
-
-              except Exception as e:
-                  print("ERROR:", e)
-
-          checked.sort(key=lambda x: (x["score"], x["size"]))
-
-          final = checked[:2]
+                  final.append((page_url, best["title"], best["url"]))
 
           with open("grabbed/final_links.txt", "w", encoding="utf-8") as f:
-              for item in final:
-                  print("SELECTED:", item["url"])
-                  f.write(item["title"] + "|||" + item["url"] + "\n")
+              for page_url, title, url in final:
+                  f.write(page_url + "|||" + title + "|||" + url + "\n")
+
+          print(f"\nPages with links found: {len(pages)} | selected for download: {len(final)}")
 
           EOF
 
@@ -281,9 +325,11 @@ jobs:
 
             [ -z "$entry" ] && continue
 
-            # split on |||
-            title="${entry%%|||*}"
-            url="${entry#*|||}"
+            # split on ||| -> pageUrl|||title|||mediaUrl
+            pageUrl="${entry%%|||*}"
+            rest="${entry#*|||}"
+            title="${rest%%|||*}"
+            url="${rest#*|||}"
 
             # sanitize title:
             #   1. replace any char that is NOT alphanumeric, space, dot, dash, underscore with _
@@ -300,6 +346,7 @@ jobs:
 
             echo ""
             echo "================================"
+            echo "PAGE:        $pageUrl"
             echo "DOWNLOADING: $url"
             echo "FILENAME:    $safe_title"
             echo "================================"
@@ -313,6 +360,8 @@ jobs:
               ext="mp4"
             fi
 
+            success=0
+
             if [[ "$ext" == "m3u8" ]]; then
 
               echo "[FFMPEG] downloading m3u8"
@@ -323,6 +372,8 @@ jobs:
                 -i "$url" \
                 -c copy \
                 "downloads/${safe_title}.mp4"
+
+              [ $? -eq 0 ] && success=1
 
             else
 
@@ -342,7 +393,9 @@ jobs:
 
               result=$?
 
-              if [ $result -ne 0 ]; then
+              if [ $result -eq 0 ]; then
+                success=1
+              else
 
                 echo "[CURL FALLBACK] aria2 failed"
 
@@ -353,13 +406,101 @@ jobs:
                   -o "downloads/${safe_title}.${ext:-mp4}" \
                   "$url"
 
+                [ $? -eq 0 ] && success=1
+
               fi
 
+            fi
+
+            if [ "$success" -ne 1 ]; then
+              echo "DOWNLOAD FAILED for: $pageUrl"
+              echo "${pageUrl}|||download_failed" >> grabbed/failed_pages.txt
             fi
 
             counter=$((counter+1))
 
           done < grabbed/final_links.txt
+
+      - name: Mark failed links in browser.txt
+        if: always()
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+
+          python3 << 'EOF'
+
+          import os
+          from datetime import datetime, timezone
+
+          run_number = os.environ.get("RUN_NUMBER", "")
+          run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          # collect every reason recorded for a failed page across all steps
+          # (no media found on page / no valid quality candidate / actual
+          # download error) into a single lookup
+          failed = {}
+          if os.path.exists("grabbed/failed_pages.txt"):
+              with open("grabbed/failed_pages.txt", "r", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or "|||" not in line:
+                          continue
+                      u, reason = line.split("|||", 1)
+                      failed[u.strip()] = reason.strip()
+
+          if not os.path.exists("browser.txt"):
+              print("browser.txt not found, nothing to update")
+              raise SystemExit(0)
+
+          with open("browser.txt", "r", encoding="utf-8") as f:
+              orig_lines = f.readlines()
+
+          new_lines = []
+          removed = 0
+          marked = 0
+
+          for line in orig_lines:
+              stripped = line.strip()
+
+              # keep blank lines and existing comments untouched
+              if not stripped or stripped.startswith("#"):
+                  new_lines.append(line if line.endswith("\n") else line + "\n")
+                  continue
+
+              if stripped in failed:
+                  reason = failed[stripped]
+                  new_lines.append(
+                      f"# FAILED [{reason}] ({run_date}, run #{run_number}): {stripped}\n"
+                  )
+                  marked += 1
+              else:
+                  # not in the failed list -> it downloaded successfully this
+                  # run, so drop it (no need to keep re-downloading it)
+                  removed += 1
+
+          with open("browser.txt", "w", encoding="utf-8") as f:
+              f.writelines(new_lines)
+
+          print(f"browser.txt updated: {removed} completed link(s) removed, {marked} failed link(s) marked")
+
+          EOF
+
+      - name: Commit updated browser.txt
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add browser.txt
+
+          if git diff --cached --quiet; then
+            echo "No changes to browser.txt"
+          else
+            git commit -m "chore(browser): mark failed / remove completed links [run ${{ github.run_number }}]"
+            git fetch origin "${{ github.ref_name }}"
+            git rebase "origin/${{ github.ref_name }}" || git rebase --abort
+            git push origin HEAD:"${{ github.ref_name }}"
+          fi
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
