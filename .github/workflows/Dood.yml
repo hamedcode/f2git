@@ -1,0 +1,256 @@
+name: 8 - Doodstream Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "لینک صفحه ویدیو (doodstream / playmogo / dood.* / ...)"
+        required: true
+
+      upload_mode:
+        description: "Upload mode"
+        required: true
+        default: "direct"
+        type: choice
+        options:
+          - "direct"
+          - "zip"
+
+      delete_old_releases:
+        description: "Delete old releases?"
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip curl aria2 jq gh
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Prepare folders
+        run: mkdir -p downloads grabbed
+
+      - name: Create Playwright script
+        run: |
+          cat > dood_dl.js << 'EOF'
+
+          const fs = require('fs');
+          const { chromium } = require('playwright');
+
+          const SOURCE_URL = process.argv[2];
+          if (!SOURCE_URL) {
+            console.error('No source URL given');
+            process.exit(1);
+          }
+
+          // Doodstream (and every whitelabel mirror of it: dood.*, playmogo,
+          // ds2play, d0000d, ...) shows a landing page at /d/<id> (and
+          // sometimes /f/<id>) that requires clicking through a countdown.
+          // The actual player lives at /e/<id> and requests its source
+          // automatically on load, so we just rewrite the path -- no click
+          // countdown needed.
+          function toEmbedUrl(u) {
+            try {
+              const parsed = new URL(u);
+              parsed.pathname = parsed.pathname
+                .replace('/d/', '/e/')
+                .replace('/f/', '/e/');
+              return parsed.toString();
+            } catch (e) {
+              return u;
+            }
+          }
+
+          const embedUrl = toEmbedUrl(SOURCE_URL);
+
+          (async () => {
+
+            const browser = await chromium.launch({ headless: true });
+
+            const context = await browser.newContext({
+              userAgent:
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            });
+
+            const page = await context.newPage();
+
+            let mediaUrl = null;
+
+            page.on('response', (response) => {
+              try {
+                const url = response.url();
+                // Doodstream CDN links always look like:
+                //   https://<cdn-host>/<hash>/<name>.mp4?token=...&expiry=...
+                const isMedia = /\.(mp4|m3u8)(\?|$)/i.test(url.split('?')[0] + (url.includes('?') ? '?x' : ''));
+                const looksLikeDirectLink =
+                  (url.includes('.mp4') || url.includes('.m3u8')) &&
+                  url.includes('token=');
+                if (!mediaUrl && looksLikeDirectLink) {
+                  console.log('FOUND:', url);
+                  mediaUrl = url;
+                }
+              } catch (e) {}
+            });
+
+            console.log('OPENING (embed):', embedUrl);
+
+            try {
+              await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
+            } catch (e) {
+              console.log('goto warning:', e.message);
+            }
+
+            // Some mirrors gate the source request behind a play tap even on
+            // the embed page (autoplay-restriction workaround). Best-effort
+            // nudge, ignore if nothing matches.
+            const playSelectors = [
+              'video',
+              '.jw-icon-display',
+              '.vjs-big-play-button',
+              '.plyr__control--overlaid',
+              'button.jw-icon-playback'
+            ];
+            for (const sel of playSelectors) {
+              if (mediaUrl) break;
+              try { await page.click(sel, { timeout: 2000 }); } catch (e) {}
+              await page.waitForTimeout(1500);
+            }
+
+            // give the player a few more seconds in case the request is
+            // still in flight
+            for (let i = 0; i < 8 && !mediaUrl; i++) {
+              await page.waitForTimeout(1000);
+            }
+
+            const title = (await page.title()).trim() || 'video';
+            console.log('TITLE:', title);
+
+            await browser.close();
+
+            if (!mediaUrl) {
+              console.error('Could not find a direct media link on this page.');
+              process.exit(1);
+            }
+
+            fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, url: mediaUrl }, null, 2));
+            console.log('Saved grabbed/result.json');
+
+          })();
+
+          EOF
+
+      - name: Run Playwright
+        run: node dood_dl.js "${{ github.event.inputs.source_url }}"
+
+      - name: Download video
+        run: |
+
+          if [ ! -f grabbed/result.json ]; then
+            echo "No result from Playwright step"
+            exit 1
+          fi
+
+          title=$(jq -r '.title' grabbed/result.json)
+          url=$(jq -r '.url' grabbed/result.json)
+
+          safe_title=$(echo "$title" \
+            | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
+            | sed 's/[_ ]\+/_/g' \
+            | sed 's/^_//;s/_$//' \
+            | cut -c1-80)
+
+          [ -z "$safe_title" ] && safe_title="video"
+
+          echo "TITLE: $safe_title"
+          echo "URL:   $url"
+
+          clean_url=$(echo "$url" | cut -d'?' -f1)
+          ext=$(echo "$clean_url" | grep -oE '\.(mp4|m3u8)' | head -1 | tr -d '.')
+
+          if [[ "$ext" == "m3u8" ]]; then
+
+            echo "[FFMPEG] downloading m3u8"
+            ffmpeg -y -user_agent "Mozilla/5.0" -i "$url" -c copy "downloads/${safe_title}.mp4"
+
+          else
+
+            echo "[ARIA2] trying download..."
+            aria2c \
+              -x 16 -s 16 -k 1M -c \
+              --summary-interval=5 \
+              --console-log-level=warn \
+              --dir=downloads \
+              --out="${safe_title}.${ext:-mp4}" \
+              "$url"
+
+            if [ $? -ne 0 ]; then
+              echo "[CURL FALLBACK] aria2 failed"
+              curl -L --retry 5 --connect-timeout 30 -A "Mozilla/5.0" \
+                -o "downloads/${safe_title}.${ext:-mp4}" \
+                "$url"
+            fi
+
+          fi
+
+          echo ""
+          echo "=== downloads/ ==="
+          ls -lh downloads/ || true
+
+          if [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+            echo "Download failed: downloads/ is empty"
+            exit 1
+          fi
+
+      - name: Create ZIP
+        if: github.event.inputs.upload_mode == 'zip'
+        run: |
+          ts=$(date +"%Y%m%d_%H%M%S")
+          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "dood_media_${ts}.zip" downloads/
+
+      - name: Delete old releases
+        if: github.event.inputs.delete_old_releases == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          releases=$(gh release list --limit 100 | awk '{print $1}')
+          for tag in $releases; do
+            gh release delete "$tag" -y || true
+          done
+
+      - name: Upload ZIP Release
+        if: github.event.inputs.upload_mode == 'zip'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dood-${{ github.run_number }}
+          files: "*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Direct Video Release
+        if: github.event.inputs.upload_mode == 'direct'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dood-${{ github.run_number }}
+          files: "downloads/*"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
