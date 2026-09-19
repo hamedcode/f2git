@@ -100,133 +100,193 @@ jobs:
 
             let mediaUrl = null;
             let title = 'video';
+            let usedEmbedUrl = null;
+
+            const MAX_ATTEMPTS = 3;
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
             try {
 
               const embedUrlObj = toEmbedUrlObj(SOURCE_URL);
               const embedUrl = embedUrlObj.toString();
               const embedBaseDomain = baseDomain(embedUrlObj.host);
+              usedEmbedUrl = embedUrl;
 
               console.log('EMBED URL:', embedUrl);
 
-              const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
+              for (let attempt = 1; attempt <= MAX_ATTEMPTS && !mediaUrl; attempt++) {
 
-              // This is the actual fix for the redirect ads: block any
-              // full-page navigation away from this site, at the network
-              // level -- the same thing an ad blocker like AdGuard/uBlock
-              // does. A request to a totally different domain that is NOT
-              // a page navigation (e.g. fetching the video itself from the
-              // CDN) is untouched by this -- it only ever inspects
-              // isNavigationRequest().
-              await context.route('**/*', (route) => {
-                const request = route.request();
-                if (request.isNavigationRequest()) {
-                  let reqHost = '';
-                  try { reqHost = new URL(request.url()).host; } catch (e) {}
-                  if (reqHost && baseDomain(reqHost) !== embedBaseDomain) {
-                    console.log('Blocking cross-site navigation (ad redirect):', request.url());
-                    return route.abort();
+                console.log(`\n=== Attempt ${attempt}/${MAX_ATTEMPTS} (fresh session) ===`);
+
+                const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
+
+                // Block any full-page navigation away from this site, at
+                // the network level -- the same thing an ad blocker like
+                // AdGuard/uBlock does. A request to a different domain
+                // that is NOT a page navigation (e.g. fetching the video
+                // itself from the CDN) is untouched -- this only ever
+                // inspects isNavigationRequest().
+                await context.route('**/*', (route) => {
+                  const request = route.request();
+                  if (request.isNavigationRequest()) {
+                    let reqHost = '';
+                    try { reqHost = new URL(request.url()).host; } catch (e) {}
+                    if (reqHost && baseDomain(reqHost) !== embedBaseDomain) {
+                      console.log('Blocking cross-site navigation (ad redirect):', request.url());
+                      return route.abort();
+                    }
                   }
-                }
-                return route.continue();
-              });
+                  return route.continue();
+                });
 
-              const page = await context.newPage();
+                // create the MAIN tab first...
+                const page = await context.newPage();
 
-              page.on('dialog', (dialog) => dialog.dismiss().catch(() => {}));
+                // ...and only THEN start watching for popups.
+                // context.newPage() itself fires a 'page' event, so
+                // registering this listener before creating the main page
+                // makes the script close its own working tab by mistake.
+                context.on('page', async (popup) => {
+                  if (popup === page) return;
+                  try {
+                    console.log('POPUP opened, closing:', popup.url());
+                    await popup.close();
+                  } catch (e) {}
+                });
 
-              // Capture the actual media URL the player itself requests.
-              // It usually lives on a completely different domain (the
-              // video CDN, e.g. cloudatacdn.com) than the doodstream page
-              // itself, so we match by shape (looks like a video file with
-              // a token), not by host.
-              page.on('response', (response) => {
+                page.on('dialog', (dialog) => dialog.dismiss().catch(() => {}));
+                page.on('close', () => console.log('Main tab was closed by the page.'));
+                page.on('crash', () => console.log('Main tab crashed.'));
+
+                // Capture the actual media URL the player itself requests.
+                // It usually lives on a completely different domain (the
+                // video CDN, e.g. cloudatacdn.com) than the doodstream
+                // page itself, so we match by shape (looks like a video
+                // file with a token), not by host.
+                page.on('response', (response) => {
+                  try {
+                    const url = response.url();
+                    const looksLikeDirectLink =
+                      (url.includes('.mp4') || url.includes('.m3u8')) && url.includes('token=');
+                    if (!mediaUrl && looksLikeDirectLink) {
+                      console.log('FOUND:', url);
+                      mediaUrl = url;
+                    }
+                  } catch (e) {}
+                });
+
                 try {
-                  const url = response.url();
-                  const looksLikeDirectLink =
-                    (url.includes('.mp4') || url.includes('.m3u8')) && url.includes('token=');
-                  if (!mediaUrl && looksLikeDirectLink) {
-                    console.log('FOUND:', url);
-                    mediaUrl = url;
-                  }
-                } catch (e) {}
-              });
-
-              let resp;
-              try {
-                resp = await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
-              } catch (e) {
-                console.log('goto warning:', e.message);
-              }
-
-              if (resp && !resp.ok() && !mediaUrl) {
-                console.error('Failed to load embed page, status:', resp.status());
-                process.exit(1);
-              }
-
-              // give a non-interactive anti-bot interstitial a chance to
-              // clear on its own, same as a real browser tab sitting there
-              const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-              if (/just a moment|checking your browser|attention required/i.test(bodyText)) {
-                console.log('Anti-bot interstitial detected, waiting for it to settle...');
-                await page.waitForTimeout(8000).catch(() => {});
-              }
-
-              // with ad redirects blocked, autoplay often fires the real
-              // request on its own within a few seconds -- give it a
-              // chance before trying anything else
-              for (let i = 0; i < 10 && !mediaUrl; i++) {
-                await page.waitForTimeout(1000).catch(() => {});
-              }
-
-              // if it's still gated behind a user gesture, try a play
-              // click now -- safe to do since ad redirects are blocked at
-              // the network level, so this can no longer hijack the tab
-              if (!mediaUrl) {
-                console.log('No autoplay request yet, trying a play click...');
-                const playSelectors = [
-                  'video',
-                  '.jw-icon-display',
-                  '.vjs-big-play-button',
-                  '.plyr__control--overlaid',
-                  'button.jw-icon-playback',
-                  '#player',
-                  '.jwplayer'
-                ];
-                for (const sel of playSelectors) {
-                  if (mediaUrl) break;
-                  try { await page.click(sel, { timeout: 2000, force: true }); } catch (e) {}
-                  await page.waitForTimeout(1500).catch(() => {});
+                  const resp = await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                  if (resp) console.log('Loaded, status:', resp.status());
+                } catch (e) {
+                  console.log('goto warning:', e.message);
                 }
-                for (let i = 0; i < 8 && !mediaUrl; i++) {
+
+                // give a non-interactive anti-bot interstitial a chance to
+                // clear on its own, same as a real browser tab sitting
+                // there
+                if (!page.isClosed()) {
+                  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+                  if (/just a moment|checking your browser|attention required/i.test(bodyText)) {
+                    console.log('Anti-bot interstitial detected, waiting for it to settle...');
+                    await page.waitForTimeout(8000).catch(() => {});
+                  }
+                }
+
+                // with ad redirects blocked, autoplay often fires the real
+                // request on its own within a few seconds -- give it a
+                // chance before trying anything else
+                for (let i = 0; i < 10 && !mediaUrl && !page.isClosed(); i++) {
                   await page.waitForTimeout(1000).catch(() => {});
                 }
+
+                // if it's still gated behind a user gesture, try a play
+                // click now -- safe to do since ad redirects are blocked
+                // at the network level, so this can no longer hijack the
+                // tab
+                if (!mediaUrl && !page.isClosed()) {
+                  console.log('No autoplay request yet, trying a play click...');
+                  const playSelectors = [
+                    'video',
+                    '.jw-icon-display',
+                    '.vjs-big-play-button',
+                    '.plyr__control--overlaid',
+                    'button.jw-icon-playback',
+                    '#player',
+                    '.jwplayer'
+                  ];
+                  for (const sel of playSelectors) {
+                    if (mediaUrl || page.isClosed()) break;
+                    try {
+                      await page.click(sel, { timeout: 2000, force: true });
+                      console.log(`  clicked "${sel}", now at:`, page.isClosed() ? '(tab closed)' : page.url());
+                    } catch (e) {
+                      console.log(`  click "${sel}" skipped:`, e.message.split('\n')[0]);
+                    }
+                    await page.waitForTimeout(1500).catch(() => {});
+                  }
+                  for (let i = 0; i < 8 && !mediaUrl && !page.isClosed(); i++) {
+                    await page.waitForTimeout(1000).catch(() => {});
+                  }
+                }
+
+                if (!page.isClosed()) {
+                  try {
+                    title = (await page.title()).trim() || title;
+                  } catch (e) {
+                    console.log('page.title() failed:', e.message);
+                  }
+                } else {
+                  console.log('Skipping title read: tab is closed.');
+                }
+                console.log('TITLE:', title);
+
+                if (!mediaUrl) {
+                  let finalUrl = 'unknown (tab closed)';
+                  if (!page.isClosed()) {
+                    try { finalUrl = page.url(); } catch (e) {}
+                  }
+                  console.log(`Attempt ${attempt} failed. Ended up on:`, finalUrl);
+                }
+
+                await context.close().catch(() => {});
+
+                if (!mediaUrl && attempt < MAX_ATTEMPTS) {
+                  const delay = 2000 + Math.floor(Math.random() * 3000);
+                  console.log(`Waiting ${Math.round(delay / 1000)}s before the next attempt...`);
+                  await sleep(delay);
+                }
+
               }
 
-              try { title = (await page.title()).trim() || 'video'; } catch (e) {}
-              console.log('TITLE:', title);
-
               if (!mediaUrl) {
-                console.error('Could not find a direct media link on this page.');
+                console.error(`Could not find a direct media link after ${MAX_ATTEMPTS} attempts.`);
                 process.exit(1);
               }
 
               // sanity check it actually resolves before handing it to the
-              // download step -- through the same context/session
-              const headRes = await context.request.head(mediaUrl, {
-                headers: { Referer: embedUrl }
+              // download step (a plain fetch is enough here, it's just a
+              // HEAD request to a CDN, not the protected page)
+              const headRes = await fetch(mediaUrl, {
+                method: 'HEAD',
+                headers: { 'User-Agent': UA, Referer: usedEmbedUrl }
+              }).catch((e) => {
+                console.log('HEAD validation request errored (continuing anyway):', e.message);
+                return null;
               });
 
-              if (!headRes.ok()) {
-                console.error('Media link did not validate, status:', headRes.status());
+              if (headRes && !headRes.ok) {
+                console.error('Media link did not validate, status:', headRes.status);
                 process.exit(1);
               }
 
-              console.log('Validated OK, content-length:', headRes.headers()['content-length']);
+              if (headRes) {
+                console.log('Validated OK, content-length:', headRes.headers.get('content-length'));
+              }
 
               fs.writeFileSync(
                 'grabbed/result.json',
-                JSON.stringify({ title, url: mediaUrl, referer: embedUrl }, null, 2)
+                JSON.stringify({ title, url: mediaUrl, referer: usedEmbedUrl }, null, 2)
               );
               console.log('Saved grabbed/result.json');
 
