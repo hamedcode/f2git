@@ -86,13 +86,6 @@ jobs:
             return parsed;
           }
 
-          function randomString(len) {
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-            let s = '';
-            for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
-            return s;
-          }
-
           // "example.com" from "cdn.example.com" / "www.example.com" -- a
           // simple eTLD+1 approximation, good enough for telling "still the
           // same site" apart from "got redirected somewhere else entirely"
@@ -105,11 +98,13 @@ jobs:
 
             const browser = await chromium.launch({ headless: true });
 
+            let mediaUrl = null;
+            let title = 'video';
+
             try {
 
               const embedUrlObj = toEmbedUrlObj(SOURCE_URL);
               const embedUrl = embedUrlObj.toString();
-              const origin = embedUrlObj.origin;
               const embedBaseDomain = baseDomain(embedUrlObj.host);
 
               console.log('EMBED URL:', embedUrl);
@@ -119,8 +114,10 @@ jobs:
               // This is the actual fix for the redirect ads: block any
               // full-page navigation away from this site, at the network
               // level -- the same thing an ad blocker like AdGuard/uBlock
-              // does. XHR/fetch calls (like the pass_md5 call we need) are
-              // NOT navigations, so this doesn't touch them at all.
+              // does. A request to a totally different domain that is NOT
+              // a page navigation (e.g. fetching the video itself from the
+              // CDN) is untouched by this -- it only ever inspects
+              // isNavigationRequest().
               await context.route('**/*', (route) => {
                 const request = route.request();
                 if (request.isNavigationRequest()) {
@@ -136,7 +133,25 @@ jobs:
 
               const page = await context.newPage();
 
-              // single clean navigation, no clicking anything
+              page.on('dialog', (dialog) => dialog.dismiss().catch(() => {}));
+
+              // Capture the actual media URL the player itself requests.
+              // It usually lives on a completely different domain (the
+              // video CDN, e.g. cloudatacdn.com) than the doodstream page
+              // itself, so we match by shape (looks like a video file with
+              // a token), not by host.
+              page.on('response', (response) => {
+                try {
+                  const url = response.url();
+                  const looksLikeDirectLink =
+                    (url.includes('.mp4') || url.includes('.m3u8')) && url.includes('token=');
+                  if (!mediaUrl && looksLikeDirectLink) {
+                    console.log('FOUND:', url);
+                    mediaUrl = url;
+                  }
+                } catch (e) {}
+              });
+
               let resp;
               try {
                 resp = await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
@@ -144,7 +159,7 @@ jobs:
                 console.log('goto warning:', e.message);
               }
 
-              if (resp && !resp.ok()) {
+              if (resp && !resp.ok() && !mediaUrl) {
                 console.error('Failed to load embed page, status:', resp.status());
                 process.exit(1);
               }
@@ -157,62 +172,53 @@ jobs:
                 await page.waitForTimeout(8000).catch(() => {});
               }
 
-              const html = await page.content();
+              // with ad redirects blocked, autoplay often fires the real
+              // request on its own within a few seconds -- give it a
+              // chance before trying anything else
+              for (let i = 0; i < 10 && !mediaUrl; i++) {
+                await page.waitForTimeout(1000).catch(() => {});
+              }
 
-              const title = (await page.title().catch(() => '')).trim() || 'video';
+              // if it's still gated behind a user gesture, try a play
+              // click now -- safe to do since ad redirects are blocked at
+              // the network level, so this can no longer hijack the tab
+              if (!mediaUrl) {
+                console.log('No autoplay request yet, trying a play click...');
+                const playSelectors = [
+                  'video',
+                  '.jw-icon-display',
+                  '.vjs-big-play-button',
+                  '.plyr__control--overlaid',
+                  'button.jw-icon-playback',
+                  '#player',
+                  '.jwplayer'
+                ];
+                for (const sel of playSelectors) {
+                  if (mediaUrl) break;
+                  try { await page.click(sel, { timeout: 2000, force: true }); } catch (e) {}
+                  await page.waitForTimeout(1500).catch(() => {});
+                }
+                for (let i = 0; i < 8 && !mediaUrl; i++) {
+                  await page.waitForTimeout(1000).catch(() => {});
+                }
+              }
+
+              try { title = (await page.title()).trim() || 'video'; } catch (e) {}
               console.log('TITLE:', title);
 
-              // find the pass_md5 endpoint the player's own JS calls to get
-              // the real source -- a plain data endpoint, no ads attached
-              const passMd5Match = html.match(/\/pass_md5\/[^'"]+/);
-
-              if (!passMd5Match) {
-                console.error('Could not find a pass_md5 endpoint on this page -- the site may have changed its player, or this URL format is not supported.');
+              if (!mediaUrl) {
+                console.error('Could not find a direct media link on this page.');
                 process.exit(1);
               }
-
-              const passMd5Path = passMd5Match[0];
-              const passMd5Url = origin + passMd5Path;
-
-              console.log('PASS_MD5:', passMd5Url);
-
-              // use the SAME browser context (same cookies/session) to make
-              // this call, instead of a raw fetch, so it passes whatever
-              // check the page load itself passed
-              const md5Res = await context.request.get(passMd5Url, {
-                headers: { Referer: embedUrl }
-              });
-
-              if (!md5Res.ok()) {
-                console.error('pass_md5 request failed, status:', md5Res.status());
-                process.exit(1);
-              }
-
-              let baseCdnUrl = (await md5Res.text()).trim();
-
-              if (!baseCdnUrl.startsWith('http')) {
-                console.error('Unexpected pass_md5 response (not a URL):', baseCdnUrl.slice(0, 200));
-                process.exit(1);
-              }
-
-              if (!baseCdnUrl.endsWith('/')) baseCdnUrl += '/';
-
-              // the token is the last path segment of the pass_md5 endpoint
-              // itself
-              const token = passMd5Path.split('/').filter(Boolean).pop();
-              const expiry = Date.now();
-              const finalUrl = `${baseCdnUrl}${randomString(10)}?token=${token}&expiry=${expiry}`;
-
-              console.log('FINAL URL:', finalUrl);
 
               // sanity check it actually resolves before handing it to the
-              // download step -- again through the same context
-              const headRes = await context.request.head(finalUrl, {
+              // download step -- through the same context/session
+              const headRes = await context.request.head(mediaUrl, {
                 headers: { Referer: embedUrl }
               });
 
               if (!headRes.ok()) {
-                console.error('Final link did not validate, status:', headRes.status());
+                console.error('Media link did not validate, status:', headRes.status());
                 process.exit(1);
               }
 
@@ -220,7 +226,7 @@ jobs:
 
               fs.writeFileSync(
                 'grabbed/result.json',
-                JSON.stringify({ title, url: finalUrl, referer: embedUrl }, null, 2)
+                JSON.stringify({ title, url: mediaUrl, referer: embedUrl }, null, 2)
               );
               console.log('Saved grabbed/result.json');
 
