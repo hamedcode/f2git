@@ -89,123 +89,140 @@ jobs:
 
             const browser = await chromium.launch({ headless: true });
 
-            const context = await browser.newContext({
-              userAgent:
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            });
-
-            // --- Popup/popunder ad defenses -----------------------------
-            // Doodstream-family mirrors almost always wire the play button
-            // to an ad script too (window.open popup, or a full-page
-            // <a target="_blank"> overlay). None of that is needed for us
-            // to get the video source, so we neutralize it three ways:
-
-            // 1) kill window.open before any page script runs, on every
-            //    document (including iframes) in this context
-            await context.addInitScript(() => {
-              window.open = () => null;
-            });
-
-            // 2) if a new tab/page slips through anyway (e.g. via a native
-            //    target="_blank" anchor, which doesn't go through
-            //    window.open), close it immediately
-            context.on('page', async (popup) => {
-              try {
-                console.log('POPUP opened, closing:', popup.url());
-                await popup.close();
-              } catch (e) {}
-            });
-
-            const page = await context.newPage();
-
-            // auto-dismiss any alert/confirm dialogs some ad scripts throw
-            page.on('dialog', async (dialog) => {
-              try { await dialog.dismiss(); } catch (e) {}
-            });
-
             let mediaUrl = null;
-
-            page.on('response', (response) => {
-              try {
-                const url = response.url();
-                // Doodstream CDN links always look like:
-                //   https://<cdn-host>/<hash>/<name>.mp4?token=...&expiry=...
-                const looksLikeDirectLink =
-                  (url.includes('.mp4') || url.includes('.m3u8')) &&
-                  url.includes('token=');
-                if (!mediaUrl && looksLikeDirectLink) {
-                  console.log('FOUND:', url);
-                  mediaUrl = url;
-                }
-              } catch (e) {}
-            });
-
-            console.log('OPENING (embed):', embedUrl);
+            let title = 'video';
 
             try {
-              await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
-            } catch (e) {
-              console.log('goto warning:', e.message);
-            }
 
-            // 3) if the click redirected the MAIN tab itself (some ads do
-            //    top.location = ... instead of opening a popup), bring it
-            //    back to the embed page before trying again
-            async function ensureOnEmbedPage() {
+              const context = await browser.newContext({
+                userAgent:
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+              });
+
+              // --- Popup/popunder ad defenses ---------------------------
+              // Doodstream-family mirrors almost always wire the play
+              // button to an ad script too (window.open popup, or a
+              // full-page <a target="_blank"> overlay). None of that is
+              // needed for us to get the video source, so we neutralize
+              // it a few ways:
+
+              // 1) kill window.open before any page script runs, on every
+              //    document (including iframes) in this context
+              await context.addInitScript(() => {
+                window.open = () => null;
+              });
+
+              // create the MAIN tab first...
+              const page = await context.newPage();
+
+              // ...and only THEN start watching for popups.
+              // context.newPage() itself fires a 'page' event, so
+              // registering this listener before creating our own main
+              // page made the script close its own working tab by
+              // mistake.
+              context.on('page', async (popup) => {
+                if (popup === page) return;
+                try {
+                  console.log('POPUP opened, closing:', popup.url());
+                  await popup.close();
+                } catch (e) {}
+              });
+
+              // auto-dismiss any alert/confirm dialogs some ad scripts
+              // throw
+              page.on('dialog', async (dialog) => {
+                try { await dialog.dismiss(); } catch (e) {}
+              });
+
+              page.on('response', (response) => {
+                try {
+                  const url = response.url();
+                  // Doodstream CDN links always look like:
+                  //   https://<cdn-host>/<hash>/<name>.mp4?token=...&expiry=...
+                  const looksLikeDirectLink =
+                    (url.includes('.mp4') || url.includes('.m3u8')) &&
+                    url.includes('token=');
+                  if (!mediaUrl && looksLikeDirectLink) {
+                    console.log('FOUND:', url);
+                    mediaUrl = url;
+                  }
+                } catch (e) {}
+              });
+
+              console.log('OPENING (embed):', embedUrl);
+
               try {
-                const currentHost = new URL(page.url()).host;
-                if (embedHost && currentHost !== embedHost) {
-                  console.log('Main tab was redirected to', page.url(), '-> going back');
-                  await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-                }
-              } catch (e) {}
-            }
-
-            // Some mirrors gate the source request behind a play tap even on
-            // the embed page (autoplay-restriction workaround). Click a
-            // couple of rounds since the first click sometimes only
-            // dismisses an ad overlay, revealing the real button under it.
-            const playSelectors = [
-              'video',
-              '.jw-icon-display',
-              '.vjs-big-play-button',
-              '.plyr__control--overlaid',
-              'button.jw-icon-playback',
-              '#player',
-              '.jwplayer'
-            ];
-
-            for (let round = 0; round < 2 && !mediaUrl; round++) {
-              for (const sel of playSelectors) {
-                if (mediaUrl) break;
-                await ensureOnEmbedPage();
-                try { await page.click(sel, { timeout: 2000, force: true }); } catch (e) {}
-                await page.waitForTimeout(1500);
+                await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
+              } catch (e) {
+                console.log('goto warning:', e.message);
               }
+
+              // if the click redirected the MAIN tab itself (some ads do
+              // top.location = ... instead of opening a popup), bring it
+              // back to the embed page before trying again
+              async function ensureOnEmbedPage() {
+                if (page.isClosed()) return;
+                try {
+                  const currentHost = new URL(page.url()).host;
+                  if (embedHost && currentHost !== embedHost) {
+                    console.log('Main tab was redirected to', page.url(), '-> going back');
+                    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+                  }
+                } catch (e) {}
+              }
+
+              // Some mirrors gate the source request behind a play tap
+              // even on the embed page (autoplay-restriction workaround).
+              // Click a couple of rounds since the first click sometimes
+              // only dismisses an ad overlay, revealing the real button
+              // under it.
+              const playSelectors = [
+                'video',
+                '.jw-icon-display',
+                '.vjs-big-play-button',
+                '.plyr__control--overlaid',
+                'button.jw-icon-playback',
+                '#player',
+                '.jwplayer'
+              ];
+
+              for (let round = 0; round < 2 && !mediaUrl && !page.isClosed(); round++) {
+                for (const sel of playSelectors) {
+                  if (mediaUrl || page.isClosed()) break;
+                  await ensureOnEmbedPage();
+                  try { await page.click(sel, { timeout: 2000, force: true }); } catch (e) {}
+                  try { await page.waitForTimeout(1500); } catch (e) {}
+                }
+              }
+
+              // as a last resort, click the dead center of the viewport --
+              // hits whatever overlay is on top regardless of its class
+              // name
+              if (!mediaUrl && !page.isClosed()) {
+                await ensureOnEmbedPage();
+                const viewport = page.viewportSize() || { width: 1280, height: 720 };
+                try {
+                  await page.mouse.click(viewport.width / 2, viewport.height / 2);
+                } catch (e) {}
+                try { await page.waitForTimeout(2000); } catch (e) {}
+              }
+
+              // give the player a few more seconds in case the request is
+              // still in flight
+              for (let i = 0; i < 8 && !mediaUrl && !page.isClosed(); i++) {
+                try { await page.waitForTimeout(1000); } catch (e) { break; }
+              }
+
+              if (!page.isClosed()) {
+                try { title = (await page.title()).trim() || 'video'; } catch (e) {}
+              }
+              console.log('TITLE:', title);
+
+            } catch (e) {
+              console.log('Unexpected error during extraction:', e.message);
+            } finally {
+              await browser.close().catch(() => {});
             }
-
-            // as a last resort, click the dead center of the viewport --
-            // hits whatever overlay is on top regardless of its class name
-            if (!mediaUrl) {
-              await ensureOnEmbedPage();
-              const viewport = page.viewportSize() || { width: 1280, height: 720 };
-              try {
-                await page.mouse.click(viewport.width / 2, viewport.height / 2);
-              } catch (e) {}
-              await page.waitForTimeout(2000);
-            }
-
-            // give the player a few more seconds in case the request is
-            // still in flight
-            for (let i = 0; i < 8 && !mediaUrl; i++) {
-              await page.waitForTimeout(1000);
-            }
-
-            let title = 'video';
-            try { title = (await page.title()).trim() || 'video'; } catch (e) {}
-            console.log('TITLE:', title);
-
-            await browser.close();
 
             if (!mediaUrl) {
               console.error('Could not find a direct media link on this page.');
