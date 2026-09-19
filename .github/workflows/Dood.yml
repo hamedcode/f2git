@@ -120,15 +120,27 @@ jobs:
 
                 const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
 
-                // Block any full-page navigation away from this site, at
-                // the network level -- the same thing an ad blocker like
-                // AdGuard/uBlock does. A request to a different domain
-                // that is NOT a page navigation (e.g. fetching the video
-                // itself from the CDN) is untouched -- this only ever
-                // inspects isNavigationRequest().
+                // hide the most obvious automation flag -- Cloudflare
+                // (and similar) explicitly check navigator.webdriver as a
+                // bot signal. This only masks that one property; it does
+                // NOT attempt to solve or click through any interactive
+                // challenge.
+                await context.addInitScript(() => {
+                  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                });
+
+                // Block full-page navigations AWAY from this site (the ad
+                // redirects) at the network level -- same thing an ad
+                // blocker like AdGuard/uBlock does. Only the TOP-level
+                // frame is checked: an iframe on the page (like a
+                // Cloudflare Turnstile verification widget, which is
+                // legitimate and needed for the site to work, not an ad)
+                // is left alone. A request to a different domain that
+                // isn't a page navigation at all (e.g. fetching the video
+                // itself from the CDN) is untouched either way.
                 await context.route('**/*', (route) => {
                   const request = route.request();
-                  if (request.isNavigationRequest()) {
+                  if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
                     let reqHost = '';
                     try { reqHost = new URL(request.url()).host; } catch (e) {}
                     if (reqHost && baseDomain(reqHost) !== embedBaseDomain) {
