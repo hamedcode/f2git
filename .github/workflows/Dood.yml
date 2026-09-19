@@ -42,19 +42,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg zip curl aria2 jq gh
-          npm init -y
-          npm install playwright
-          npx playwright install chromium --with-deps
 
       - name: Prepare folders
         run: mkdir -p downloads grabbed
 
-      - name: Create Playwright script
+      - name: Create resolver script
         run: |
           cat > dood_dl.js << 'EOF'
 
+          // Resolves a doodstream-family share/embed link (dood.*, playmogo,
+          // ds2play, d0000d, ...) to a direct, downloadable CDN URL.
+          //
+          // No browser, no clicking, no ads: we replicate the two plain
+          // HTTP calls the player's own JS makes on page load to fetch its
+          // video source (the "pass_md5" handshake). Since we never render
+          // the page or execute its JS, none of the ad scripts ever run.
+
           const fs = require('fs');
-          const { chromium } = require('playwright');
 
           const SOURCE_URL = process.argv[2];
           if (!SOURCE_URL) {
@@ -62,237 +66,134 @@ jobs:
             process.exit(1);
           }
 
-          // Doodstream (and every whitelabel mirror of it: dood.*, playmogo,
-          // ds2play, d0000d, ...) shows a landing page at /d/<id> (and
-          // sometimes /f/<id>) that requires clicking through a countdown.
-          // The actual player lives at /e/<id> and requests its source
-          // automatically on load, so we just rewrite the path -- no click
-          // countdown needed.
-          function toEmbedUrl(u) {
-            try {
-              const parsed = new URL(u);
-              parsed.pathname = parsed.pathname
-                .replace('/d/', '/e/')
-                .replace('/f/', '/e/');
-              return parsed.toString();
-            } catch (e) {
-              return u;
-            }
+          const HEADERS_BASE = {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+          };
+
+          function toEmbedUrlObj(u) {
+            const parsed = new URL(u);
+            parsed.pathname = parsed.pathname.replace('/d/', '/e/').replace('/f/', '/e/');
+            return parsed;
           }
 
-          const embedUrl = toEmbedUrl(SOURCE_URL);
-          const embedHost = (() => {
-            try { return new URL(embedUrl).host; } catch (e) { return null; }
-          })();
+          function randomString(len) {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let s = '';
+            for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+            return s;
+          }
 
           (async () => {
 
-            const browser = await chromium.launch({ headless: true });
-
-            let mediaUrl = null;
-            let title = 'video';
-
-            const MAX_ATTEMPTS = 3;
-
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
             try {
 
-              for (let attempt = 1; attempt <= MAX_ATTEMPTS && !mediaUrl; attempt++) {
+              const embedUrlObj = toEmbedUrlObj(SOURCE_URL);
+              const embedUrl = embedUrlObj.toString();
+              const origin = embedUrlObj.origin;
 
-                console.log(`\n=== Attempt ${attempt}/${MAX_ATTEMPTS} (fresh session) ===`);
+              console.log('EMBED URL:', embedUrl);
 
-                // a brand new context = brand new cookies/session, so each
-                // attempt looks like a fresh visit rather than the same
-                // session bouncing back and forth (which is what seems to
-                // trip the "Just a moment..." anti-bot check)
-                const context = await browser.newContext({
-                  userAgent:
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                  locale: 'en-US'
-                });
+              const pageRes = await fetch(embedUrl, {
+                headers: { ...HEADERS_BASE, Referer: origin + '/' }
+              });
 
-                // --- Popup/popunder ad defenses -------------------------
-                // Doodstream-family mirrors almost always wire the play
-                // button to an ad script too (window.open popup, a
-                // full-page <a target="_blank"> overlay, or a full
-                // top-level redirect). We neutralize what we can:
-
-                // 1) kill window.open before any page script runs, on
-                //    every document (including iframes) in this context
-                await context.addInitScript(() => {
-                  window.open = () => null;
-                });
-
-                // create the MAIN tab first...
-                const page = await context.newPage();
-
-                // ...and only THEN start watching for popups.
-                // context.newPage() itself fires a 'page' event, so
-                // registering this listener before creating our own main
-                // page made the script close its own working tab by
-                // mistake.
-                context.on('page', async (popup) => {
-                  if (popup === page) return;
-                  try {
-                    console.log('POPUP opened, closing:', popup.url());
-                    await popup.close();
-                  } catch (e) {}
-                });
-
-                // auto-dismiss any alert/confirm dialogs some ad scripts
-                // throw
-                page.on('dialog', async (dialog) => {
-                  try { await dialog.dismiss(); } catch (e) {}
-                });
-
-                page.on('response', (response) => {
-                  try {
-                    const url = response.url();
-                    // Doodstream CDN links always look like:
-                    //   https://<cdn-host>/<hash>/<name>.mp4?token=...&expiry=...
-                    const looksLikeDirectLink =
-                      (url.includes('.mp4') || url.includes('.m3u8')) &&
-                      url.includes('token=');
-                    if (!mediaUrl && looksLikeDirectLink) {
-                      console.log('FOUND:', url);
-                      mediaUrl = url;
-                    }
-                  } catch (e) {}
-                });
-
-                console.log('OPENING (embed):', embedUrl);
-
-                try {
-                  await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
-                } catch (e) {
-                  console.log('goto warning:', e.message);
-                }
-
-                // some sites throw up a non-interactive Cloudflare-style
-                // "Just a moment..." check that auto-resolves after a few
-                // seconds on its own -- give it a chance before giving up
-                // on this attempt. We do NOT attempt to solve anything
-                // interactive (an actual CAPTCHA); if one shows up this
-                // will simply not find a media link and move to the next
-                // attempt / report failure.
-                try {
-                  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-                  if (/just a moment|checking your browser|attention required/i.test(bodyText)) {
-                    console.log('Anti-bot interstitial detected, waiting for it to settle...');
-                    await page.waitForTimeout(8000).catch(() => {});
-                  }
-                } catch (e) {}
-
-                // if a click redirects the MAIN tab itself (some ads do
-                // top.location = ... instead of opening a popup), bring it
-                // back to the embed page before trying the next selector
-                async function ensureOnEmbedPage() {
-                  if (page.isClosed()) return;
-                  try {
-                    const currentHost = new URL(page.url()).host;
-                    if (embedHost && currentHost !== embedHost) {
-                      console.log('Main tab was redirected to', page.url(), '-> going back');
-                      await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-                    }
-                  } catch (e) {}
-                }
-
-                // Some mirrors gate the source request behind a play tap
-                // even on the embed page (autoplay-restriction
-                // workaround). Click a couple of rounds since the first
-                // click sometimes only dismisses an ad overlay, revealing
-                // the real button under it.
-                const playSelectors = [
-                  'video',
-                  '.jw-icon-display',
-                  '.vjs-big-play-button',
-                  '.plyr__control--overlaid',
-                  'button.jw-icon-playback',
-                  '#player',
-                  '.jwplayer'
-                ];
-
-                for (let round = 0; round < 2 && !mediaUrl && !page.isClosed(); round++) {
-                  for (const sel of playSelectors) {
-                    if (mediaUrl || page.isClosed()) break;
-                    await ensureOnEmbedPage();
-                    try { await page.click(sel, { timeout: 2000, force: true }); } catch (e) {}
-                    try { await page.waitForTimeout(1500); } catch (e) {}
-                  }
-                }
-
-                // as a last resort, click the dead center of the viewport
-                // -- hits whatever overlay is on top regardless of its
-                // class name
-                if (!mediaUrl && !page.isClosed()) {
-                  await ensureOnEmbedPage();
-                  const viewport = page.viewportSize() || { width: 1280, height: 720 };
-                  try {
-                    await page.mouse.click(viewport.width / 2, viewport.height / 2);
-                  } catch (e) {}
-                  try { await page.waitForTimeout(2000); } catch (e) {}
-                }
-
-                // give the player a few more seconds in case the request
-                // is still in flight
-                for (let i = 0; i < 8 && !mediaUrl && !page.isClosed(); i++) {
-                  try { await page.waitForTimeout(1000); } catch (e) { break; }
-                }
-
-                if (!page.isClosed()) {
-                  try { title = (await page.title()).trim() || 'video'; } catch (e) {}
-                }
-                console.log('TITLE:', title);
-
-                if (!mediaUrl) {
-                  let finalUrl = 'unknown';
-                  try { finalUrl = page.url(); } catch (e) {}
-                  console.log(`Attempt ${attempt} failed. Ended up on:`, finalUrl);
-                }
-
-                // fresh session per attempt -- discard this one entirely
-                await context.close().catch(() => {});
-
-                if (!mediaUrl && attempt < MAX_ATTEMPTS) {
-                  const delay = 2000 + Math.floor(Math.random() * 3000);
-                  console.log(`Waiting ${Math.round(delay / 1000)}s before the next attempt...`);
-                  await sleep(delay);
-                }
-
+              if (!pageRes.ok) {
+                console.error('Failed to load embed page, status:', pageRes.status);
+                process.exit(1);
               }
 
-            } catch (e) {
-              console.log('Unexpected error during extraction:', e.message);
-            } finally {
-              await browser.close().catch(() => {});
-            }
+              const html = await pageRes.text();
 
-            if (!mediaUrl) {
-              console.error(`Could not find a direct media link after ${MAX_ATTEMPTS} attempts.`);
+              const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
+              const title = (titleMatch ? titleMatch[1] : 'video').trim() || 'video';
+              console.log('TITLE:', title);
+
+              // find the pass_md5 endpoint the player's own JS calls to get
+              // the real source -- a plain data endpoint, no ads attached
+              const passMd5Match = html.match(/\/pass_md5\/[^'"]+/);
+
+              if (!passMd5Match) {
+                console.error('Could not find a pass_md5 endpoint on this page -- the site may have changed its player, or this URL format is not supported.');
+                process.exit(1);
+              }
+
+              const passMd5Path = passMd5Match[0];
+              const passMd5Url = origin + passMd5Path;
+
+              console.log('PASS_MD5:', passMd5Url);
+
+              const md5Res = await fetch(passMd5Url, {
+                headers: { ...HEADERS_BASE, Referer: embedUrl }
+              });
+
+              if (!md5Res.ok) {
+                console.error('pass_md5 request failed, status:', md5Res.status);
+                process.exit(1);
+              }
+
+              let baseCdnUrl = (await md5Res.text()).trim();
+
+              if (!baseCdnUrl.startsWith('http')) {
+                console.error('Unexpected pass_md5 response (not a URL):', baseCdnUrl.slice(0, 200));
+                process.exit(1);
+              }
+
+              if (!baseCdnUrl.endsWith('/')) baseCdnUrl += '/';
+
+              // the token is the last path segment of the pass_md5 endpoint
+              // itself
+              const token = passMd5Path.split('/').filter(Boolean).pop();
+              const expiry = Date.now();
+              const finalUrl = `${baseCdnUrl}${randomString(10)}?token=${token}&expiry=${expiry}`;
+
+              console.log('FINAL URL:', finalUrl);
+
+              // sanity check it actually resolves before handing it to the
+              // download step
+              const headRes = await fetch(finalUrl, {
+                method: 'HEAD',
+                headers: { ...HEADERS_BASE, Referer: embedUrl }
+              });
+
+              if (!headRes.ok) {
+                console.error('Final link did not validate, status:', headRes.status);
+                process.exit(1);
+              }
+
+              console.log('Validated OK, content-length:', headRes.headers.get('content-length'));
+
+              fs.writeFileSync(
+                'grabbed/result.json',
+                JSON.stringify({ title, url: finalUrl, referer: embedUrl }, null, 2)
+              );
+              console.log('Saved grabbed/result.json');
+
+            } catch (e) {
+              console.error('Error:', e.message);
               process.exit(1);
             }
-
-            fs.writeFileSync('grabbed/result.json', JSON.stringify({ title, url: mediaUrl }, null, 2));
-            console.log('Saved grabbed/result.json');
 
           })();
 
           EOF
 
-      - name: Run Playwright
+      - name: Run resolver
         run: node dood_dl.js "${{ github.event.inputs.source_url }}"
 
       - name: Download video
         run: |
 
           if [ ! -f grabbed/result.json ]; then
-            echo "No result from Playwright step"
+            echo "No result from resolver step"
             exit 1
           fi
 
           title=$(jq -r '.title' grabbed/result.json)
           url=$(jq -r '.url' grabbed/result.json)
+          referer=$(jq -r '.referer' grabbed/result.json)
+          ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
           safe_title=$(echo "$title" \
             | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
@@ -302,16 +203,23 @@ jobs:
 
           [ -z "$safe_title" ] && safe_title="video"
 
-          echo "TITLE: $safe_title"
-          echo "URL:   $url"
+          echo "TITLE:   $safe_title"
+          echo "URL:     $url"
+          echo "REFERER: $referer"
 
           clean_url=$(echo "$url" | cut -d'?' -f1)
           ext=$(echo "$clean_url" | grep -oE '\.(mp4|m3u8)' | head -1 | tr -d '.')
 
+          # the CDN checks the Referer header (and sometimes user-agent), so
+          # every downloader needs to send the same ones the resolver used
+
           if [[ "$ext" == "m3u8" ]]; then
 
             echo "[FFMPEG] downloading m3u8"
-            ffmpeg -y -user_agent "Mozilla/5.0" -i "$url" -c copy "downloads/${safe_title}.mp4"
+            ffmpeg -y \
+              -user_agent "$ua" \
+              -headers "Referer: ${referer}\r\n" \
+              -i "$url" -c copy "downloads/${safe_title}.mp4"
 
           else
 
@@ -320,13 +228,17 @@ jobs:
               -x 16 -s 16 -k 1M -c \
               --summary-interval=5 \
               --console-log-level=warn \
+              --user-agent="$ua" \
+              --referer="$referer" \
               --dir=downloads \
               --out="${safe_title}.${ext:-mp4}" \
               "$url"
 
             if [ $? -ne 0 ]; then
               echo "[CURL FALLBACK] aria2 failed"
-              curl -L --retry 5 --connect-timeout 30 -A "Mozilla/5.0" \
+              curl -L --retry 5 --connect-timeout 30 \
+                -A "$ua" \
+                -e "$referer" \
                 -o "downloads/${safe_title}.${ext:-mp4}" \
                 "$url"
             fi
@@ -341,6 +253,19 @@ jobs:
             echo "Download failed: downloads/ is empty"
             exit 1
           fi
+
+          # doodstream CDN returns a small HTML error page (not the real
+          # video) if the token/referer didn't validate -- a real clip is
+          # essentially never under ~200KB, so treat anything that small as
+          # a failed download
+          for f in downloads/*; do
+            size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$size" -lt 200000 ]; then
+              echo "Downloaded file looks too small ($size bytes) -- likely an error page, not the video:"
+              head -c 300 "$f"; echo
+              exit 1
+            fi
+          done
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
