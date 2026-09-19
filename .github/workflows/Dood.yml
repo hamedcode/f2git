@@ -137,6 +137,11 @@ jobs:
                 // challenge.
                 await context.addInitScript(() => {
                   Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                  // some popunder ad scripts fall back to hijacking the
+                  // CURRENT tab (e.g. to about:blank) when window.open()
+                  // is unavailable/blocked, as a workaround for popup
+                  // blockers. Neutering it outright avoids that path too.
+                  window.open = () => null;
                 });
 
                 // Block full-page navigations AWAY from this site (the ad
@@ -204,30 +209,43 @@ jobs:
                 }
 
                 // ---- Stage 1: the /d/ share page -----------------------
+                //
+                // The /download/ href is present in plain static HTML from
+                // the very first paint -- it needs no JS execution and no
+                // click to appear. So we grab the HTML the instant the
+                // document is parsed (domcontentloaded), *before* waiting
+                // for anything else: the longer we wait around (networkidle
+                // etc.), the more time an auto-firing ad redirect has to
+                // hijack the tab to about:blank first.
 
                 try {
-                  const resp = await page.goto(shareUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                  const resp = await page.goto(shareUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
                   if (resp) console.log('Loaded share page, status:', resp.status());
                 } catch (e) {
                   console.log('goto (share page) warning:', e.message);
                 }
 
-                await waitOutInterstitial();
+                let downloadPageUrl = null;
+                let html = !page.isClosed() ? await page.content().catch(() => '') : '';
+                let hrefMatch = html.match(/href="(\/download\/[^"]+)"/i);
+
+                if (!hrefMatch && !page.isClosed()) {
+                  // didn't catch it in time / page wasn't ready yet -- fall
+                  // back to waiting a bit and checking again once
+                  await waitOutInterstitial();
+                  await page.waitForTimeout(1500).catch(() => {});
+                  if (!page.isClosed()) {
+                    html = await page.content().catch(() => '');
+                    hrefMatch = html.match(/href="(\/download\/[^"]+)"/i);
+                  }
+                }
 
                 if (!page.isClosed()) {
                   try { title = (await page.title()).trim() || title; } catch (e) {}
                 }
                 console.log('TITLE:', title);
 
-                let downloadPageUrl = null;
-
-                if (!mediaUrl && !page.isClosed()) {
-                  const html = await page.content().catch(() => '');
-
-                  // the real download link is plain, static HTML -- no
-                  // click or wait needed to reveal it
-                  const hrefMatch = html.match(/href="(\/download\/[^"]+)"/i);
-
+                if (!mediaUrl) {
                   if (hrefMatch) {
                     downloadPageUrl = origin + hrefMatch[1];
                     console.log('DOWNLOAD LINK (from share page HTML):', downloadPageUrl);
