@@ -42,6 +42,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg zip curl aria2 jq gh
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
 
       - name: Prepare folders
         run: mkdir -p downloads grabbed
@@ -53,12 +56,20 @@ jobs:
           // Resolves a doodstream-family share/embed link (dood.*, playmogo,
           // ds2play, d0000d, ...) to a direct, downloadable CDN URL.
           //
-          // No browser, no clicking, no ads: we replicate the two plain
-          // HTTP calls the player's own JS makes on page load to fetch its
-          // video source (the "pass_md5" handshake). Since we never render
-          // the page or execute its JS, none of the ad scripts ever run.
+          // No clicking, no ads: we replicate the two plain HTTP calls the
+          // player's own JS makes on page load to fetch its video source
+          // (the "pass_md5" handshake) -- so none of the ad scripts ever
+          // fire. But a raw Node fetch() gets blocked with 403 by this
+          // site's bot protection (it checks the real-browser network
+          // fingerprint, not just headers), so we make BOTH requests
+          // through an actual headless Chromium instance instead: one
+          // single clean page load (no interaction) to get the HTML, then
+          // the pass_md5 call through that same browser context so it
+          // carries whatever cookies/fingerprint got it past the check the
+          // first time.
 
           const fs = require('fs');
+          const { chromium } = require('playwright');
 
           const SOURCE_URL = process.argv[2];
           if (!SOURCE_URL) {
@@ -66,11 +77,8 @@ jobs:
             process.exit(1);
           }
 
-          const HEADERS_BASE = {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-          };
+          const UA =
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
           function toEmbedUrlObj(u) {
             const parsed = new URL(u);
@@ -87,6 +95,8 @@ jobs:
 
           (async () => {
 
+            const browser = await chromium.launch({ headless: true });
+
             try {
 
               const embedUrlObj = toEmbedUrlObj(SOURCE_URL);
@@ -95,19 +105,33 @@ jobs:
 
               console.log('EMBED URL:', embedUrl);
 
-              const pageRes = await fetch(embedUrl, {
-                headers: { ...HEADERS_BASE, Referer: origin + '/' }
-              });
+              const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
+              const page = await context.newPage();
 
-              if (!pageRes.ok) {
-                console.error('Failed to load embed page, status:', pageRes.status);
+              // single clean navigation, no clicking anything
+              let resp;
+              try {
+                resp = await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
+              } catch (e) {
+                console.log('goto warning:', e.message);
+              }
+
+              if (resp && !resp.ok()) {
+                console.error('Failed to load embed page, status:', resp.status());
                 process.exit(1);
               }
 
-              const html = await pageRes.text();
+              // give a non-interactive anti-bot interstitial a chance to
+              // clear on its own, same as a real browser tab sitting there
+              const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+              if (/just a moment|checking your browser|attention required/i.test(bodyText)) {
+                console.log('Anti-bot interstitial detected, waiting for it to settle...');
+                await page.waitForTimeout(8000).catch(() => {});
+              }
 
-              const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
-              const title = (titleMatch ? titleMatch[1] : 'video').trim() || 'video';
+              const html = await page.content();
+
+              const title = (await page.title().catch(() => '')).trim() || 'video';
               console.log('TITLE:', title);
 
               // find the pass_md5 endpoint the player's own JS calls to get
@@ -124,12 +148,15 @@ jobs:
 
               console.log('PASS_MD5:', passMd5Url);
 
-              const md5Res = await fetch(passMd5Url, {
-                headers: { ...HEADERS_BASE, Referer: embedUrl }
+              // use the SAME browser context (same cookies/session) to make
+              // this call, instead of a raw fetch, so it passes whatever
+              // check the page load itself passed
+              const md5Res = await context.request.get(passMd5Url, {
+                headers: { Referer: embedUrl }
               });
 
-              if (!md5Res.ok) {
-                console.error('pass_md5 request failed, status:', md5Res.status);
+              if (!md5Res.ok()) {
+                console.error('pass_md5 request failed, status:', md5Res.status());
                 process.exit(1);
               }
 
@@ -151,18 +178,17 @@ jobs:
               console.log('FINAL URL:', finalUrl);
 
               // sanity check it actually resolves before handing it to the
-              // download step
-              const headRes = await fetch(finalUrl, {
-                method: 'HEAD',
-                headers: { ...HEADERS_BASE, Referer: embedUrl }
+              // download step -- again through the same context
+              const headRes = await context.request.head(finalUrl, {
+                headers: { Referer: embedUrl }
               });
 
-              if (!headRes.ok) {
-                console.error('Final link did not validate, status:', headRes.status);
+              if (!headRes.ok()) {
+                console.error('Final link did not validate, status:', headRes.status());
                 process.exit(1);
               }
 
-              console.log('Validated OK, content-length:', headRes.headers.get('content-length'));
+              console.log('Validated OK, content-length:', headRes.headers()['content-length']);
 
               fs.writeFileSync(
                 'grabbed/result.json',
@@ -173,6 +199,8 @@ jobs:
             } catch (e) {
               console.error('Error:', e.message);
               process.exit(1);
+            } finally {
+              await browser.close().catch(() => {});
             }
 
           })();
