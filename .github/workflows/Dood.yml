@@ -251,7 +251,11 @@ jobs:
                   lastPageUrl = downloadPageUrl;
 
                   try {
-                    const resp2 = await page.goto(downloadPageUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                    const resp2 = await page.goto(downloadPageUrl, {
+                      waitUntil: 'networkidle',
+                      timeout: 60000,
+                      referer: shareUrl
+                    });
                     if (resp2) console.log('Loaded download page, status:', resp2.status());
                   } catch (e) {
                     console.log('goto (download page) warning:', e.message);
