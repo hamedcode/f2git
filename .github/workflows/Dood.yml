@@ -93,6 +93,14 @@ jobs:
             return s;
           }
 
+          // "example.com" from "cdn.example.com" / "www.example.com" -- a
+          // simple eTLD+1 approximation, good enough for telling "still the
+          // same site" apart from "got redirected somewhere else entirely"
+          function baseDomain(host) {
+            const parts = host.split('.');
+            return parts.slice(-2).join('.');
+          }
+
           (async () => {
 
             const browser = await chromium.launch({ headless: true });
@@ -102,10 +110,30 @@ jobs:
               const embedUrlObj = toEmbedUrlObj(SOURCE_URL);
               const embedUrl = embedUrlObj.toString();
               const origin = embedUrlObj.origin;
+              const embedBaseDomain = baseDomain(embedUrlObj.host);
 
               console.log('EMBED URL:', embedUrl);
 
               const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
+
+              // This is the actual fix for the redirect ads: block any
+              // full-page navigation away from this site, at the network
+              // level -- the same thing an ad blocker like AdGuard/uBlock
+              // does. XHR/fetch calls (like the pass_md5 call we need) are
+              // NOT navigations, so this doesn't touch them at all.
+              await context.route('**/*', (route) => {
+                const request = route.request();
+                if (request.isNavigationRequest()) {
+                  let reqHost = '';
+                  try { reqHost = new URL(request.url()).host; } catch (e) {}
+                  if (reqHost && baseDomain(reqHost) !== embedBaseDomain) {
+                    console.log('Blocking cross-site navigation (ad redirect):', request.url());
+                    return route.abort();
+                  }
+                }
+                return route.continue();
+              });
+
               const page = await context.newPage();
 
               // single clean navigation, no clicking anything
