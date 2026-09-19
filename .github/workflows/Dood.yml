@@ -56,17 +56,20 @@ jobs:
           // Resolves a doodstream-family share/embed link (dood.*, playmogo,
           // ds2play, d0000d, ...) to a direct, downloadable CDN URL.
           //
-          // No clicking, no ads: we replicate the two plain HTTP calls the
-          // player's own JS makes on page load to fetch its video source
-          // (the "pass_md5" handshake) -- so none of the ad scripts ever
-          // fire. But a raw Node fetch() gets blocked with 403 by this
-          // site's bot protection (it checks the real-browser network
-          // fingerprint, not just headers), so we make BOTH requests
-          // through an actual headless Chromium instance instead: one
-          // single clean page load (no interaction) to get the HTML, then
-          // the pass_md5 call through that same browser context so it
-          // carries whatever cookies/fingerprint got it past the check the
-          // first time.
+          // Key discovery (thanks to manual View Source on the /d/ page):
+          // the "Download Now" button + 5-second countdown is pure UI
+          // theater. The real /download/<hash>/o/<token> link is ALREADY
+          // sitting in the page's static HTML from the very first load,
+          // just CSS-hidden -- no click, no wait, no JS execution needed
+          // to reveal it. So:
+          //   1) load the /d/<id> "share" page, pull the /download/... href
+          //      straight out of the HTML
+          //   2) visit that /download/... page and see what it hands back
+          //      -- either it redirects/serves the actual CDN link
+          //      directly, or it's another reveal-a-link page
+          // A raw Node fetch() gets 403'd by this site's bot protection
+          // (browser-fingerprint check, not just headers), so both loads
+          // go through an actual headless Chromium instance.
 
           const fs = require('fs');
           const { chromium } = require('playwright');
@@ -80,9 +83,11 @@ jobs:
           const UA =
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-          function toEmbedUrlObj(u) {
+          // normalize to the /d/<id> "share" page -- the one whose static
+          // HTML already contains the real download link
+          function toShareUrlObj(u) {
             const parsed = new URL(u);
-            parsed.pathname = parsed.pathname.replace('/d/', '/e/').replace('/f/', '/e/');
+            parsed.pathname = parsed.pathname.replace('/e/', '/d/').replace('/f/', '/d/');
             return parsed;
           }
 
@@ -94,25 +99,30 @@ jobs:
             return parts.slice(-2).join('.');
           }
 
+          function looksLikeMediaLink(url) {
+            return (url.includes('.mp4') || url.includes('.m3u8')) && url.includes('token=');
+          }
+
           (async () => {
 
             const browser = await chromium.launch({ headless: true });
 
             let mediaUrl = null;
             let title = 'video';
-            let usedEmbedUrl = null;
+            let lastPageUrl = null;
 
             const MAX_ATTEMPTS = 3;
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
             try {
 
-              const embedUrlObj = toEmbedUrlObj(SOURCE_URL);
-              const embedUrl = embedUrlObj.toString();
-              const embedBaseDomain = baseDomain(embedUrlObj.host);
-              usedEmbedUrl = embedUrl;
+              const shareUrlObj = toShareUrlObj(SOURCE_URL);
+              const shareUrl = shareUrlObj.toString();
+              const origin = shareUrlObj.origin;
+              const siteBaseDomain = baseDomain(shareUrlObj.host);
+              lastPageUrl = shareUrl;
 
-              console.log('EMBED URL:', embedUrl);
+              console.log('SHARE URL:', shareUrl);
 
               for (let attempt = 1; attempt <= MAX_ATTEMPTS && !mediaUrl; attempt++) {
 
@@ -120,10 +130,10 @@ jobs:
 
                 const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
 
-                // hide the most obvious automation flag -- Cloudflare
-                // (and similar) explicitly check navigator.webdriver as a
-                // bot signal. This only masks that one property; it does
-                // NOT attempt to solve or click through any interactive
+                // hide the most obvious automation flag -- Cloudflare (and
+                // similar) explicitly check navigator.webdriver as a bot
+                // signal. This only masks that one property; it does NOT
+                // attempt to solve or click through any interactive
                 // challenge.
                 await context.addInitScript(() => {
                   Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -131,20 +141,21 @@ jobs:
 
                 // Block full-page navigations AWAY from this site (the ad
                 // redirects) at the network level -- same thing an ad
-                // blocker like AdGuard/uBlock does. Only the TOP-level
-                // frame is checked: an iframe on the page (like a
-                // Cloudflare Turnstile verification widget, which is
-                // legitimate and needed for the site to work, not an ad)
-                // is left alone. A request to a different domain that
-                // isn't a page navigation at all (e.g. fetching the video
-                // itself from the CDN) is untouched either way.
+                // blocker like AdGuard/uBlock does. Exceptions: only the
+                // TOP frame is checked (an iframe, e.g. a Cloudflare
+                // Turnstile widget, is left alone -- it's legitimate, not
+                // an ad); and a navigation that already looks like the
+                // final media link is let through even if it's on another
+                // domain, in case this mirror delivers it via a real
+                // browser redirect straight to the CDN.
                 await context.route('**/*', (route) => {
                   const request = route.request();
                   if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+                    const url = request.url();
                     let reqHost = '';
-                    try { reqHost = new URL(request.url()).host; } catch (e) {}
-                    if (reqHost && baseDomain(reqHost) !== embedBaseDomain) {
-                      console.log('Blocking cross-site navigation (ad redirect):', request.url());
+                    try { reqHost = new URL(url).host; } catch (e) {}
+                    if (reqHost && baseDomain(reqHost) !== siteBaseDomain && !looksLikeMediaLink(url)) {
+                      console.log('Blocking cross-site navigation (ad redirect):', url);
                       return route.abort();
                     }
                   }
@@ -167,37 +178,24 @@ jobs:
                 });
 
                 page.on('dialog', (dialog) => dialog.dismiss().catch(() => {}));
-                page.on('close', () => console.log('Main tab was closed by the page.'));
-                page.on('crash', () => console.log('Main tab crashed.'));
 
-                // Capture the actual media URL the player itself requests.
+                // Capture the actual media URL if it ever shows up as a
+                // network response, regardless of which step triggers it.
                 // It usually lives on a completely different domain (the
-                // video CDN, e.g. cloudatacdn.com) than the doodstream
-                // page itself, so we match by shape (looks like a video
-                // file with a token), not by host.
+                // video CDN, e.g. cloudatacdn.com), so we match by shape,
+                // not by host.
                 page.on('response', (response) => {
                   try {
                     const url = response.url();
-                    const looksLikeDirectLink =
-                      (url.includes('.mp4') || url.includes('.m3u8')) && url.includes('token=');
-                    if (!mediaUrl && looksLikeDirectLink) {
-                      console.log('FOUND:', url);
+                    if (!mediaUrl && looksLikeMediaLink(url)) {
+                      console.log('FOUND (network):', url);
                       mediaUrl = url;
                     }
                   } catch (e) {}
                 });
 
-                try {
-                  const resp = await page.goto(embedUrl, { waitUntil: 'networkidle', timeout: 60000 });
-                  if (resp) console.log('Loaded, status:', resp.status());
-                } catch (e) {
-                  console.log('goto warning:', e.message);
-                }
-
-                // give a non-interactive anti-bot interstitial a chance to
-                // clear on its own, same as a real browser tab sitting
-                // there
-                if (!page.isClosed()) {
+                async function waitOutInterstitial() {
+                  if (page.isClosed()) return;
                   const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
                   if (/just a moment|checking your browser|attention required/i.test(bodyText)) {
                     console.log('Anti-bot interstitial detected, waiting for it to settle...');
@@ -205,53 +203,91 @@ jobs:
                   }
                 }
 
-                // with ad redirects blocked, autoplay often fires the real
-                // request on its own within a few seconds -- give it a
-                // chance before trying anything else
-                for (let i = 0; i < 10 && !mediaUrl && !page.isClosed(); i++) {
-                  await page.waitForTimeout(1000).catch(() => {});
+                // ---- Stage 1: the /d/ share page -----------------------
+
+                try {
+                  const resp = await page.goto(shareUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                  if (resp) console.log('Loaded share page, status:', resp.status());
+                } catch (e) {
+                  console.log('goto (share page) warning:', e.message);
                 }
 
-                // if it's still gated behind a user gesture, try a play
-                // click now -- safe to do since ad redirects are blocked
-                // at the network level, so this can no longer hijack the
-                // tab
+                await waitOutInterstitial();
+
+                if (!page.isClosed()) {
+                  try { title = (await page.title()).trim() || title; } catch (e) {}
+                }
+                console.log('TITLE:', title);
+
+                let downloadPageUrl = null;
+
                 if (!mediaUrl && !page.isClosed()) {
-                  console.log('No autoplay request yet, trying a play click...');
-                  const playSelectors = [
-                    'video',
-                    '.jw-icon-display',
-                    '.vjs-big-play-button',
-                    '.plyr__control--overlaid',
-                    'button.jw-icon-playback',
-                    '#player',
-                    '.jwplayer'
-                  ];
-                  for (const sel of playSelectors) {
-                    if (mediaUrl || page.isClosed()) break;
-                    try {
-                      await page.click(sel, { timeout: 2000, force: true });
-                      console.log(`  clicked "${sel}", now at:`, page.isClosed() ? '(tab closed)' : page.url());
-                    } catch (e) {
-                      console.log(`  click "${sel}" skipped:`, e.message.split('\n')[0]);
+                  const html = await page.content().catch(() => '');
+
+                  // the real download link is plain, static HTML -- no
+                  // click or wait needed to reveal it
+                  const hrefMatch = html.match(/href="(\/download\/[^"]+)"/i);
+
+                  if (hrefMatch) {
+                    downloadPageUrl = origin + hrefMatch[1];
+                    console.log('DOWNLOAD LINK (from share page HTML):', downloadPageUrl);
+                  } else {
+                    // also check directly in case the share page itself
+                    // already embeds the final CDN link somewhere
+                    const directMatch = html.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)\?[^\s"'<>]*token=[^\s"'<>]*/i);
+                    if (directMatch) {
+                      console.log('FOUND (share page HTML):', directMatch[0]);
+                      mediaUrl = directMatch[0];
+                    } else {
+                      console.log('No /download/ link found in the share page HTML.');
                     }
-                    await page.waitForTimeout(1500).catch(() => {});
                   }
+                }
+
+                // ---- Stage 2: the /download/ page -----------------------
+
+                if (!mediaUrl && downloadPageUrl && !page.isClosed()) {
+
+                  lastPageUrl = downloadPageUrl;
+
+                  try {
+                    const resp2 = await page.goto(downloadPageUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                    if (resp2) console.log('Loaded download page, status:', resp2.status());
+                  } catch (e) {
+                    console.log('goto (download page) warning:', e.message);
+                  }
+
+                  await waitOutInterstitial();
+
+                  // give it a few seconds in case it auto-redirects/fires
+                  // the real request on its own
                   for (let i = 0; i < 8 && !mediaUrl && !page.isClosed(); i++) {
                     await page.waitForTimeout(1000).catch(() => {});
                   }
-                }
 
-                if (!page.isClosed()) {
-                  try {
-                    title = (await page.title()).trim() || title;
-                  } catch (e) {
-                    console.log('page.title() failed:', e.message);
+                  if (!mediaUrl && !page.isClosed()) {
+                    const html2 = await page.content().catch(() => '');
+
+                    const directMatch2 = html2.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)\?[^\s"'<>]*token=[^\s"'<>]*/i);
+                    if (directMatch2) {
+                      console.log('FOUND (download page HTML):', directMatch2[0]);
+                      mediaUrl = directMatch2[0];
+                    } else if (/captcha|recaptcha|hcaptcha|turnstile/i.test(html2)) {
+                      console.log('This step appears to require solving a CAPTCHA/human-check -- cannot automate past that.');
+                    } else {
+                      // last resort: click an obvious "download" button/link
+                      console.log('Trying a click on a download button as last resort...');
+                      try {
+                        await page.click('a:has-text("Download"), .btn:has-text("Download"), a[href*="download"]', { timeout: 3000, force: true });
+                      } catch (e) {
+                        console.log('  download click skipped:', e.message.split('\n')[0]);
+                      }
+                      for (let i = 0; i < 5 && !mediaUrl && !page.isClosed(); i++) {
+                        await page.waitForTimeout(1000).catch(() => {});
+                      }
+                    }
                   }
-                } else {
-                  console.log('Skipping title read: tab is closed.');
                 }
-                console.log('TITLE:', title);
 
                 if (!mediaUrl) {
                   let finalUrl = 'unknown (tab closed)';
@@ -281,7 +317,7 @@ jobs:
               // HEAD request to a CDN, not the protected page)
               const headRes = await fetch(mediaUrl, {
                 method: 'HEAD',
-                headers: { 'User-Agent': UA, Referer: usedEmbedUrl }
+                headers: { 'User-Agent': UA, Referer: lastPageUrl }
               }).catch((e) => {
                 console.log('HEAD validation request errored (continuing anyway):', e.message);
                 return null;
@@ -298,7 +334,7 @@ jobs:
 
               fs.writeFileSync(
                 'grabbed/result.json',
-                JSON.stringify({ title, url: mediaUrl, referer: usedEmbedUrl }, null, 2)
+                JSON.stringify({ title, url: mediaUrl, referer: lastPageUrl }, null, 2)
               );
               console.log('Saved grabbed/result.json');
 
