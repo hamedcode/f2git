@@ -273,19 +273,48 @@ jobs:
 
                 if (!mediaUrl && downloadPageUrl && !page.isClosed()) {
 
+                  // The real download link sits inside a div the page
+                  // keeps CSS-hidden until its 5-second countdown timer
+                  // finishes (pure UI theater -- we already have the href
+                  // from the static HTML). A hidden element has no visible
+                  // position for a real click to land on, so force it
+                  // visible first; this doesn't touch the click itself, so
+                  // it's still a genuine user-gesture click afterward.
+                  await page.evaluate(() => {
+                    const el = document.querySelector('a[href^="/download/"]');
+                    let node = el;
+                    while (node && node !== document.body) {
+                      node.style.setProperty('display', 'block', 'important');
+                      node.style.setProperty('visibility', 'visible', 'important');
+                      node.style.setProperty('opacity', '1', 'important');
+                      node = node.parentElement;
+                    }
+                  }).catch(() => {});
+
                   try {
                     const [resp2] = await Promise.all([
                       page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }).catch((e) => {
                         console.log('waitForNavigation warning:', e.message);
                         return null;
                       }),
-                      page.click('a[href^="/download/"]', { timeout: 5000, force: true })
+                      page.click('a[href^="/download/"]', { timeout: 5000 })
                     ]);
                     if (resp2) console.log('Loaded download page (via click), status:', resp2.status());
                     lastPageUrl = page.isClosed() ? downloadPageUrl : page.url();
                   } catch (e) {
                     console.log('click-through to download page failed:', e.message);
                     lastPageUrl = downloadPageUrl;
+                  }
+
+                  // some ad script may have hijacked the tab to about:blank
+                  // as a side effect of the click -- recover in place
+                  // rather than burning a whole fresh-session attempt
+                  if (!page.isClosed() && page.url() === 'about:blank') {
+                    console.log('Tab ended up on about:blank after the click, navigating back...');
+                    await page.goto(downloadPageUrl, { waitUntil: 'networkidle', timeout: 30000, referer: shareUrl }).catch((e) => {
+                      console.log('recovery goto warning:', e.message);
+                    });
+                    lastPageUrl = page.isClosed() ? downloadPageUrl : page.url();
                   }
 
                   await waitOutInterstitial();
