@@ -263,20 +263,29 @@ jobs:
                 }
 
                 // ---- Stage 2: the /download/ page -----------------------
+                //
+                // A HAR capture from a real browser showed the successful
+                // request here carries "Sec-Fetch-User: ?1" -- Chromium
+                // only sends that when the navigation came from an actual
+                // user gesture (a real click), never for a programmatic
+                // goto(). So we click the link on the page instead of
+                // navigating to the URL directly.
 
                 if (!mediaUrl && downloadPageUrl && !page.isClosed()) {
 
-                  lastPageUrl = downloadPageUrl;
-
                   try {
-                    const resp2 = await page.goto(downloadPageUrl, {
-                      waitUntil: 'networkidle',
-                      timeout: 60000,
-                      referer: shareUrl
-                    });
-                    if (resp2) console.log('Loaded download page, status:', resp2.status());
+                    const [resp2] = await Promise.all([
+                      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }).catch((e) => {
+                        console.log('waitForNavigation warning:', e.message);
+                        return null;
+                      }),
+                      page.click('a[href^="/download/"]', { timeout: 5000, force: true })
+                    ]);
+                    if (resp2) console.log('Loaded download page (via click), status:', resp2.status());
+                    lastPageUrl = page.isClosed() ? downloadPageUrl : page.url();
                   } catch (e) {
-                    console.log('goto (download page) warning:', e.message);
+                    console.log('click-through to download page failed:', e.message);
+                    lastPageUrl = downloadPageUrl;
                   }
 
                   await waitOutInterstitial();
@@ -298,6 +307,7 @@ jobs:
                       console.log('This step appears to require solving a CAPTCHA/human-check -- cannot automate past that.');
                     } else {
                       // last resort: click an obvious "download" button/link
+
                       console.log('Trying a click on a download button as last resort...');
                       try {
                         await page.click('a:has-text("Download"), .btn:has-text("Download"), a[href*="download"]', { timeout: 3000, force: true });
@@ -334,12 +344,21 @@ jobs:
                 process.exit(1);
               }
 
+              // A real browser's request to the CDN itself carries just
+              // the site's origin as Referer (e.g. "https://playmogo.com/"),
+              // not the full path of whatever page the link was clicked
+              // from -- confirmed from a real HAR capture. Using the full
+              // page URL here (what we tried before) is why validation/
+              // download kept failing even after the link itself was
+              // correct.
+              const cdnReferer = origin + '/';
+
               // sanity check it actually resolves before handing it to the
               // download step (a plain fetch is enough here, it's just a
               // HEAD request to a CDN, not the protected page)
               const headRes = await fetch(mediaUrl, {
                 method: 'HEAD',
-                headers: { 'User-Agent': UA, Referer: lastPageUrl }
+                headers: { 'User-Agent': UA, Referer: cdnReferer }
               }).catch((e) => {
                 console.log('HEAD validation request errored (continuing anyway):', e.message);
                 return null;
@@ -356,7 +375,7 @@ jobs:
 
               fs.writeFileSync(
                 'grabbed/result.json',
-                JSON.stringify({ title, url: mediaUrl, referer: lastPageUrl }, null, 2)
+                JSON.stringify({ title, url: mediaUrl, referer: cdnReferer }, null, 2)
               );
               console.log('Saved grabbed/result.json');
 
@@ -422,6 +441,10 @@ jobs:
               --console-log-level=warn \
               --user-agent="$ua" \
               --referer="$referer" \
+              --header="Sec-Fetch-Site: cross-site" \
+              --header="Sec-Fetch-Mode: navigate" \
+              --header="Sec-Fetch-Dest: document" \
+              --header="Sec-Fetch-User: ?1" \
               --dir=downloads \
               --out="${safe_title}.${ext:-mp4}" \
               "$url"
@@ -431,6 +454,10 @@ jobs:
               curl -L --retry 5 --connect-timeout 30 \
                 -A "$ua" \
                 -e "$referer" \
+                -H "Sec-Fetch-Site: cross-site" \
+                -H "Sec-Fetch-Mode: navigate" \
+                -H "Sec-Fetch-Dest: document" \
+                -H "Sec-Fetch-User: ?1" \
                 -o "downloads/${safe_title}.${ext:-mp4}" \
                 "$url"
             fi
