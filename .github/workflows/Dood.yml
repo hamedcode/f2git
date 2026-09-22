@@ -6,6 +6,7 @@ on:
       source_url:
         description: "لینک صفحه ویدیو (doodstream / playmogo / dood.* / ...)"
         required: true
+        type: string
 
       upload_mode:
         description: "Upload mode"
@@ -35,763 +36,798 @@ jobs:
 
     steps:
 
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout
         uses: actions/checkout@v4
+
+
+      # ============================================================
+      # INSTALL DEPENDENCIES
+      # ============================================================
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zip curl aria2 jq
+
+          sudo apt-get install -y \
+            ffmpeg \
+            zip \
+            curl \
+            aria2 \
+            jq
+
           npm init -y
+
           npm install playwright
+
           npx playwright install chromium --with-deps
+
+
+      # ============================================================
+      # PREPARE DIRECTORIES
+      # ============================================================
 
       - name: Prepare folders
         run: |
-          mkdir -p downloads grabbed
+          mkdir -p downloads
+          mkdir -p grabbed
 
-      # ------------------------------------------------------------
-      # Resolve Dood / Playmogo video
-      #
-      # IMPORTANT:
-      # We deliberately do NOT visit /download/ anymore.
-      #
-      # The normal player page (/e/<id>) contains:
-      #
-      #   $.get('/pass_md5/<hash>/<token>', ...)
-      #
-      # and the pass_md5 endpoint returns the CDN base URL.
-      #
-      # This avoids the Cloudflare challenge currently affecting
-      # /download/ on GitHub Actions.
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # CREATE DIAGNOSTIC DOOD RESOLVER
+      # ============================================================
 
       - name: Create resolver script
         run: |
           cat > dood_dl.js << 'EOF'
 
           const fs = require('fs');
-          const crypto = require('crypto');
           const { chromium } = require('playwright');
 
           const SOURCE_URL = process.argv[2];
 
           if (!SOURCE_URL) {
-            console.error('No source URL given');
+            console.error('Usage: node dood_dl.js "<url>"');
             process.exit(1);
           }
 
-          /*
-           * Keep this close to a normal current Chrome UA.
-           * Do not use navigator.webdriver spoofing here.
-           */
           const UA =
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-            '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+            'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+            'Chrome/140.0.0.0 Safari/537.36';
 
           const sleep = ms =>
             new Promise(resolve => setTimeout(resolve, ms));
 
+          fs.mkdirSync('grabbed', { recursive: true });
 
-          // ----------------------------------------------------------
-          // Helpers
-          // ----------------------------------------------------------
 
-          function normalizeInput(urlString) {
-            const u = new URL(urlString);
+          // ==========================================================
+          // NORMALIZE URL
+          // ==========================================================
 
-            /*
-             * /d/<id> -> /e/<id>
-             *
-             * Dood/Playmogo player pages use /e/ while share pages
-             * normally use /d/.
-             */
-            if (
-              u.pathname.startsWith('/d/') ||
-              u.pathname.startsWith('/f/')
-            ) {
-              u.pathname = u.pathname.replace(/^\/(d|f)\//, '/e/');
+          function normalizePlayerUrl(input) {
+
+            const u = new URL(input);
+
+            if (u.pathname.startsWith('/d/')) {
+              u.pathname =
+                u.pathname.replace(/^\/d\//, '/e/');
             }
 
-            return u;
+            return u.toString();
           }
 
 
-          function randomString(length = 10) {
-            const chars =
-              'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+          // ==========================================================
+          // SANITIZE TITLE
+          // ==========================================================
 
-            let out = '';
+          function sanitizeTitle(s) {
 
-            for (let i = 0; i < length; i++) {
-              out += chars[Math.floor(Math.random() * chars.length)];
-            }
-
-            return out;
-          }
-
-
-          function looksLikeMedia(url) {
-            return (
-              /\.mp4(?:\?|$)/i.test(url) ||
-              /\.m3u8(?:\?|$)/i.test(url)
-            );
-          }
-
-
-          function looksLikeDoodCdn(url) {
-            try {
-              const u = new URL(url);
-
-              return (
-                /\.cloudatacdn\.com$/i.test(u.hostname) &&
-                looksLikeMedia(url)
-              );
-            } catch {
-              return false;
-            }
-          }
-
-
-          function extractTitle(html) {
-            const m = html.match(
-              /<title[^>]*>([\s\S]*?)<\/title>/i
-            );
-
-            if (!m) return 'video';
-
-            return m[1]
+            return (s || 'video')
+              .replace(/<[^>]+>/g, '')
               .replace(/&amp;/g, '&')
               .replace(/&quot;/g, '"')
               .replace(/&#39;/g, "'")
-              .replace(/<[^>]+>/g, '')
-              .trim() || 'video';
+              .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 120) || 'video';
           }
 
 
-          function extractPassMd5(html) {
-            /*
-             * Current Dood player pattern:
-             *
-             * $.get('/pass_md5/HASH/TOKEN', function(data) {
-             *
-             */
+          // ==========================================================
+          // INTERESTING NETWORK REQUEST
+          // ==========================================================
 
-            const patterns = [
-              /['"](?:https?:\/\/[^'"]+)?\/pass_md5\/([^'"]+)['"]/i,
-
-              /['"]\/pass_md5\/([^'"]+)['"]/i,
-
-              /\/pass_md5\/([A-Za-z0-9._~\-\/]+)[\s'"]/i
-            ];
-
-            for (const re of patterns) {
-              const m = html.match(re);
-
-              if (m && m[1]) {
-                return m[1];
-              }
-            }
-
-            return null;
-          }
-
-
-          function buildPassMd5Url(origin, passPath) {
-            return new URL(
-              '/pass_md5/' + passPath,
-              origin
-            ).toString();
-          }
-
-
-          function buildCandidateFromPassMd5(baseUrl, token) {
-            /*
-             * Classic Dood CDN mechanism:
-             *
-             * pass_md5 response + random 10 chars +
-             * ?token=<token>&expiry=<timestamp>
-             *
-             * The actual browser network request is preferred if the
-             * player generates a nicer/filename-based CDN URL.
-             */
-
-            const randomPart = randomString(10);
+          function isInteresting(url) {
 
             return (
-              baseUrl +
-              randomPart +
-              '?token=' +
-              encodeURIComponent(token) +
-              '&expiry=' +
-              Date.now()
+              /pass_md5/i.test(url) ||
+              /cloudatacdn/i.test(url) ||
+              /\.mp4(?:\?|$)/i.test(url) ||
+              /\.m3u8(?:\?|$)/i.test(url) ||
+              /\/cptr\//i.test(url) ||
+              /\/api\//i.test(url)
             );
           }
 
 
-          function extractTokenFromPassPath(passPath) {
-            const parts = passPath.split('/');
-
-            return parts[parts.length - 1] || null;
-          }
-
-
-          function sanitizeTitle(title) {
-            let s = title
-              .replace(/[^a-zA-Z0-9 ._-]/g, '_')
-              .replace(/[_ ]+/g, '_')
-              .replace(/^_+|_+$/g, '')
-              .trim();
-
-            if (!s) s = 'video';
-
-            return s.slice(0, 100);
-          }
-
-
-          async function fetchPassMd5(page, passUrl, playerUrl) {
-
-            console.log('PASS_MD5 URL:', passUrl);
-
-            const result = await page.evaluate(
-              async ({ passUrl, playerUrl }) => {
-
-                try {
-
-                  const response = await fetch(passUrl, {
-                    method: 'GET',
-                    credentials: 'include',
-                    headers: {
-                      'X-Requested-With': 'XMLHttpRequest',
-                      'Accept': '*/*'
-                    },
-                    referrer: playerUrl
-                  });
-
-                  const text = await response.text();
-
-                  return {
-                    status: response.status,
-                    ok: response.ok,
-                    text
-                  };
-
-                } catch (e) {
-
-                  return {
-                    status: 0,
-                    ok: false,
-                    text: '',
-                    error: String(e)
-                  };
-
-                }
-
-              },
-              {
-                passUrl,
-                playerUrl
-              }
-            );
-
-            console.log(
-              'PASS_MD5 status:',
-              result.status
-            );
-
-            if (!result.ok) {
-              console.log(
-                'PASS_MD5 error:',
-                result.error || result.text.slice(0, 300)
-              );
-
-              return null;
-            }
-
-            const cdnBase = result.text.trim();
-
-            if (
-              !cdnBase.startsWith('http://') &&
-              !cdnBase.startsWith('https://')
-            ) {
-              console.log(
-                'PASS_MD5 returned unexpected data:',
-                cdnBase.slice(0, 500)
-              );
-
-              return null;
-            }
-
-            console.log(
-              'PASS_MD5 CDN base:',
-              cdnBase
-            );
-
-            return cdnBase;
-          }
-
-
-          async function validateMediaUrl(url, referer) {
-
-            console.log('Validating media URL...');
-
-            try {
-
-              const result = await fetch(url, {
-                method: 'GET',
-
-                headers: {
-                  'User-Agent': UA,
-                  'Referer': referer,
-                  'Range': 'bytes=0-1023',
-                  'Accept': '*/*'
-                },
-
-                redirect: 'follow'
-              });
-
-              console.log(
-                'Media validation status:',
-                result.status
-              );
-
-              const contentType =
-                result.headers.get('content-type') || '';
-
-              const contentLength =
-                result.headers.get('content-length') || '';
-
-              console.log(
-                'Media content-type:',
-                contentType
-              );
-
-              console.log(
-                'Media content-length:',
-                contentLength || '(not provided)'
-              );
-
-              /*
-               * 206 is ideal for a range request.
-               * 200 is also acceptable.
-               */
-              if (
-                result.status === 200 ||
-                result.status === 206
-              ) {
-                return true;
-              }
-
-              return false;
-
-            } catch (e) {
-
-              console.log(
-                'Media validation failed:',
-                e.message
-              );
-
-              return false;
-            }
-          }
-
-
-          // ----------------------------------------------------------
-          // Main
-          // ----------------------------------------------------------
+          // ==========================================================
+          // MAIN
+          // ==========================================================
 
           (async () => {
 
-            let browser = null;
+            let browser;
 
             try {
 
-              const playerUrlObj =
-                normalizeInput(SOURCE_URL);
-
               const playerUrl =
-                playerUrlObj.toString();
+                normalizePlayerUrl(SOURCE_URL);
 
-              const origin =
-                playerUrlObj.origin;
+              const player =
+                new URL(playerUrl);
 
-              console.log('SOURCE URL:', SOURCE_URL);
-              console.log('PLAYER URL:', playerUrl);
+              console.log(
+                'SOURCE URL:',
+                SOURCE_URL
+              );
+
+              console.log(
+                'PLAYER URL:',
+                playerUrl
+              );
 
 
-              browser = await chromium.launch({
-                headless: true
-              });
+              // ======================================================
+              // LAUNCH BROWSER
+              // ======================================================
 
-
-              /*
-               * One persistent context is intentional.
-               *
-               * If Cloudflare gives us a normal clearance while
-               * loading the player page, we keep the exact same
-               * cookies/session for pass_md5.
-               */
-              const context =
-                await browser.newContext({
-                  userAgent: UA,
-                  locale: 'en-US',
-                  timezoneId: 'UTC',
-                  viewport: {
-                    width: 1366,
-                    height: 768
-                  }
+              browser =
+                await chromium.launch({
+                  headless: true
                 });
 
 
-              /*
-               * Do NOT spoof navigator.webdriver.
-               *
-               * The goal here is to use a normal browser session,
-               * not to implement a Cloudflare bypass.
-               */
+              const context =
+                await browser.newContext({
+
+                  userAgent: UA,
+
+                  locale: 'en-US',
+
+                  timezoneId: 'UTC',
+
+                  viewport: {
+                    width: 1366,
+                    height: 768
+                  },
+
+                  javaScriptEnabled: true
+
+                });
 
 
               const page =
                 await context.newPage();
 
 
-              let networkMediaUrl = null;
-              let passMd5Response = null;
+              // ======================================================
+              // STORAGE
+              // ======================================================
+
+              const requests = [];
+              const responses = [];
+              const scripts = [];
+
+              let finalMediaUrl = null;
+              let passMd5Url = null;
+              let passMd5Body = null;
 
 
-              /*
-               * Watch requests/responses generated by the real player.
-               *
-               * If the player itself creates the final CDN URL,
-               * this is the best source because it gives us exactly
-               * what the site generated.
-               */
+              // ======================================================
+              // REQUEST LOGGER
+              // ======================================================
 
               page.on('request', request => {
 
-                const url = request.url();
+                const url =
+                  request.url();
 
-                if (
-                  !networkMediaUrl &&
-                  looksLikeDoodCdn(url)
-                ) {
+                const item = {
+
+                  type: 'request',
+
+                  method:
+                    request.method(),
+
+                  url,
+
+                  resourceType:
+                    request.resourceType(),
+
+                  headers:
+                    request.headers()
+
+                };
+
+                requests.push(item);
+
+
+                if (isInteresting(url)) {
 
                   console.log(
-                    'FOUND CDN MEDIA REQUEST:',
+                    '\n>>> INTERESTING REQUEST'
+                  );
+
+                  console.log(
+                    request.method(),
                     url
                   );
 
-                  networkMediaUrl = url;
+                  console.log(
+                    'TYPE:',
+                    request.resourceType()
+                  );
+
+                }
+
+
+                if (/pass_md5/i.test(url)) {
+
+                  passMd5Url = url;
+
+                  console.log(
+                    '>>> PASS_MD5 REQUEST FOUND:',
+                    url
+                  );
+
+                }
+
+
+                if (
+                  /cloudatacdn/i.test(url) &&
+                  (
+                    /\.mp4/i.test(url) ||
+                    /token=/i.test(url)
+                  )
+                ) {
+
+                  finalMediaUrl = url;
+
+                  console.log(
+                    '>>> CDN MEDIA REQUEST FOUND:',
+                    url
+                  );
+
                 }
 
               });
 
 
+              // ======================================================
+              // RESPONSE LOGGER
+              // ======================================================
+
               page.on('response', async response => {
 
-                const url = response.url();
+                const url =
+                  response.url();
 
-                if (
-                  !passMd5Response &&
-                  /\/pass_md5\//i.test(url)
-                ) {
+                const item = {
+
+                  type: 'response',
+
+                  status:
+                    response.status(),
+
+                  url,
+
+                  resourceType:
+                    response.request()
+                      .resourceType()
+
+                };
+
+                responses.push(item);
+
+
+                if (isInteresting(url)) {
+
+                  console.log(
+                    '\n<<< INTERESTING RESPONSE'
+                  );
+
+                  console.log(
+                    response.status(),
+                    url
+                  );
+
+                }
+
+
+                if (/pass_md5/i.test(url)) {
 
                   try {
 
                     const text =
                       await response.text();
 
-                    if (
-                      response.ok() &&
-                      /^https?:\/\//i.test(text.trim())
-                    ) {
+                    passMd5Body =
+                      text;
 
-                      passMd5Response =
-                        text.trim();
+                    console.log(
+                      '>>> PASS_MD5 RESPONSE BODY:'
+                    );
 
-                      console.log(
-                        'CAPTURED PASS_MD5 RESPONSE:',
-                        passMd5Response
-                      );
-                    }
+                    console.log(
+                      text.slice(0, 2000)
+                    );
 
-                  } catch {}
+                  } catch (e) {
+
+                    console.log(
+                      'Could not read pass_md5 response:',
+                      e.message
+                    );
+
+                  }
+
+                }
+
+
+                if (
+                  /cloudatacdn/i.test(url) &&
+                  (
+                    /\.mp4/i.test(url) ||
+                    /token=/i.test(url)
+                  )
+                ) {
+
+                  finalMediaUrl =
+                    url;
+
                 }
 
               });
 
 
-              console.log(
-                '\nLoading player page...'
-              );
+              // ======================================================
+              // PAGE CONSOLE
+              // ======================================================
 
+              page.on('console', msg => {
+
+                console.log(
+                  `[PAGE CONSOLE ${msg.type()}] ${msg.text()}`
+                );
+
+              });
+
+
+              page.on('pageerror', error => {
+
+                console.log(
+                  '[PAGE ERROR]',
+                  error.message
+                );
+
+              });
+
+
+              page.on('requestfailed', request => {
+
+                console.log(
+                  '[REQUEST FAILED]',
+                  request.method(),
+                  request.url(),
+                  request.failure()?.errorText || ''
+                );
+
+              });
+
+
+              // ======================================================
+              // LOAD PLAYER
+              // ======================================================
+
+              console.log(
+                '\n=== Loading player ==='
+              );
 
               const response =
                 await page.goto(
                   playerUrl,
                   {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 60000
+                    waitUntil:
+                      'domcontentloaded',
+
+                    timeout:
+                      60000
                   }
                 );
 
 
-              if (response) {
+              console.log(
+                'PLAYER STATUS:',
+                response
+                  ? response.status()
+                  : 'unknown'
+              );
 
-                console.log(
-                  'Player page status:',
-                  response.status()
-                );
-
-              }
+              console.log(
+                'CURRENT URL:',
+                page.url()
+              );
 
 
-              /*
-               * Give the page enough time to execute the player
-               * JavaScript and issue /pass_md5.
-               *
-               * We intentionally do NOT use networkidle because
-               * these pages contain ads/analytics that can keep
-               * the network busy indefinitely.
-               */
+              // ======================================================
+              // WAIT FOR PLAYER INITIALIZATION
+              // ======================================================
 
-              await page.waitForTimeout(5000);
+              console.log(
+                '\n=== Waiting for player initialization ==='
+              );
 
+              await page.waitForTimeout(3000);
+
+
+              // ======================================================
+              // SAVE HTML
+              // ======================================================
 
               const html =
                 await page.content();
 
-
-              const title =
-                extractTitle(html);
-
-
-              console.log(
-                'TITLE:',
-                title
-              );
-
-
-              /*
-               * First check whether the real player already produced
-               * the final CDN URL.
-               */
-
-              if (networkMediaUrl) {
-
-                console.log(
-                  '\nUsing CDN URL captured from player.'
-                );
-
-              }
-
-
-              /*
-               * If the player request was not captured, extract the
-               * pass_md5 endpoint directly from the player HTML.
-               */
-
-              let passPath =
-                extractPassMd5(html);
-
-
-              if (!passPath) {
-
-                console.log(
-                  'Could not find /pass_md5/ in player HTML.'
-                );
-
-              } else {
-
-                console.log(
-                  'PASS_MD5 path:',
-                  passPath
-                );
-
-              }
-
-
-              /*
-               * Call pass_md5 ourselves if the browser did not
-               * already do it.
-               */
-
-              let cdnBase =
-                passMd5Response;
-
-
-              if (
-                !cdnBase &&
-                passPath
-              ) {
-
-                const passUrl =
-                  buildPassMd5Url(
-                    origin,
-                    passPath
-                  );
-
-                cdnBase =
-                  await fetchPassMd5(
-                    page,
-                    passUrl,
-                    playerUrl
-                  );
-
-              }
-
-
-              /*
-               * The player-generated network URL is preferred.
-               *
-               * If it wasn't observed, create the classic Dood
-               * candidate from pass_md5.
-               */
-
-              let mediaUrl =
-                networkMediaUrl;
-
-
-              if (!mediaUrl && cdnBase) {
-
-                const token =
-                  extractTokenFromPassPath(
-                    passPath || ''
-                  );
-
-                if (token) {
-
-                  const candidate =
-                    buildCandidateFromPassMd5(
-                      cdnBase,
-                      token
-                    );
-
-                  console.log(
-                    '\nGenerated CDN candidate:',
-                    candidate
-                  );
-
-                  /*
-                   * Store it for the download step.
-                   * We don't require HEAD here because some CDNs
-                   * reject HEAD even though GET works.
-                   */
-
-                  mediaUrl = candidate;
-                }
-              }
-
-
-              /*
-               * Wait a little longer for the actual player request.
-               *
-               * This is especially useful if Turnstile/FingerprintJS
-               * delays the player initialization.
-               */
-
-              if (!networkMediaUrl) {
-
-                console.log(
-                  '\nWaiting for player-generated CDN URL...'
-                );
-
-                for (
-                  let i = 0;
-                  i < 10 && !networkMediaUrl;
-                  i++
-                ) {
-
-                  await sleep(1000);
-                }
-
-                if (networkMediaUrl) {
-                  mediaUrl =
-                    networkMediaUrl;
-                }
-
-              }
-
-
-              if (!mediaUrl) {
-
-                console.error(
-                  '\nCould not obtain a CDN media URL.'
-                );
-
-                console.error(
-                  'The player page may now require an additional human verification step.'
-                );
-
-                console.error(
-                  'Player URL:',
-                  playerUrl
-                );
-
-                /*
-                 * Save a diagnostic snapshot to help with the next
-                 * iteration without exposing cookies.
-                 */
-
-                try {
-                  fs.writeFileSync(
-                    'grabbed/player.html',
-                    html
-                  );
-                } catch {}
-
-                process.exit(1);
-              }
-
-
-              /*
-               * The HAR shows that the CDN request uses the site
-               * origin as Referer:
-               *
-               *     https://playmogo.com/
-               *
-               * not the /e/... URL.
-               */
-
-              const cdnReferer =
-                origin + '/';
-
-
-              console.log(
-                '\nFINAL MEDIA URL:'
+              fs.writeFileSync(
+                'grabbed/player.html',
+                html
               );
 
               console.log(
-                mediaUrl
-              );
-
-              console.log(
-                'REFERER:',
-                cdnReferer
+                'Saved grabbed/player.html'
               );
 
 
-              /*
-               * Lightweight validation.
-               *
-               * Do not fail merely because validation is unavailable;
-               * the actual downloader below is the final authority.
-               */
+              // ======================================================
+              // EXTRACT SCRIPT INFORMATION
+              // ======================================================
 
-              await validateMediaUrl(
-                mediaUrl,
-                cdnReferer
-              );
+              const scriptData =
+                await page.evaluate(() => {
+
+                  return Array.from(
+                    document.scripts
+                  ).map((s, i) => ({
+
+                    index: i,
+
+                    src:
+                      s.src || null,
+
+                    inline:
+                      s.src
+                        ? false
+                        : true,
+
+                    text:
+                      s.src
+                        ? ''
+                        : s.textContent
+
+                  }));
+
+                });
 
 
               fs.writeFileSync(
-                'grabbed/result.json',
+                'grabbed/scripts.json',
+                JSON.stringify(
+                  scriptData,
+                  null,
+                  2
+                )
+              );
+
+
+              console.log(
+                'Scripts found:',
+                scriptData.length
+              );
+
+
+              for (const s of scriptData) {
+
+                console.log(
+                  `SCRIPT ${s.index}:`,
+                  s.src || '(inline)'
+                );
+
+              }
+
+
+              // ======================================================
+              // STATIC PATTERN SCAN
+              // ======================================================
+
+              console.log(
+                '\n=== Static pattern scan ==='
+              );
+
+              const patterns = [
+
+                /\/pass_md5[^'"`\s<)]*/gi,
+
+                /pass_md5/gi,
+
+                /cloudatacdn/gi,
+
+                /token\s*[:=]/gi,
+
+                /expiry\s*[:=]/gi,
+
+                /m3u8/gi,
+
+                /\.mp4/gi,
+
+                /cptr/gi
+
+              ];
+
+
+              for (const re of patterns) {
+
+                const matches =
+                  html.match(re);
+
+                console.log(
+                  re.toString(),
+                  ':',
+                  matches
+                    ? matches.length
+                    : 0
+                );
+
+              }
+
+
+              // ======================================================
+              // SEARCH INLINE JS
+              // ======================================================
+
+              console.log(
+                '\n=== Searching JavaScript sources ==='
+              );
+
+
+              for (const s of scriptData) {
+
+                if (!s.inline)
+                  continue;
+
+                const text =
+                  s.text || '';
+
+                if (
+                  /pass_md5|cloudatacdn|m3u8|\.mp4|expiry|token/i
+                    .test(text)
+                ) {
+
+                  console.log(
+                    `FOUND interesting inline script ${s.index}`
+                  );
+
+                  const idx =
+                    text.search(
+                      /pass_md5|cloudatacdn|m3u8|\.mp4|expiry|token/i
+                    );
+
+                  console.log(
+                    text.slice(
+                      Math.max(0, idx - 500),
+                      idx + 2500
+                    )
+                  );
+
+                }
+
+              }
+
+
+              // ======================================================
+              // EXTENDED NETWORK OBSERVATION
+              // ======================================================
+
+              console.log(
+                '\n=== Extended network observation ==='
+              );
+
+
+              for (
+                let i = 1;
+                i <= 20;
+                i++
+              ) {
+
+                await sleep(1000);
+
+                console.log(
+                  `Network observation ${i}/20`
+                );
+
+
+                if (finalMediaUrl) {
+
+                  console.log(
+                    'Media URL already found.'
+                  );
+
+                  break;
+
+                }
+
+              }
+
+
+              // ======================================================
+              // TRY NORMAL PLAYER INTERACTION
+              // ======================================================
+
+              if (!finalMediaUrl) {
+
+                console.log(
+                  '\n=== Trying normal player interaction ==='
+                );
+
+
+                const selectors = [
+
+                  'video',
+
+                  '.jwplayer',
+
+                  '.plyr',
+
+                  '.vjs-tech',
+
+                  '[class*="play"]',
+
+                  '[id*="play"]'
+
+                ];
+
+
+                for (
+                  const selector
+                  of selectors
+                ) {
+
+                  try {
+
+                    const count =
+                      await page
+                        .locator(selector)
+                        .count();
+
+
+                    console.log(
+                      selector,
+                      'count =',
+                      count
+                    );
+
+
+                    if (count > 0) {
+
+                      await page
+                        .locator(selector)
+                        .first()
+                        .click({
+                          timeout: 2000,
+                          force: true
+                        })
+                        .catch(() => {});
+
+
+                      await sleep(3000);
+
+                    }
+
+                  } catch {}
+
+                }
+
+              }
+
+
+              // ======================================================
+              // MEDIA ELEMENTS
+              // ======================================================
+
+              const mediaInfo =
+                await page.evaluate(() => {
+
+                  return {
+
+                    videos:
+                      Array.from(
+                        document.querySelectorAll(
+                          'video'
+                        )
+                      ).map(v => ({
+
+                        src:
+                          v.src || null,
+
+                        currentSrc:
+                          v.currentSrc || null,
+
+                        poster:
+                          v.poster || null
+
+                      })),
+
+                    sources:
+                      Array.from(
+                        document.querySelectorAll(
+                          'source'
+                        )
+                      ).map(s => ({
+
+                        src:
+                          s.src || null,
+
+                        type:
+                          s.type || null
+
+                      }))
+
+                  };
+
+                });
+
+
+              console.log(
+                '\n=== MEDIA ELEMENTS ==='
+              );
+
+              console.log(
+                JSON.stringify(
+                  mediaInfo,
+                  null,
+                  2
+                )
+              );
+
+
+              // ======================================================
+              // SAVE NETWORK DIAGNOSTICS
+              // ======================================================
+
+              fs.writeFileSync(
+                'grabbed/network.json',
                 JSON.stringify(
                   {
-                    title,
-                    url: mediaUrl,
-                    referer: cdnReferer,
-                    player_url: playerUrl
+
+                    playerUrl,
+
+                    finalMediaUrl,
+
+                    passMd5Url,
+
+                    passMd5Body,
+
+                    requests,
+
+                    responses,
+
+                    mediaInfo
+
                   },
                   null,
                   2
@@ -800,26 +836,114 @@ jobs:
 
 
               console.log(
-                '\nSaved grabbed/result.json'
+                '\nSaved grabbed/network.json'
               );
+
+
+              // ======================================================
+              // RESULT
+              // ======================================================
+
+              if (finalMediaUrl) {
+
+                console.log(
+                  '\n========================================'
+                );
+
+                console.log(
+                  'SUCCESS: CDN MEDIA URL FOUND'
+                );
+
+                console.log(
+                  '========================================'
+                );
+
+                console.log(
+                  finalMediaUrl
+                );
+
+
+                const title =
+                  await page.title();
+
+
+                fs.writeFileSync(
+                  'grabbed/result.json',
+                  JSON.stringify(
+                    {
+
+                      title:
+                        sanitizeTitle(title),
+
+                      url:
+                        finalMediaUrl,
+
+                      referer:
+                        player.origin + '/',
+
+                      player_url:
+                        playerUrl
+
+                    },
+                    null,
+                    2
+                  )
+                );
+
+
+                console.log(
+                  'Saved grabbed/result.json'
+                );
+
+
+              } else {
+
+                console.log(
+                  '\n========================================'
+                );
+
+                console.log(
+                  'NO MEDIA URL FOUND'
+                );
+
+                console.log(
+                  '========================================'
+                );
+
+                console.log(
+                  'Diagnostics saved under grabbed/'
+                );
+
+
+                process.exitCode = 1;
+
+              }
 
 
               await context.close();
 
-            } catch (e) {
+
+            } catch (error) {
 
               console.error(
-                'Resolver error:',
-                e.stack || e.message
+                '\nFATAL ERROR'
               );
 
-              process.exit(1);
+              console.error(
+                error.stack ||
+                error.message
+              );
+
+              process.exitCode = 1;
 
             } finally {
 
               if (browser) {
-                await browser.close()
+
+                await browser
+                  .close()
                   .catch(() => {});
+
               }
 
             }
@@ -828,31 +952,67 @@ jobs:
 
           EOF
 
-      # ------------------------------------------------------------
-      # Run resolver
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # RUN RESOLVER
+      # ============================================================
 
       - name: Run resolver
+        id: resolver
+        continue-on-error: true
         run: |
           node dood_dl.js "${{ github.event.inputs.source_url }}"
 
-      # ------------------------------------------------------------
-      # Download actual media
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # UPLOAD DIAGNOSTICS
+      # ============================================================
+
+      - name: Upload Dood diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dood-diagnostics-${{ github.run_number }}
+          path: grabbed/
+          if-no-files-found: warn
+          retention-days: 7
+
+
+      # ============================================================
+      # STOP IF RESOLVER FAILED
+      # ============================================================
+
+      - name: Stop if resolver failed
+        if: steps.resolver.outcome != 'success'
+        run: |
+          echo "Dood resolver failed."
+          echo "Diagnostic files were uploaded as an artifact."
+          exit 1
+
+
+      # ============================================================
+      # DOWNLOAD VIDEO
+      # ============================================================
 
       - name: Download video
+        if: steps.resolver.outcome == 'success'
         run: |
 
           if [ ! -f grabbed/result.json ]; then
-            echo "No result from resolver step"
+            echo "No result.json found."
             exit 1
           fi
 
+
           title=$(jq -r '.title' grabbed/result.json)
+
           url=$(jq -r '.url' grabbed/result.json)
+
           referer=$(jq -r '.referer' grabbed/result.json)
 
+
           ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+
 
           safe_title=$(echo "$title" \
             | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
@@ -860,12 +1020,18 @@ jobs:
             | sed 's/^_//;s/_$//' \
             | cut -c1-80)
 
-          [ -z "$safe_title" ] && safe_title="video"
+
+          if [ -z "$safe_title" ]; then
+            safe_title="video"
+          fi
+
 
           echo "TITLE:   $safe_title"
           echo "REFERER: $referer"
 
+
           clean_url=$(echo "$url" | cut -d'?' -f1)
+
 
           ext=$(echo "$clean_url" \
             | grep -oEi '\.(mp4|m3u8)' \
@@ -873,16 +1039,20 @@ jobs:
             | tr '[:upper:]' '[:lower:]' \
             | tr -d '.')
 
-          [ -z "$ext" ] && ext="mp4"
+
+          if [ -z "$ext" ]; then
+            ext="mp4"
+          fi
 
 
-          # ----------------------------------------------------------
+          # ==========================================================
           # M3U8
-          # ----------------------------------------------------------
+          # ==========================================================
 
           if [[ "$ext" == "m3u8" ]]; then
 
             echo "[FFMPEG] downloading m3u8"
+
 
             ffmpeg -y \
               -user_agent "$ua" \
@@ -891,18 +1061,18 @@ jobs:
               -c copy \
               "downloads/${safe_title}.mp4"
 
+
           else
 
-            # --------------------------------------------------------
+            # ========================================================
             # MP4
-            #
-            # aria2 is preferred because the video CDN generally
-            # supports ranged downloads.
-            # --------------------------------------------------------
+            # ========================================================
 
             echo "[ARIA2] trying download..."
 
+
             set +e
+
 
             aria2c \
               -x 8 \
@@ -918,7 +1088,9 @@ jobs:
               --out="${safe_title}.mp4" \
               "$url"
 
+
             aria_status=$?
+
 
             set -e
 
@@ -926,6 +1098,7 @@ jobs:
             if [ "$aria_status" -ne 0 ]; then
 
               echo "[CURL FALLBACK] aria2 failed"
+
 
               curl -L \
                 --fail \
@@ -943,6 +1116,10 @@ jobs:
           fi
 
 
+          # ==========================================================
+          # CHECK DOWNLOAD
+          # ==========================================================
+
           echo ""
           echo "=== downloads/ ==="
 
@@ -950,21 +1127,21 @@ jobs:
 
 
           if [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+
             echo "Download failed: downloads/ is empty"
             exit 1
+
           fi
 
-
-          # ----------------------------------------------------------
-          # Basic sanity check
-          # ----------------------------------------------------------
 
           for f in downloads/*; do
 
             size=$(stat -c%s "$f" 2>/dev/null || echo 0)
 
+            echo ""
             echo "Downloaded: $f"
             echo "Size: $size bytes"
+
 
             if [ "$size" -lt 200000 ]; then
 
@@ -972,8 +1149,14 @@ jobs:
               echo "Downloaded file looks too small."
               echo "It may be an error page instead of the video."
 
+
               file "$f" || true
-              head -c 500 "$f" 2>/dev/null || true
+
+
+              head -c 500 "$f" \
+                2>/dev/null || true
+
+
               echo ""
 
               exit 1
@@ -983,14 +1166,16 @@ jobs:
           done
 
 
-      # ------------------------------------------------------------
-      # Create ZIP
-      # ------------------------------------------------------------
+      # ============================================================
+      # CREATE ZIP
+      # ============================================================
 
       - name: Create ZIP
-        if: github.event.inputs.upload_mode == 'zip'
+        if: steps.resolver.outcome == 'success' && github.event.inputs.upload_mode == 'zip'
         run: |
+
           ts=$(date +"%Y%m%d_%H%M%S")
+
 
           zip -r \
             -P "${{ secrets.ZIP_PASSWORD }}" \
@@ -998,29 +1183,32 @@ jobs:
             downloads/
 
 
-      # ------------------------------------------------------------
-      # Delete old releases
-      # ------------------------------------------------------------
+      # ============================================================
+      # DELETE OLD RELEASES
+      # ============================================================
 
       - name: Delete old releases
-        if: github.event.inputs.delete_old_releases == 'yes'
+        if: steps.resolver.outcome == 'success' && github.event.inputs.delete_old_releases == 'yes'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
 
           releases=$(gh release list --limit 100 | awk '{print $1}')
 
+
           for tag in $releases; do
+
             gh release delete "$tag" -y || true
+
           done
 
 
-      # ------------------------------------------------------------
-      # Upload ZIP Release
-      # ------------------------------------------------------------
+      # ============================================================
+      # UPLOAD ZIP RELEASE
+      # ============================================================
 
       - name: Upload ZIP Release
-        if: github.event.inputs.upload_mode == 'zip'
+        if: steps.resolver.outcome == 'success' && github.event.inputs.upload_mode == 'zip'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dood-${{ github.run_number }}
@@ -1029,12 +1217,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 
-      # ------------------------------------------------------------
-      # Upload Direct Video Release
-      # ------------------------------------------------------------
+      # ============================================================
+      # UPLOAD DIRECT VIDEO RELEASE
+      # ============================================================
 
       - name: Upload Direct Video Release
-        if: github.event.inputs.upload_mode == 'direct'
+        if: steps.resolver.outcome == 'success' && github.event.inputs.upload_mode == 'direct'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dood-${{ github.run_number }}
