@@ -41,406 +41,804 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zip curl aria2 jq gh
+          sudo apt-get install -y ffmpeg zip curl aria2 jq
           npm init -y
           npm install playwright
           npx playwright install chromium --with-deps
 
       - name: Prepare folders
-        run: mkdir -p downloads grabbed
+        run: |
+          mkdir -p downloads grabbed
+
+      # ------------------------------------------------------------
+      # Resolve Dood / Playmogo video
+      #
+      # IMPORTANT:
+      # We deliberately do NOT visit /download/ anymore.
+      #
+      # The normal player page (/e/<id>) contains:
+      #
+      #   $.get('/pass_md5/<hash>/<token>', ...)
+      #
+      # and the pass_md5 endpoint returns the CDN base URL.
+      #
+      # This avoids the Cloudflare challenge currently affecting
+      # /download/ on GitHub Actions.
+      # ------------------------------------------------------------
 
       - name: Create resolver script
         run: |
           cat > dood_dl.js << 'EOF'
 
-          // Resolves a doodstream-family share/embed link (dood.*, playmogo,
-          // ds2play, d0000d, ...) to a direct, downloadable CDN URL.
-          //
-          // Key discovery (thanks to manual View Source on the /d/ page):
-          // the "Download Now" button + 5-second countdown is pure UI
-          // theater. The real /download/<hash>/o/<token> link is ALREADY
-          // sitting in the page's static HTML from the very first load,
-          // just CSS-hidden -- no click, no wait, no JS execution needed
-          // to reveal it. So:
-          //   1) load the /d/<id> "share" page, pull the /download/... href
-          //      straight out of the HTML
-          //   2) visit that /download/... page and see what it hands back
-          //      -- either it redirects/serves the actual CDN link
-          //      directly, or it's another reveal-a-link page
-          // A raw Node fetch() gets 403'd by this site's bot protection
-          // (browser-fingerprint check, not just headers), so both loads
-          // go through an actual headless Chromium instance.
-
           const fs = require('fs');
+          const crypto = require('crypto');
           const { chromium } = require('playwright');
 
           const SOURCE_URL = process.argv[2];
+
           if (!SOURCE_URL) {
             console.error('No source URL given');
             process.exit(1);
           }
 
+          /*
+           * Keep this close to a normal current Chrome UA.
+           * Do not use navigator.webdriver spoofing here.
+           */
           const UA =
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
-          // normalize to the /d/<id> "share" page -- the one whose static
-          // HTML already contains the real download link
-          function toShareUrlObj(u) {
-            const parsed = new URL(u);
-            parsed.pathname = parsed.pathname.replace('/e/', '/d/').replace('/f/', '/d/');
-            return parsed;
+          const sleep = ms =>
+            new Promise(resolve => setTimeout(resolve, ms));
+
+
+          // ----------------------------------------------------------
+          // Helpers
+          // ----------------------------------------------------------
+
+          function normalizeInput(urlString) {
+            const u = new URL(urlString);
+
+            /*
+             * /d/<id> -> /e/<id>
+             *
+             * Dood/Playmogo player pages use /e/ while share pages
+             * normally use /d/.
+             */
+            if (
+              u.pathname.startsWith('/d/') ||
+              u.pathname.startsWith('/f/')
+            ) {
+              u.pathname = u.pathname.replace(/^\/(d|f)\//, '/e/');
+            }
+
+            return u;
           }
 
-          // "example.com" from "cdn.example.com" / "www.example.com" -- a
-          // simple eTLD+1 approximation, good enough for telling "still the
-          // same site" apart from "got redirected somewhere else entirely"
-          function baseDomain(host) {
-            const parts = host.split('.');
-            return parts.slice(-2).join('.');
+
+          function randomString(length = 10) {
+            const chars =
+              'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+            let out = '';
+
+            for (let i = 0; i < length; i++) {
+              out += chars[Math.floor(Math.random() * chars.length)];
+            }
+
+            return out;
           }
 
-          function looksLikeMediaLink(url) {
-            return (url.includes('.mp4') || url.includes('.m3u8')) && url.includes('token=');
+
+          function looksLikeMedia(url) {
+            return (
+              /\.mp4(?:\?|$)/i.test(url) ||
+              /\.m3u8(?:\?|$)/i.test(url)
+            );
           }
 
-          (async () => {
 
-            const browser = await chromium.launch({ headless: true });
+          function looksLikeDoodCdn(url) {
+            try {
+              const u = new URL(url);
 
-            let mediaUrl = null;
-            let title = 'video';
-            let lastPageUrl = null;
+              return (
+                /\.cloudatacdn\.com$/i.test(u.hostname) &&
+                looksLikeMedia(url)
+              );
+            } catch {
+              return false;
+            }
+          }
 
-            const MAX_ATTEMPTS = 3;
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          function extractTitle(html) {
+            const m = html.match(
+              /<title[^>]*>([\s\S]*?)<\/title>/i
+            );
+
+            if (!m) return 'video';
+
+            return m[1]
+              .replace(/&amp;/g, '&')
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .replace(/<[^>]+>/g, '')
+              .trim() || 'video';
+          }
+
+
+          function extractPassMd5(html) {
+            /*
+             * Current Dood player pattern:
+             *
+             * $.get('/pass_md5/HASH/TOKEN', function(data) {
+             *
+             */
+
+            const patterns = [
+              /['"](?:https?:\/\/[^'"]+)?\/pass_md5\/([^'"]+)['"]/i,
+
+              /['"]\/pass_md5\/([^'"]+)['"]/i,
+
+              /\/pass_md5\/([A-Za-z0-9._~\-\/]+)[\s'"]/i
+            ];
+
+            for (const re of patterns) {
+              const m = html.match(re);
+
+              if (m && m[1]) {
+                return m[1];
+              }
+            }
+
+            return null;
+          }
+
+
+          function buildPassMd5Url(origin, passPath) {
+            return new URL(
+              '/pass_md5/' + passPath,
+              origin
+            ).toString();
+          }
+
+
+          function buildCandidateFromPassMd5(baseUrl, token) {
+            /*
+             * Classic Dood CDN mechanism:
+             *
+             * pass_md5 response + random 10 chars +
+             * ?token=<token>&expiry=<timestamp>
+             *
+             * The actual browser network request is preferred if the
+             * player generates a nicer/filename-based CDN URL.
+             */
+
+            const randomPart = randomString(10);
+
+            return (
+              baseUrl +
+              randomPart +
+              '?token=' +
+              encodeURIComponent(token) +
+              '&expiry=' +
+              Date.now()
+            );
+          }
+
+
+          function extractTokenFromPassPath(passPath) {
+            const parts = passPath.split('/');
+
+            return parts[parts.length - 1] || null;
+          }
+
+
+          function sanitizeTitle(title) {
+            let s = title
+              .replace(/[^a-zA-Z0-9 ._-]/g, '_')
+              .replace(/[_ ]+/g, '_')
+              .replace(/^_+|_+$/g, '')
+              .trim();
+
+            if (!s) s = 'video';
+
+            return s.slice(0, 100);
+          }
+
+
+          async function fetchPassMd5(page, passUrl, playerUrl) {
+
+            console.log('PASS_MD5 URL:', passUrl);
+
+            const result = await page.evaluate(
+              async ({ passUrl, playerUrl }) => {
+
+                try {
+
+                  const response = await fetch(passUrl, {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: {
+                      'X-Requested-With': 'XMLHttpRequest',
+                      'Accept': '*/*'
+                    },
+                    referrer: playerUrl
+                  });
+
+                  const text = await response.text();
+
+                  return {
+                    status: response.status,
+                    ok: response.ok,
+                    text
+                  };
+
+                } catch (e) {
+
+                  return {
+                    status: 0,
+                    ok: false,
+                    text: '',
+                    error: String(e)
+                  };
+
+                }
+
+              },
+              {
+                passUrl,
+                playerUrl
+              }
+            );
+
+            console.log(
+              'PASS_MD5 status:',
+              result.status
+            );
+
+            if (!result.ok) {
+              console.log(
+                'PASS_MD5 error:',
+                result.error || result.text.slice(0, 300)
+              );
+
+              return null;
+            }
+
+            const cdnBase = result.text.trim();
+
+            if (
+              !cdnBase.startsWith('http://') &&
+              !cdnBase.startsWith('https://')
+            ) {
+              console.log(
+                'PASS_MD5 returned unexpected data:',
+                cdnBase.slice(0, 500)
+              );
+
+              return null;
+            }
+
+            console.log(
+              'PASS_MD5 CDN base:',
+              cdnBase
+            );
+
+            return cdnBase;
+          }
+
+
+          async function validateMediaUrl(url, referer) {
+
+            console.log('Validating media URL...');
 
             try {
 
-              const shareUrlObj = toShareUrlObj(SOURCE_URL);
-              const shareUrl = shareUrlObj.toString();
-              const origin = shareUrlObj.origin;
-              const siteBaseDomain = baseDomain(shareUrlObj.host);
-              lastPageUrl = shareUrl;
+              const result = await fetch(url, {
+                method: 'GET',
 
-              console.log('SHARE URL:', shareUrl);
+                headers: {
+                  'User-Agent': UA,
+                  'Referer': referer,
+                  'Range': 'bytes=0-1023',
+                  'Accept': '*/*'
+                },
 
-              for (let attempt = 1; attempt <= MAX_ATTEMPTS && !mediaUrl; attempt++) {
-
-                console.log(`\n=== Attempt ${attempt}/${MAX_ATTEMPTS} (fresh session) ===`);
-
-                const context = await browser.newContext({ userAgent: UA, locale: 'en-US' });
-
-                // hide the most obvious automation flag -- Cloudflare (and
-                // similar) explicitly check navigator.webdriver as a bot
-                // signal. This only masks that one property; it does NOT
-                // attempt to solve or click through any interactive
-                // challenge.
-                await context.addInitScript(() => {
-                  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                  // some popunder ad scripts fall back to hijacking the
-                  // CURRENT tab (e.g. to about:blank) when window.open()
-                  // is unavailable/blocked, as a workaround for popup
-                  // blockers. Neutering it outright avoids that path too.
-                  window.open = () => null;
-                });
-
-                // Block full-page navigations AWAY from this site (the ad
-                // redirects) at the network level -- same thing an ad
-                // blocker like AdGuard/uBlock does. Exceptions: only the
-                // TOP frame is checked (an iframe, e.g. a Cloudflare
-                // Turnstile widget, is left alone -- it's legitimate, not
-                // an ad); and a navigation that already looks like the
-                // final media link is let through even if it's on another
-                // domain, in case this mirror delivers it via a real
-                // browser redirect straight to the CDN.
-                await context.route('**/*', (route) => {
-                  const request = route.request();
-                  if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
-                    const url = request.url();
-                    let reqHost = '';
-                    try { reqHost = new URL(url).host; } catch (e) {}
-                    if (reqHost && baseDomain(reqHost) !== siteBaseDomain && !looksLikeMediaLink(url)) {
-                      console.log('Blocking cross-site navigation (ad redirect):', url);
-                      return route.abort();
-                    }
-                  }
-                  return route.continue();
-                });
-
-                // create the MAIN tab first...
-                const page = await context.newPage();
-
-                // ...and only THEN start watching for popups.
-                // context.newPage() itself fires a 'page' event, so
-                // registering this listener before creating the main page
-                // makes the script close its own working tab by mistake.
-                context.on('page', async (popup) => {
-                  if (popup === page) return;
-                  try {
-                    console.log('POPUP opened, closing:', popup.url());
-                    await popup.close();
-                  } catch (e) {}
-                });
-
-                page.on('dialog', (dialog) => dialog.dismiss().catch(() => {}));
-
-                // Capture the actual media URL if it ever shows up as a
-                // network response, regardless of which step triggers it.
-                // It usually lives on a completely different domain (the
-                // video CDN, e.g. cloudatacdn.com), so we match by shape,
-                // not by host.
-                page.on('response', (response) => {
-                  try {
-                    const url = response.url();
-                    if (!mediaUrl && looksLikeMediaLink(url)) {
-                      console.log('FOUND (network):', url);
-                      mediaUrl = url;
-                    }
-                  } catch (e) {}
-                });
-
-                async function waitOutInterstitial() {
-                  if (page.isClosed()) return;
-                  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-                  if (/just a moment|checking your browser|attention required/i.test(bodyText)) {
-                    console.log('Anti-bot interstitial detected, waiting for it to settle...');
-                    await page.waitForTimeout(8000).catch(() => {});
-                  }
-                }
-
-                // ---- Stage 1: the /d/ share page -----------------------
-                //
-                // The /download/ href is present in plain static HTML from
-                // the very first paint -- it needs no JS execution and no
-                // click to appear. So we grab the HTML the instant the
-                // document is parsed (domcontentloaded), *before* waiting
-                // for anything else: the longer we wait around (networkidle
-                // etc.), the more time an auto-firing ad redirect has to
-                // hijack the tab to about:blank first.
-
-                try {
-                  const resp = await page.goto(shareUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                  if (resp) console.log('Loaded share page, status:', resp.status());
-                } catch (e) {
-                  console.log('goto (share page) warning:', e.message);
-                }
-
-                let downloadPageUrl = null;
-                let html = !page.isClosed() ? await page.content().catch(() => '') : '';
-                let hrefMatch = html.match(/href="(\/download\/[^"]+)"/i);
-
-                if (!hrefMatch && !page.isClosed()) {
-                  // didn't catch it in time / page wasn't ready yet -- fall
-                  // back to waiting a bit and checking again once
-                  await waitOutInterstitial();
-                  await page.waitForTimeout(1500).catch(() => {});
-                  if (!page.isClosed()) {
-                    html = await page.content().catch(() => '');
-                    hrefMatch = html.match(/href="(\/download\/[^"]+)"/i);
-                  }
-                }
-
-                if (!page.isClosed()) {
-                  try { title = (await page.title()).trim() || title; } catch (e) {}
-                }
-                console.log('TITLE:', title);
-
-                if (!mediaUrl) {
-                  if (hrefMatch) {
-                    downloadPageUrl = origin + hrefMatch[1];
-                    console.log('DOWNLOAD LINK (from share page HTML):', downloadPageUrl);
-                  } else {
-                    // also check directly in case the share page itself
-                    // already embeds the final CDN link somewhere
-                    const directMatch = html.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)\?[^\s"'<>]*token=[^\s"'<>]*/i);
-                    if (directMatch) {
-                      console.log('FOUND (share page HTML):', directMatch[0]);
-                      mediaUrl = directMatch[0];
-                    } else {
-                      console.log('No /download/ link found in the share page HTML.');
-                    }
-                  }
-                }
-
-                // ---- Stage 2: the /download/ page -----------------------
-                //
-                // A HAR capture from a real browser showed the successful
-                // request here carries "Sec-Fetch-User: ?1" -- Chromium
-                // only sends that when the navigation came from an actual
-                // user gesture (a real click), never for a programmatic
-                // goto(). So we click the link on the page instead of
-                // navigating to the URL directly.
-
-                if (!mediaUrl && downloadPageUrl && !page.isClosed()) {
-
-                  // The real download link sits inside a div the page
-                  // keeps CSS-hidden until its 5-second countdown timer
-                  // finishes (pure UI theater -- we already have the href
-                  // from the static HTML). A hidden element has no visible
-                  // position for a real click to land on, so force it
-                  // visible first; this doesn't touch the click itself, so
-                  // it's still a genuine user-gesture click afterward.
-                  await page.evaluate(() => {
-                    const el = document.querySelector('a[href^="/download/"]');
-                    let node = el;
-                    while (node && node !== document.body) {
-                      node.style.setProperty('display', 'block', 'important');
-                      node.style.setProperty('visibility', 'visible', 'important');
-                      node.style.setProperty('opacity', '1', 'important');
-                      node = node.parentElement;
-                    }
-                  }).catch(() => {});
-
-                  try {
-                    const [resp2] = await Promise.all([
-                      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 }).catch((e) => {
-                        console.log('waitForNavigation warning:', e.message);
-                        return null;
-                      }),
-                      page.click('a[href^="/download/"]', { timeout: 5000 })
-                    ]);
-                    if (resp2) {
-                      console.log('Loaded download page (via click), status:', resp2.status());
-                      if (!resp2.ok()) {
-                        try {
-                          const h = resp2.headers();
-                          console.log('  response headers: server=', h['server'], 'cf-ray=', h['cf-ray'], 'cf-mitigated=', h['cf-mitigated']);
-                        } catch (e) {}
-                      }
-                    }
-                    lastPageUrl = page.isClosed() ? downloadPageUrl : page.url();
-                  } catch (e) {
-                    console.log('click-through to download page failed:', e.message);
-                    lastPageUrl = downloadPageUrl;
-                  }
-
-                  // some ad script may have hijacked the tab to about:blank
-                  // as a side effect of the click -- recover in place
-                  // rather than burning a whole fresh-session attempt
-                  if (!page.isClosed() && page.url() === 'about:blank') {
-                    console.log('Tab ended up on about:blank after the click, navigating back...');
-                    await page.goto(downloadPageUrl, { waitUntil: 'networkidle', timeout: 30000, referer: shareUrl }).catch((e) => {
-                      console.log('recovery goto warning:', e.message);
-                    });
-                    lastPageUrl = page.isClosed() ? downloadPageUrl : page.url();
-                  }
-
-                  await waitOutInterstitial();
-
-                  // give it a few seconds in case it auto-redirects/fires
-                  // the real request on its own
-                  for (let i = 0; i < 8 && !mediaUrl && !page.isClosed(); i++) {
-                    await page.waitForTimeout(1000).catch(() => {});
-                  }
-
-                  if (!mediaUrl && !page.isClosed()) {
-                    const html2 = await page.content().catch(() => '');
-
-                    const directMatch2 = html2.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)\?[^\s"'<>]*token=[^\s"'<>]*/i);
-                    if (directMatch2) {
-                      console.log('FOUND (download page HTML):', directMatch2[0]);
-                      mediaUrl = directMatch2[0];
-                    } else {
-                      // this page's normal template always loads the
-                      // reCAPTCHA SDK script regardless of whether it's
-                      // actually shown -- only a truly RENDERED widget
-                      // means we're actually blocked by it
-                      const hasRenderedCaptcha =
-                        /class="[^"]*(g-recaptcha|h-captcha|cf-turnstile)/i.test(html2) ||
-                        /id="cf-challenge|Checking your browser|Verify you are human/i.test(html2);
-
-                      if (hasRenderedCaptcha) {
-                        console.log('This step appears to require solving a CAPTCHA/human-check -- cannot automate past that.');
-                      } else {
-                        console.log('Unexpected page content, first 600 chars:');
-                        console.log(html2.replace(/\s+/g, ' ').slice(0, 600));
-
-                        // last resort: click an obvious "download" button/link
-                        console.log('Trying a click on a download button as last resort...');
-                        try {
-                          await page.click('a:has-text("Download"), .btn:has-text("Download"), a[href*="download"]', { timeout: 3000, force: true });
-                        } catch (e) {
-                          console.log('  download click skipped:', e.message.split('\n')[0]);
-                        }
-                        for (let i = 0; i < 5 && !mediaUrl && !page.isClosed(); i++) {
-                          await page.waitForTimeout(1000).catch(() => {});
-                        }
-                      }
-                    }
-                  }
-                }
-
-                if (!mediaUrl) {
-                  let finalUrl = 'unknown (tab closed)';
-                  if (!page.isClosed()) {
-                    try { finalUrl = page.url(); } catch (e) {}
-                  }
-                  console.log(`Attempt ${attempt} failed. Ended up on:`, finalUrl);
-                }
-
-                await context.close().catch(() => {});
-
-                if (!mediaUrl && attempt < MAX_ATTEMPTS) {
-                  const delay = 2000 + Math.floor(Math.random() * 3000);
-                  console.log(`Waiting ${Math.round(delay / 1000)}s before the next attempt...`);
-                  await sleep(delay);
-                }
-
-              }
-
-              if (!mediaUrl) {
-                console.error(`Could not find a direct media link after ${MAX_ATTEMPTS} attempts.`);
-                process.exit(1);
-              }
-
-              // A real browser's request to the CDN itself carries just
-              // the site's origin as Referer (e.g. "https://playmogo.com/"),
-              // not the full path of whatever page the link was clicked
-              // from -- confirmed from a real HAR capture. Using the full
-              // page URL here (what we tried before) is why validation/
-              // download kept failing even after the link itself was
-              // correct.
-              const cdnReferer = origin + '/';
-
-              // sanity check it actually resolves before handing it to the
-              // download step (a plain fetch is enough here, it's just a
-              // HEAD request to a CDN, not the protected page)
-              const headRes = await fetch(mediaUrl, {
-                method: 'HEAD',
-                headers: { 'User-Agent': UA, Referer: cdnReferer }
-              }).catch((e) => {
-                console.log('HEAD validation request errored (continuing anyway):', e.message);
-                return null;
+                redirect: 'follow'
               });
 
-              if (headRes && !headRes.ok) {
-                console.error('Media link did not validate, status:', headRes.status);
+              console.log(
+                'Media validation status:',
+                result.status
+              );
+
+              const contentType =
+                result.headers.get('content-type') || '';
+
+              const contentLength =
+                result.headers.get('content-length') || '';
+
+              console.log(
+                'Media content-type:',
+                contentType
+              );
+
+              console.log(
+                'Media content-length:',
+                contentLength || '(not provided)'
+              );
+
+              /*
+               * 206 is ideal for a range request.
+               * 200 is also acceptable.
+               */
+              if (
+                result.status === 200 ||
+                result.status === 206
+              ) {
+                return true;
+              }
+
+              return false;
+
+            } catch (e) {
+
+              console.log(
+                'Media validation failed:',
+                e.message
+              );
+
+              return false;
+            }
+          }
+
+
+          // ----------------------------------------------------------
+          // Main
+          // ----------------------------------------------------------
+
+          (async () => {
+
+            let browser = null;
+
+            try {
+
+              const playerUrlObj =
+                normalizeInput(SOURCE_URL);
+
+              const playerUrl =
+                playerUrlObj.toString();
+
+              const origin =
+                playerUrlObj.origin;
+
+              console.log('SOURCE URL:', SOURCE_URL);
+              console.log('PLAYER URL:', playerUrl);
+
+
+              browser = await chromium.launch({
+                headless: true
+              });
+
+
+              /*
+               * One persistent context is intentional.
+               *
+               * If Cloudflare gives us a normal clearance while
+               * loading the player page, we keep the exact same
+               * cookies/session for pass_md5.
+               */
+              const context =
+                await browser.newContext({
+                  userAgent: UA,
+                  locale: 'en-US',
+                  timezoneId: 'UTC',
+                  viewport: {
+                    width: 1366,
+                    height: 768
+                  }
+                });
+
+
+              /*
+               * Do NOT spoof navigator.webdriver.
+               *
+               * The goal here is to use a normal browser session,
+               * not to implement a Cloudflare bypass.
+               */
+
+
+              const page =
+                await context.newPage();
+
+
+              let networkMediaUrl = null;
+              let passMd5Response = null;
+
+
+              /*
+               * Watch requests/responses generated by the real player.
+               *
+               * If the player itself creates the final CDN URL,
+               * this is the best source because it gives us exactly
+               * what the site generated.
+               */
+
+              page.on('request', request => {
+
+                const url = request.url();
+
+                if (
+                  !networkMediaUrl &&
+                  looksLikeDoodCdn(url)
+                ) {
+
+                  console.log(
+                    'FOUND CDN MEDIA REQUEST:',
+                    url
+                  );
+
+                  networkMediaUrl = url;
+                }
+
+              });
+
+
+              page.on('response', async response => {
+
+                const url = response.url();
+
+                if (
+                  !passMd5Response &&
+                  /\/pass_md5\//i.test(url)
+                ) {
+
+                  try {
+
+                    const text =
+                      await response.text();
+
+                    if (
+                      response.ok() &&
+                      /^https?:\/\//i.test(text.trim())
+                    ) {
+
+                      passMd5Response =
+                        text.trim();
+
+                      console.log(
+                        'CAPTURED PASS_MD5 RESPONSE:',
+                        passMd5Response
+                      );
+                    }
+
+                  } catch {}
+                }
+
+              });
+
+
+              console.log(
+                '\nLoading player page...'
+              );
+
+
+              const response =
+                await page.goto(
+                  playerUrl,
+                  {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 60000
+                  }
+                );
+
+
+              if (response) {
+
+                console.log(
+                  'Player page status:',
+                  response.status()
+                );
+
+              }
+
+
+              /*
+               * Give the page enough time to execute the player
+               * JavaScript and issue /pass_md5.
+               *
+               * We intentionally do NOT use networkidle because
+               * these pages contain ads/analytics that can keep
+               * the network busy indefinitely.
+               */
+
+              await page.waitForTimeout(5000);
+
+
+              const html =
+                await page.content();
+
+
+              const title =
+                extractTitle(html);
+
+
+              console.log(
+                'TITLE:',
+                title
+              );
+
+
+              /*
+               * First check whether the real player already produced
+               * the final CDN URL.
+               */
+
+              if (networkMediaUrl) {
+
+                console.log(
+                  '\nUsing CDN URL captured from player.'
+                );
+
+              }
+
+
+              /*
+               * If the player request was not captured, extract the
+               * pass_md5 endpoint directly from the player HTML.
+               */
+
+              let passPath =
+                extractPassMd5(html);
+
+
+              if (!passPath) {
+
+                console.log(
+                  'Could not find /pass_md5/ in player HTML.'
+                );
+
+              } else {
+
+                console.log(
+                  'PASS_MD5 path:',
+                  passPath
+                );
+
+              }
+
+
+              /*
+               * Call pass_md5 ourselves if the browser did not
+               * already do it.
+               */
+
+              let cdnBase =
+                passMd5Response;
+
+
+              if (
+                !cdnBase &&
+                passPath
+              ) {
+
+                const passUrl =
+                  buildPassMd5Url(
+                    origin,
+                    passPath
+                  );
+
+                cdnBase =
+                  await fetchPassMd5(
+                    page,
+                    passUrl,
+                    playerUrl
+                  );
+
+              }
+
+
+              /*
+               * The player-generated network URL is preferred.
+               *
+               * If it wasn't observed, create the classic Dood
+               * candidate from pass_md5.
+               */
+
+              let mediaUrl =
+                networkMediaUrl;
+
+
+              if (!mediaUrl && cdnBase) {
+
+                const token =
+                  extractTokenFromPassPath(
+                    passPath || ''
+                  );
+
+                if (token) {
+
+                  const candidate =
+                    buildCandidateFromPassMd5(
+                      cdnBase,
+                      token
+                    );
+
+                  console.log(
+                    '\nGenerated CDN candidate:',
+                    candidate
+                  );
+
+                  /*
+                   * Store it for the download step.
+                   * We don't require HEAD here because some CDNs
+                   * reject HEAD even though GET works.
+                   */
+
+                  mediaUrl = candidate;
+                }
+              }
+
+
+              /*
+               * Wait a little longer for the actual player request.
+               *
+               * This is especially useful if Turnstile/FingerprintJS
+               * delays the player initialization.
+               */
+
+              if (!networkMediaUrl) {
+
+                console.log(
+                  '\nWaiting for player-generated CDN URL...'
+                );
+
+                for (
+                  let i = 0;
+                  i < 10 && !networkMediaUrl;
+                  i++
+                ) {
+
+                  await sleep(1000);
+                }
+
+                if (networkMediaUrl) {
+                  mediaUrl =
+                    networkMediaUrl;
+                }
+
+              }
+
+
+              if (!mediaUrl) {
+
+                console.error(
+                  '\nCould not obtain a CDN media URL.'
+                );
+
+                console.error(
+                  'The player page may now require an additional human verification step.'
+                );
+
+                console.error(
+                  'Player URL:',
+                  playerUrl
+                );
+
+                /*
+                 * Save a diagnostic snapshot to help with the next
+                 * iteration without exposing cookies.
+                 */
+
+                try {
+                  fs.writeFileSync(
+                    'grabbed/player.html',
+                    html
+                  );
+                } catch {}
+
                 process.exit(1);
               }
 
-              if (headRes) {
-                console.log('Validated OK, content-length:', headRes.headers.get('content-length'));
-              }
+
+              /*
+               * The HAR shows that the CDN request uses the site
+               * origin as Referer:
+               *
+               *     https://playmogo.com/
+               *
+               * not the /e/... URL.
+               */
+
+              const cdnReferer =
+                origin + '/';
+
+
+              console.log(
+                '\nFINAL MEDIA URL:'
+              );
+
+              console.log(
+                mediaUrl
+              );
+
+              console.log(
+                'REFERER:',
+                cdnReferer
+              );
+
+
+              /*
+               * Lightweight validation.
+               *
+               * Do not fail merely because validation is unavailable;
+               * the actual downloader below is the final authority.
+               */
+
+              await validateMediaUrl(
+                mediaUrl,
+                cdnReferer
+              );
+
 
               fs.writeFileSync(
                 'grabbed/result.json',
-                JSON.stringify({ title, url: mediaUrl, referer: cdnReferer }, null, 2)
+                JSON.stringify(
+                  {
+                    title,
+                    url: mediaUrl,
+                    referer: cdnReferer,
+                    player_url: playerUrl
+                  },
+                  null,
+                  2
+                )
               );
-              console.log('Saved grabbed/result.json');
+
+
+              console.log(
+                '\nSaved grabbed/result.json'
+              );
+
+
+              await context.close();
 
             } catch (e) {
-              console.error('Error:', e.message);
+
+              console.error(
+                'Resolver error:',
+                e.stack || e.message
+              );
+
               process.exit(1);
+
             } finally {
-              await browser.close().catch(() => {});
+
+              if (browser) {
+                await browser.close()
+                  .catch(() => {});
+              }
+
             }
 
           })();
 
           EOF
 
+      # ------------------------------------------------------------
+      # Run resolver
+      # ------------------------------------------------------------
+
       - name: Run resolver
-        run: node dood_dl.js "${{ github.event.inputs.source_url }}"
+        run: |
+          node dood_dl.js "${{ github.event.inputs.source_url }}"
+
+      # ------------------------------------------------------------
+      # Download actual media
+      # ------------------------------------------------------------
 
       - name: Download video
         run: |
@@ -453,7 +851,8 @@ jobs:
           title=$(jq -r '.title' grabbed/result.json)
           url=$(jq -r '.url' grabbed/result.json)
           referer=$(jq -r '.referer' grabbed/result.json)
-          ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+          ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
           safe_title=$(echo "$title" \
             | sed 's/[^a-zA-Z0-9 ._-]/_/g' \
@@ -464,92 +863,161 @@ jobs:
           [ -z "$safe_title" ] && safe_title="video"
 
           echo "TITLE:   $safe_title"
-          echo "URL:     $url"
           echo "REFERER: $referer"
 
           clean_url=$(echo "$url" | cut -d'?' -f1)
-          ext=$(echo "$clean_url" | grep -oE '\.(mp4|m3u8)' | head -1 | tr -d '.')
 
-          # the CDN checks the Referer header (and sometimes user-agent), so
-          # every downloader needs to send the same ones the resolver used
+          ext=$(echo "$clean_url" \
+            | grep -oEi '\.(mp4|m3u8)' \
+            | head -1 \
+            | tr '[:upper:]' '[:lower:]' \
+            | tr -d '.')
+
+          [ -z "$ext" ] && ext="mp4"
+
+
+          # ----------------------------------------------------------
+          # M3U8
+          # ----------------------------------------------------------
 
           if [[ "$ext" == "m3u8" ]]; then
 
             echo "[FFMPEG] downloading m3u8"
+
             ffmpeg -y \
               -user_agent "$ua" \
               -headers "Referer: ${referer}\r\n" \
-              -i "$url" -c copy "downloads/${safe_title}.mp4"
+              -i "$url" \
+              -c copy \
+              "downloads/${safe_title}.mp4"
 
           else
 
+            # --------------------------------------------------------
+            # MP4
+            #
+            # aria2 is preferred because the video CDN generally
+            # supports ranged downloads.
+            # --------------------------------------------------------
+
             echo "[ARIA2] trying download..."
+
+            set +e
+
             aria2c \
-              -x 16 -s 16 -k 1M -c \
+              -x 8 \
+              -s 8 \
+              -k 1M \
+              -c \
               --summary-interval=5 \
               --console-log-level=warn \
               --user-agent="$ua" \
               --referer="$referer" \
-              --header="Sec-Fetch-Site: cross-site" \
-              --header="Sec-Fetch-Mode: navigate" \
-              --header="Sec-Fetch-Dest: document" \
-              --header="Sec-Fetch-User: ?1" \
+              --header="Accept: */*" \
               --dir=downloads \
-              --out="${safe_title}.${ext:-mp4}" \
+              --out="${safe_title}.mp4" \
               "$url"
 
-            if [ $? -ne 0 ]; then
+            aria_status=$?
+
+            set -e
+
+
+            if [ "$aria_status" -ne 0 ]; then
+
               echo "[CURL FALLBACK] aria2 failed"
-              curl -L --retry 5 --connect-timeout 30 \
+
+              curl -L \
+                --fail \
+                --retry 5 \
+                --retry-all-errors \
+                --connect-timeout 30 \
                 -A "$ua" \
                 -e "$referer" \
-                -H "Sec-Fetch-Site: cross-site" \
-                -H "Sec-Fetch-Mode: navigate" \
-                -H "Sec-Fetch-Dest: document" \
-                -H "Sec-Fetch-User: ?1" \
-                -o "downloads/${safe_title}.${ext:-mp4}" \
+                -H "Accept: */*" \
+                -o "downloads/${safe_title}.mp4" \
                 "$url"
+
             fi
 
           fi
 
+
           echo ""
           echo "=== downloads/ ==="
+
           ls -lh downloads/ || true
+
 
           if [ -z "$(ls -A downloads 2>/dev/null)" ]; then
             echo "Download failed: downloads/ is empty"
             exit 1
           fi
 
-          # doodstream CDN returns a small HTML error page (not the real
-          # video) if the token/referer didn't validate -- a real clip is
-          # essentially never under ~200KB, so treat anything that small as
-          # a failed download
+
+          # ----------------------------------------------------------
+          # Basic sanity check
+          # ----------------------------------------------------------
+
           for f in downloads/*; do
+
             size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+
+            echo "Downloaded: $f"
+            echo "Size: $size bytes"
+
             if [ "$size" -lt 200000 ]; then
-              echo "Downloaded file looks too small ($size bytes) -- likely an error page, not the video:"
-              head -c 300 "$f"; echo
+
+              echo ""
+              echo "Downloaded file looks too small."
+              echo "It may be an error page instead of the video."
+
+              file "$f" || true
+              head -c 500 "$f" 2>/dev/null || true
+              echo ""
+
               exit 1
+
             fi
+
           done
+
+
+      # ------------------------------------------------------------
+      # Create ZIP
+      # ------------------------------------------------------------
 
       - name: Create ZIP
         if: github.event.inputs.upload_mode == 'zip'
         run: |
           ts=$(date +"%Y%m%d_%H%M%S")
-          zip -r -P "${{ secrets.ZIP_PASSWORD }}" "dood_media_${ts}.zip" downloads/
+
+          zip -r \
+            -P "${{ secrets.ZIP_PASSWORD }}" \
+            "dood_media_${ts}.zip" \
+            downloads/
+
+
+      # ------------------------------------------------------------
+      # Delete old releases
+      # ------------------------------------------------------------
 
       - name: Delete old releases
         if: github.event.inputs.delete_old_releases == 'yes'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+
           releases=$(gh release list --limit 100 | awk '{print $1}')
+
           for tag in $releases; do
             gh release delete "$tag" -y || true
           done
+
+
+      # ------------------------------------------------------------
+      # Upload ZIP Release
+      # ------------------------------------------------------------
 
       - name: Upload ZIP Release
         if: github.event.inputs.upload_mode == 'zip'
@@ -559,6 +1027,11 @@ jobs:
           files: "*.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+      # ------------------------------------------------------------
+      # Upload Direct Video Release
+      # ------------------------------------------------------------
 
       - name: Upload Direct Video Release
         if: github.event.inputs.upload_mode == 'direct'
