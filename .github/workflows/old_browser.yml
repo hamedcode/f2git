@@ -202,7 +202,7 @@ jobs:
               except Exception as e:
                   print("ERROR:", e)
           checked.sort(key=lambda x: (x["score"], x["size"]))
-          final = checked[:4]
+          final = checked[:2]
           with open("grabbed/final_links.txt", "w", encoding="utf-8") as f:
               for item in final:
                   print("SELECTED:", item["url"])
