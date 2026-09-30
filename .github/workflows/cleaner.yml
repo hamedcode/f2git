@@ -1,12 +1,13 @@
+```yaml
 name: Cleaner
 
 on:
   workflow_dispatch:
     inputs:
 
-      # ==============================
-      # File history
-      # ==============================
+      # ==========================================
+      # FILE HISTORY
+      # ==========================================
 
       link:
         description: "Clean history of link.txt"
@@ -26,31 +27,76 @@ on:
         type: boolean
         default: false
 
-      # ==============================
-      # Workflow run history
-      # ==============================
 
-      workflow:
-        description: "Workflow whose previous runs should be deleted"
+      # ==========================================
+      # WORKFLOW RUN HISTORY
+      # ==========================================
+
+      workflow_9xb:
+        description: "Delete previous runs of 9xb.yml"
         required: true
-        type: choice
-        options:
-          - None
-          - 9xb.yml
-          - Demo.yml
-          - browser.yml
-          - cleaner.yml
-          - gofile.yml
-          - zip.yml
-          - old_browser.yml
-          - send_to_telegram.yml
-          - yt-dlp.yml
-          - zip-all.yml
-        default: None
+        type: boolean
+        default: false
+
+      workflow_demo:
+        description: "Delete previous runs of Demo.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_browser:
+        description: "Delete previous runs of browser.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_cleaner:
+        description: "Delete previous runs of cleaner.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_gofile:
+        description: "Delete previous runs of gofile.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_zip:
+        description: "Delete previous runs of zip.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_old_browser:
+        description: "Delete previous runs of old_browser.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_send_to_telegram:
+        description: "Delete previous runs of send_to_telegram.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_yt_dlp:
+        description: "Delete previous runs of yt-dlp.yml"
+        required: true
+        type: boolean
+        default: false
+
+      workflow_zip_all:
+        description: "Delete previous runs of zip-all.yml"
+        required: true
+        type: boolean
+        default: false
+
 
 permissions:
   contents: write
   actions: write
+
 
 jobs:
   clean:
@@ -59,7 +105,7 @@ jobs:
     steps:
 
       # ==========================================
-      # Checkout repository
+      # CHECKOUT
       # ==========================================
 
       - name: Checkout full repository history
@@ -68,8 +114,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+
       # ==========================================
-      # Save selected files
+      # SAVE SELECTED FILES
       # ==========================================
 
       - name: Save selected files
@@ -103,8 +150,9 @@ jobs:
             cp "browser.txt" "/tmp/selected-files/browser.txt"
           fi
 
+
       # ==========================================
-      # Check file selection
+      # CHECK FILE SELECTION
       # ==========================================
 
       - name: Check file selection
@@ -116,8 +164,9 @@ jobs:
             ls -1 /tmp/selected-files
           fi
 
+
       # ==========================================
-      # Install git-filter-repo
+      # INSTALL GIT-FILTER-REPO
       # ==========================================
 
       - name: Install git-filter-repo
@@ -128,8 +177,9 @@ jobs:
         run: |
           python3 -m pip install git-filter-repo
 
+
       # ==========================================
-      # Remove selected files from Git history
+      # REMOVE SELECTED FILES FROM GIT HISTORY
       # ==========================================
 
       - name: Remove selected files from Git history
@@ -157,8 +207,9 @@ jobs:
             --invert-paths \
             --force
 
+
       # ==========================================
-      # Restore current versions of selected files
+      # RESTORE CURRENT FILES
       # ==========================================
 
       - name: Restore selected files
@@ -179,8 +230,9 @@ jobs:
 
           git commit -m "Restore selected files"
 
+
       # ==========================================
-      # Restore GitHub remote
+      # RESTORE ORIGIN
       # ==========================================
 
       - name: Restore GitHub remote
@@ -194,8 +246,9 @@ jobs:
           git remote add origin \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
 
+
       # ==========================================
-      # Push rewritten Git history
+      # PUSH REWRITTEN HISTORY
       # ==========================================
 
       - name: Push rewritten Git history
@@ -206,34 +259,264 @@ jobs:
         run: |
           git push origin "${{ github.ref_name }}" --force
 
+
       # ==========================================
-      # Delete previous runs of selected workflow
+      # DELETE WORKFLOW RUNS
       # ==========================================
 
-      - name: Delete previous workflow runs
-        if: inputs.workflow != 'None'
+      - name: Delete selected workflow runs
         env:
           GH_TOKEN: ${{ github.token }}
-          SELECTED_WORKFLOW: ${{ inputs.workflow }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
-          echo "Selected workflow: $SELECTED_WORKFLOW"
-          echo "Current Cleaner run: $CURRENT_RUN_ID"
 
-          gh run list \
-            --workflow="$SELECTED_WORKFLOW" \
-            --limit 1000 \
-            --json databaseId \
-            --jq '.[].databaseId' |
-          while read RUN_ID; do
+          # --------------------------------------
+          # 9xb.yml
+          # --------------------------------------
 
-            if [ "$RUN_ID" != "$CURRENT_RUN_ID" ]; then
-              echo "Deleting run: $RUN_ID"
-              gh run delete "$RUN_ID" --repo "${{ github.repository }}" || true
-            else
-              echo "Keeping current run: $RUN_ID"
-            fi
+          if [ "${{ inputs.workflow_9xb }}" = "true" ]; then
 
-          done
+            echo "Deleting previous runs of 9xb.yml"
 
-          echo "Workflow history cleanup completed."
+            gh run list \
+              --workflow="9xb.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # Demo.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_demo }}" = "true" ]; then
+
+            echo "Deleting previous runs of Demo.yml"
+
+            gh run list \
+              --workflow="Demo.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # browser.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_browser }}" = "true" ]; then
+
+            echo "Deleting previous runs of browser.yml"
+
+            gh run list \
+              --workflow="browser.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # cleaner.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_cleaner }}" = "true" ]; then
+
+            echo "Deleting previous runs of cleaner.yml"
+
+            gh run list \
+              --workflow="cleaner.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # gofile.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_gofile }}" = "true" ]; then
+
+            echo "Deleting previous runs of gofile.yml"
+
+            gh run list \
+              --workflow="gofile.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # zip.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_zip }}" = "true" ]; then
+
+            echo "Deleting previous runs of zip.yml"
+
+            gh run list \
+              --workflow="zip.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # old_browser.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_old_browser }}" = "true" ]; then
+
+            echo "Deleting previous runs of old_browser.yml"
+
+            gh run list \
+              --workflow="old_browser.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # send_to_telegram.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_send_to_telegram }}" = "true" ]; then
+
+            echo "Deleting previous runs of send_to_telegram.yml"
+
+            gh run list \
+              --workflow="send_to_telegram.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # yt-dlp.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_yt_dlp }}" = "true" ]; then
+
+            echo "Deleting previous runs of yt-dlp.yml"
+
+            gh run list \
+              --workflow="yt-dlp.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+
+          # --------------------------------------
+          # zip-all.yml
+          # --------------------------------------
+
+          if [ "${{ inputs.workflow_zip_all }}" = "true" ]; then
+
+            echo "Deleting previous runs of zip-all.yml"
+
+            gh run list \
+              --workflow="zip-all.yml" \
+              --limit 1000 \
+              --json databaseId \
+              --jq '.[].databaseId' |
+            while read RUN_ID; do
+
+              if [ "$RUN_ID" != "${{ github.run_id }}" ]; then
+                gh run delete "$RUN_ID" \
+                  --repo "${{ github.repository }}" || true
+              fi
+
+            done
+
+          fi
+
+          echo "Workflow cleanup completed."
+```
