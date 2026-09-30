@@ -1,9 +1,13 @@
-
-name: Clean File History
+name: Cleaner
 
 on:
   workflow_dispatch:
     inputs:
+
+      # ==============================
+      # File history
+      # ==============================
+
       link:
         description: "Clean history of link.txt"
         required: true
@@ -22,19 +26,51 @@ on:
         type: boolean
         default: false
 
+      # ==============================
+      # Workflow run history
+      # ==============================
+
+      workflow:
+        description: "Workflow whose previous runs should be deleted"
+        required: true
+        type: choice
+        options:
+          - None
+          - 9xb.yml
+          - Demo.yml
+          - browser.yml
+          - cleaner.yml
+          - gofile.yml
+          - zip.yml
+          - old_browser.yml
+          - send_to_telegram.yml
+          - yt-dlp.yml
+          - zip-all.yml
+        default: None
+
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  clean-history:
+  clean:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ==========================================
+      # Checkout repository
+      # ==========================================
+
       - name: Checkout full repository history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      # ==========================================
+      # Save selected files
+      # ==========================================
 
       - name: Save selected files
         run: |
@@ -45,6 +81,7 @@ jobs:
               echo "ERROR: link.txt not found!"
               exit 1
             fi
+
             cp "link.txt" "/tmp/selected-files/link.txt"
           fi
 
@@ -53,6 +90,7 @@ jobs:
               echo "ERROR: yt.txt not found!"
               exit 1
             fi
+
             cp "yt.txt" "/tmp/selected-files/yt.txt"
           fi
 
@@ -61,24 +99,44 @@ jobs:
               echo "ERROR: browser.txt not found!"
               exit 1
             fi
+
             cp "browser.txt" "/tmp/selected-files/browser.txt"
           fi
 
-      - name: Check selection
+      # ==========================================
+      # Check file selection
+      # ==========================================
+
+      - name: Check file selection
         run: |
           if [ -z "$(ls -A /tmp/selected-files 2>/dev/null)" ]; then
-            echo "ERROR: No files selected."
-            exit 1
+            echo "No file history cleanup selected."
+          else
+            echo "Selected files:"
+            ls -1 /tmp/selected-files
           fi
 
-          echo "Selected files:"
-          ls -1 /tmp/selected-files
+      # ==========================================
+      # Install git-filter-repo
+      # ==========================================
 
       - name: Install git-filter-repo
+        if: |
+          inputs.link == true ||
+          inputs.yt == true ||
+          inputs.browser == true
         run: |
           python3 -m pip install git-filter-repo
 
+      # ==========================================
+      # Remove selected files from Git history
+      # ==========================================
+
       - name: Remove selected files from Git history
+        if: |
+          inputs.link == true ||
+          inputs.yt == true ||
+          inputs.browser == true
         run: |
           FILES=""
 
@@ -99,10 +157,19 @@ jobs:
             --invert-paths \
             --force
 
+      # ==========================================
+      # Restore current versions of selected files
+      # ==========================================
+
       - name: Restore selected files
+        if: |
+          inputs.link == true ||
+          inputs.yt == true ||
+          inputs.browser == true
         run: |
           for file in /tmp/selected-files/*; do
             filename=$(basename "$file")
+
             cp "$file" "$filename"
             git add "$filename"
           done
@@ -112,6 +179,61 @@ jobs:
 
           git commit -m "Restore selected files"
 
-      - name: Push rewritten history
+      # ==========================================
+      # Restore GitHub remote
+      # ==========================================
+
+      - name: Restore GitHub remote
+        if: |
+          inputs.link == true ||
+          inputs.yt == true ||
+          inputs.browser == true
+        run: |
+          git remote remove origin 2>/dev/null || true
+
+          git remote add origin \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+      # ==========================================
+      # Push rewritten Git history
+      # ==========================================
+
+      - name: Push rewritten Git history
+        if: |
+          inputs.link == true ||
+          inputs.yt == true ||
+          inputs.browser == true
         run: |
           git push origin "${{ github.ref_name }}" --force
+
+      # ==========================================
+      # Delete previous runs of selected workflow
+      # ==========================================
+
+      - name: Delete previous workflow runs
+        if: inputs.workflow != 'None'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTED_WORKFLOW: ${{ inputs.workflow }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "Selected workflow: $SELECTED_WORKFLOW"
+          echo "Current Cleaner run: $CURRENT_RUN_ID"
+
+          gh run list \
+            --workflow="$SELECTED_WORKFLOW" \
+            --limit 1000 \
+            --json databaseId \
+            --jq '.[].databaseId' |
+          while read RUN_ID; do
+
+            if [ "$RUN_ID" != "$CURRENT_RUN_ID" ]; then
+              echo "Deleting run: $RUN_ID"
+              gh run delete "$RUN_ID" --repo "${{ github.repository }}" || true
+            else
+              echo "Keeping current run: $RUN_ID"
+            fi
+
+          done
+
+          echo "Workflow history cleanup completed."
