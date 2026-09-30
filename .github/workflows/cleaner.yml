@@ -1,4 +1,4 @@
-```yaml
+
 name: Cleaner
 
 on:
@@ -519,4 +519,3 @@ jobs:
           fi
 
           echo "Workflow cleanup completed."
-```
