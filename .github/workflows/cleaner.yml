@@ -1,4 +1,4 @@
-```yaml
+
 name: Clean File History
 
 on:
@@ -115,4 +115,3 @@ jobs:
       - name: Push rewritten history
         run: |
           git push origin "${{ github.ref_name }}" --force
-```
