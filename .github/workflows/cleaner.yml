@@ -1,0 +1,54 @@
+name: Clean link.txt History
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  clean-history:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout full repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Save current link.txt
+        run: |
+          if [ ! -f "link.txt" ]; then
+            echo "ERROR: link.txt not found!"
+            exit 1
+          fi
+
+          cp "link.txt" "/tmp/link.txt"
+
+      - name: Install git-filter-repo
+        run: |
+          python3 -m pip install git-filter-repo
+
+      - name: Remove link.txt from entire Git history
+        run: |
+          git filter-repo \
+            --path link.txt \
+            --invert-paths \
+            --force
+
+      - name: Restore current link.txt
+        run: |
+          cp "/tmp/link.txt" "link.txt"
+
+          git add link.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Restore link.txt without previous history"
+
+      - name: Push rewritten history
+        run: |
+          git remote add origin "https://github.com/${{ github.repository }}.git" 2>/dev/null || true
+          git push origin "${{ github.ref_name }}" --force
