@@ -1,7 +1,26 @@
-name: Clean link.txt History
+```yaml
+name: Clean File History
 
 on:
   workflow_dispatch:
+    inputs:
+      link:
+        description: "Clean history of link.txt"
+        required: true
+        type: boolean
+        default: false
+
+      yt:
+        description: "Clean history of yt.txt"
+        required: true
+        type: boolean
+        default: false
+
+      browser:
+        description: "Clean history of browser.txt"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,38 +36,83 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Save current link.txt
+      - name: Save selected files
         run: |
-          if [ ! -f "link.txt" ]; then
-            echo "ERROR: link.txt not found!"
+          mkdir -p /tmp/selected-files
+
+          if [ "${{ inputs.link }}" = "true" ]; then
+            if [ ! -f "link.txt" ]; then
+              echo "ERROR: link.txt not found!"
+              exit 1
+            fi
+            cp "link.txt" "/tmp/selected-files/link.txt"
+          fi
+
+          if [ "${{ inputs.yt }}" = "true" ]; then
+            if [ ! -f "yt.txt" ]; then
+              echo "ERROR: yt.txt not found!"
+              exit 1
+            fi
+            cp "yt.txt" "/tmp/selected-files/yt.txt"
+          fi
+
+          if [ "${{ inputs.browser }}" = "true" ]; then
+            if [ ! -f "browser.txt" ]; then
+              echo "ERROR: browser.txt not found!"
+              exit 1
+            fi
+            cp "browser.txt" "/tmp/selected-files/browser.txt"
+          fi
+
+      - name: Check selection
+        run: |
+          if [ -z "$(ls -A /tmp/selected-files 2>/dev/null)" ]; then
+            echo "ERROR: No files selected."
             exit 1
           fi
 
-          cp "link.txt" "/tmp/link.txt"
+          echo "Selected files:"
+          ls -1 /tmp/selected-files
 
       - name: Install git-filter-repo
         run: |
           python3 -m pip install git-filter-repo
 
-      - name: Remove link.txt from entire Git history
+      - name: Remove selected files from Git history
         run: |
+          FILES=""
+
+          if [ "${{ inputs.link }}" = "true" ]; then
+            FILES="$FILES --path link.txt"
+          fi
+
+          if [ "${{ inputs.yt }}" = "true" ]; then
+            FILES="$FILES --path yt.txt"
+          fi
+
+          if [ "${{ inputs.browser }}" = "true" ]; then
+            FILES="$FILES --path browser.txt"
+          fi
+
           git filter-repo \
-            --path link.txt \
+            $FILES \
             --invert-paths \
             --force
 
-      - name: Restore current link.txt
+      - name: Restore selected files
         run: |
-          cp "/tmp/link.txt" "link.txt"
-
-          git add link.txt
+          for file in /tmp/selected-files/*; do
+            filename=$(basename "$file")
+            cp "$file" "$filename"
+            git add "$filename"
+          done
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git commit -m "Restore link.txt without previous history"
+          git commit -m "Restore selected files"
 
       - name: Push rewritten history
         run: |
-          git remote add origin "https://github.com/${{ github.repository }}.git" 2>/dev/null || true
           git push origin "${{ github.ref_name }}" --force
+```
