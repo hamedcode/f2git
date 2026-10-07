@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       source_url:
-        description: "لینک فایل برای دانلود"
-        required: true
+        description: "لینک فایل (خالی = خوندن لینک‌ها از browser.txt)"
+        required: false
+        default: ""
 
       upload_mode:
         description: "Upload mode"
@@ -31,7 +32,7 @@ permissions:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
 
@@ -49,6 +50,31 @@ jobs:
       - name: Prepare folders
         run: mkdir -p downloads grabbed
 
+      # اولویت: اگه source_url پر باشه فقط همون، وگرنه لینک‌ها از browser.txt
+      - name: Collect links
+        env:
+          SRC: ${{ github.event.inputs.source_url }}
+        run: |
+          if [ -n "$(printf '%s' "$SRC" | tr -d '[:space:]')" ]; then
+            echo "Mode: source_url input"
+            printf '%s\n' "$SRC" | tr ', ' '\n\n' | tr -d '\r' > raw_links.txt
+          elif [ -f browser.txt ]; then
+            echo "Mode: browser.txt"
+            tr -d '\r' < browser.txt > raw_links.txt
+          else
+            : > raw_links.txt
+          fi
+
+          # حذف خط خالی و کامنت (#)، trim، حذف تکراری‌ها
+          awk 'NF && $0 !~ /^[[:space:]]*#/ { gsub(/^[ \t]+|[ \t]+$/, ""); if (!seen[$0]++) print }' raw_links.txt > links.txt
+
+          if [ ! -s links.txt ]; then
+            echo "No links found (source_url is empty and browser.txt is missing/empty)"
+            exit 1
+          fi
+          echo "=== Links ($(wc -l < links.txt)) ==="
+          cat links.txt
+
       - name: Write Playwright script
         run: |
           python3 - << 'PYEOF'
@@ -59,6 +85,9 @@ jobs:
 
           const SOURCE_URL = process.argv[2];
           if (!SOURCE_URL) { console.error('No source URL'); process.exit(1); }
+
+          const OUT = process.argv[3] || 'grabbed';
+          fs.mkdirSync(OUT, { recursive: true });
 
           const PROCESS_URL = 'https://9xbuddy.site/process?url=' + encodeURIComponent(SOURCE_URL);
 
@@ -186,7 +215,6 @@ jobs:
             console.log('Links before click:', knownLinks.size);
 
             // ── کلیک روی دکمه‌های Extract/Download یکی یکی ──────────────
-            // بعد از هر کلیک، DOM رو poll می‌کنیم تا لینک جدید بیاد
             const allFoundLinks = new Set([...knownLinks]);
 
             const buttons = await page.$$('button, a');
@@ -203,7 +231,6 @@ jobs:
 
                 await btn.click().catch(() => {});
 
-                // صبر کن تا /extract response بیاد و DOM آپدیت بشه
                 const newLinks = await pollForNewLinks(page, allFoundLinks, 15000);
 
                 if (newLinks.length > 0) {
@@ -257,10 +284,10 @@ jobs:
             console.log('\n=== Candidates:', candidates.length);
             candidates.forEach((c, i) => console.log(' [' + (i+1) + '][' + c.type + '] ' + c.url.slice(0, 100)));
 
-            fs.writeFileSync('grabbed/candidates.json', JSON.stringify(candidates, null, 2));
-            fs.writeFileSync('grabbed/title.txt', title);
+            fs.writeFileSync(path.join(OUT, 'candidates.json'), JSON.stringify(candidates, null, 2));
+            fs.writeFileSync(path.join(OUT, 'title.txt'), title);
             const cookies = await context.cookies();
-            fs.writeFileSync('grabbed/cookies.txt', cookies.map(c => c.name + '=' + c.value).join('; '));
+            fs.writeFileSync(path.join(OUT, 'cookies.txt'), cookies.map(c => c.name + '=' + c.value).join('; '));
 
             await browser.close();
             if (candidates.length === 0) { console.error('No candidates!'); process.exit(1); }
@@ -271,26 +298,28 @@ jobs:
           print('Written')
           PYEOF
 
-      - name: Run Playwright
-        run: node buddy_dl.js "${{ github.event.inputs.source_url }}"
+      - name: Run Playwright (all links)
+        run: |
+          i=0
+          while IFS= read -r url || [ -n "$url" ]; do
+            [ -z "$url" ] && continue
+            i=$((i+1))
+            echo ""
+            echo "################ [$i] $url ################"
+            node buddy_dl.js "$url" "grabbed/$i" < /dev/null || echo "!! Playwright failed for link $i: $url"
+          done < links.txt
 
       - name: Download all candidates until success
         run: |
           python3 - << 'PYEOF'
-          import json, subprocess, sys, os, re
-
-          candidates = json.load(open('grabbed/candidates.json'))
-          title      = open('grabbed/title.txt').read().strip()
-          cookies    = open('grabbed/cookies.txt').read().strip() if os.path.exists('grabbed/cookies.txt') else ''
-
-          print(f'Total candidates: {len(candidates)}')
+          import json, subprocess, sys, os, re, glob
 
           def get_ext(url):
             m = re.search(r'\.(mp4|m3u8|mkv|webm|mov|vid)', url.split('?')[0], re.I)
             ext = m.group(1).lower() if m else 'mp4'
             return 'mp4' if ext == 'vid' else ext
 
-          def make_headers(headers):
+          def make_headers(headers, cookies):
             h = {
               'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               'accept': '*/*',
@@ -347,46 +376,70 @@ jobs:
             if os.path.exists(dest): os.remove(dest)
             return False
 
-          downloaded = False
-          for i, c in enumerate(candidates):
-            url  = c['url']
-            hdrs = make_headers(c.get('headers', {}))
-            ctype = c['type']
-            ext  = get_ext(url)
-            dest = f'downloads/{title}.{ext}'
+          def download_one(folder, n):
+            candidates = json.load(open(f'{folder}/candidates.json'))
+            title      = open(f'{folder}/title.txt').read().strip()
+            cp         = f'{folder}/cookies.txt'
+            cookies    = open(cp).read().strip() if os.path.exists(cp) else ''
+            print(f'Total candidates: {len(candidates)}')
 
-            print(f'\n=== [{i+1}/{len(candidates)}][{ctype}] {url[:80]}')
+            for i, c in enumerate(candidates):
+              url   = c['url']
+              hdrs  = make_headers(c.get('headers', {}), cookies)
+              ctype = c['type']
+              ext   = get_ext(url)
 
-            if ext == 'm3u8':
-              ok = run_ffmpeg(url, hdrs, f'downloads/{title}.mp4')
-            else:
-              ok = run_curl(url, hdrs, dest)
-              if not ok:
-                print('  curl failed, trying aria2c...')
-                ok = run_aria2(url, hdrs, dest)
+              print(f'\n=== [{n}] [{i+1}/{len(candidates)}][{ctype}] {url[:80]}')
 
-            if ok:
-              print('SUCCESS!')
-              downloaded = True
-              break
-            else:
+              if ext == 'm3u8':
+                ok = run_ffmpeg(url, hdrs, f'downloads/{n}_{title}.mp4')
+              else:
+                dest = f'downloads/{n}_{title}.{ext}'
+                ok = run_curl(url, hdrs, dest)
+                if not ok:
+                  print('  curl failed, trying aria2c...')
+                  ok = run_aria2(url, hdrs, dest)
+
+              if ok:
+                print('SUCCESS!')
+                return True
               print('  failed, next...')
+            return False
 
-          if not downloaded:
-            print('\nAll candidates failed!')
+          folders = sorted(glob.glob('grabbed/[0-9]*'), key=lambda p: int(p.split('/')[-1]))
+          results = {}
+          for f in folders:
+            n = f.split('/')[-1]
+            print(f'\n################ LINK {n} ################')
+            if not os.path.exists(f'{f}/candidates.json'):
+              print('  no candidates.json (Playwright failed)')
+              results[n] = False
+              continue
+            results[n] = bool(download_one(f, n))
+
+          print('\n===== SUMMARY =====')
+          for n, ok in results.items():
+            print(f'  link {n}:', 'OK' if ok else 'FAILED')
+
+          if not any(results.values()):
+            print('\nAll links failed!')
             sys.exit(1)
           PYEOF
 
       - name: Show results
+        if: always()
         run: |
           echo "=== downloads/ ===" && ls -lh downloads/ || echo "(empty)"
-          echo "=== candidates ===" && python3 -c "
-          import json
-          try:
-            c = json.load(open('grabbed/candidates.json'))
-            for i,x in enumerate(c): print(f'  [{i+1}][{x[\"type\"]}] {x[\"url\"][:90]}')
-          except: pass
-          "
+          python3 - << 'PYEOF'
+          import json, glob
+          for f in sorted(glob.glob('grabbed/[0-9]*/candidates.json')):
+            print('===', f)
+            try:
+              for i, x in enumerate(json.load(open(f))):
+                print(f"  [{i+1}][{x['type']}] {x['url'][:90]}")
+            except Exception as e:
+              print('  error:', e)
+          PYEOF
 
       - name: Upload debug artifacts
         if: always()
