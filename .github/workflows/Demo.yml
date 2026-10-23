@@ -2,6 +2,34 @@ name: 7. Build Demo Clips
 
 on:
   workflow_dispatch:
+    inputs:
+      parts:
+        description: "تعداد پارت نمونه از هر ویدیو (Number of parts per video)"
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+          - "8"
+          - "10"
+      length:
+        description: "طول هر پارت به ثانیه (Length of each part in seconds)"
+        required: true
+        default: "20"
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "15"
+          - "20"
+          - "30"
+          - "45"
+          - "60"
 
 permissions:
   contents: write
@@ -21,8 +49,16 @@ jobs:
 
       - name: Create Demo Videos
         shell: bash
+        env:
+          PARTS: ${{ inputs.parts }}
+          SEG_LEN: ${{ inputs.length }}
         run: |
           set +e
+
+          PARTS="${PARTS:-3}"
+          SEG_LEN="${SEG_LEN:-20}"
+
+          echo "Settings: $PARTS part(s) x ${SEG_LEN}s per video"
 
           mkdir -p demos
           mkdir -p work
@@ -74,66 +110,58 @@ jobs:
 
             duration_int=${duration%.*}
 
-            # Calculate dynamic start times: 25%, 50%, 75% of total duration
-            # Leave at least 20 seconds before end for the segment
-            start1=$(( duration_int * 25 / 100 ))
-            start2=$(( duration_int * 50 / 100 ))
-            start3=$(( duration_int * 75 / 100 ))
-
-            # Clamp each start so the 20s segment doesn't exceed video length
-            max_start=$(( duration_int - 20 ))
+            # Last allowed start so a segment doesn't run past the end
+            max_start=$(( duration_int - SEG_LEN ))
             [[ $max_start -lt 0 ]] && max_start=0
-
-            [[ $start1 -gt $max_start ]] && start1=$max_start
-            [[ $start2 -gt $max_start ]] && start2=$max_start
-            [[ $start3 -gt $max_start ]] && start3=$max_start
-
-            echo "Segment starts (seconds): $start1 | $start2 | $start3"
 
             base="${filename%.*}"
             ext="${filename##*.}"
 
             mkdir -p "work/$base"
 
-            extract_segment() {
-              local start_sec="$1"
-              local output="$2"
-
-              if (( start_sec >= duration_int )); then
-                echo "Skipping segment at ${start_sec}s (beyond video length)"
-                return
-              fi
-
-              ffmpeg -y \
-                -ss "$start_sec" \
-                -i "$filename" \
-                -t 20 \
-                -c copy \
-                "$output"
-
-              local ffmpeg_exit=$?
-              if [[ $ffmpeg_exit -ne 0 ]]; then
-                echo "ffmpeg failed for segment at ${start_sec}s (exit $ffmpeg_exit)"
-                rm -f "$output"
-              fi
-            }
-
-            extract_segment "$start1" "work/$base/part1.$ext"
-            extract_segment "$start2" "work/$base/part2.$ext"
-            extract_segment "$start3" "work/$base/part3.$ext"
-
             list_file="work/$base/list.txt"
             rm -f "$list_file"
 
-            for part in \
-              "part1.$ext" \
-              "part2.$ext" \
-              "part3.$ext"
-            do
-              if [[ -f "work/$base/$part" ]]; then
-                echo "file '$part'" >> "$list_file"
+            last_start=-1
+            starts_log=""
+
+            # Evenly spaced starts: i/(PARTS+1) of the duration
+            # (PARTS=3 gives 25% / 50% / 75%, same as before)
+            for (( i=1; i<=PARTS; i++ )); do
+
+              start=$(( duration_int * i / (PARTS + 1) ))
+              [[ $start -gt $max_start ]] && start=$max_start
+
+              # Skip duplicate starts (short videos get clamped to the same point)
+              if [[ $start -eq $last_start ]]; then
+                echo "Skipping part $i (same start as previous: ${start}s)"
+                continue
               fi
+              last_start=$start
+
+              part="part${i}.${ext}"
+              starts_log="$starts_log ${start}s"
+
+              ffmpeg -nostdin -y \
+                -ss "$start" \
+                -i "$filename" \
+                -t "$SEG_LEN" \
+                -c copy \
+                "work/$base/$part"
+
+              ffmpeg_exit=$?
+
+              if [[ $ffmpeg_exit -ne 0 ]]; then
+                echo "ffmpeg failed for part $i at ${start}s (exit $ffmpeg_exit)"
+                rm -f "work/$base/$part"
+                continue
+              fi
+
+              echo "file '$part'" >> "$list_file"
+
             done
+
+            echo "Segment starts:$starts_log"
 
             if [[ ! -s "$list_file" ]]; then
               echo "No valid segments found, skipping..."
@@ -146,7 +174,7 @@ jobs:
             (
               cd "work/$base"
 
-              ffmpeg -y \
+              ffmpeg -nostdin -y \
                 -f concat \
                 -safe 0 \
                 -i list.txt \
