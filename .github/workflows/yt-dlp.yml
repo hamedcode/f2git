@@ -26,6 +26,7 @@ on:
           - x265-540-28
           - x265-480-29
           - x265-720-27-80k
+          - x265-src-res-28-cap400
         default: x265-veryfast-27
 
       min_size_mb:
@@ -198,6 +199,14 @@ jobs:
               -of default=nk=1:nw=1 "$f" 2>/dev/null || echo "0")
             bitrate_raw=${bitrate_raw:-0}
             [[ "$bitrate_raw" =~ ^[0-9]+$ ]] || bitrate_raw=0
+            # Fallback: webm/mkv often have no per-stream bitrate -> use container bitrate
+            if [[ "$bitrate_raw" -eq 0 ]]; then
+              bitrate_raw=$(ffprobe -v error \
+                -show_entries format=bit_rate \
+                -of default=nk=1:nw=1 "$f" 2>/dev/null || echo "0")
+              bitrate_raw=${bitrate_raw:-0}
+              [[ "$bitrate_raw" =~ ^[0-9]+$ ]] || bitrate_raw=0
+            fi
             bitrate_k=$((bitrate_raw / 1000))
             echo "${res}|${bitrate_k}"
           }
@@ -215,6 +224,20 @@ jobs:
 
             if [[ "$MODE" == "disabled" ]]; then
               cp "$file" encoded/
+              # Record file details even though encoding is disabled
+              info_before=$(get_video_info "$file")
+              res_before=$(echo "$info_before" | cut -d'|' -f1)
+              br_before=$(echo "$info_before" | cut -d'|' -f2)
+              vcodec=$(ffprobe -v error -select_streams v:0 \
+                -show_entries stream=codec_name \
+                -of default=nk=1:nw=1 "$file" 2>/dev/null || echo "N/A")
+              echo "### \`${name}\`" >> "$STATS_FILE"
+              echo "- **Status:** Not encoded (encode mode disabled)" >> "$STATS_FILE"
+              echo "- **Resolution:** ${res_before}" >> "$STATS_FILE"
+              echo "- **Video bitrate:** ${br_before} kbps" >> "$STATS_FILE"
+              echo "- **Video codec:** ${vcodec:-N/A}" >> "$STATS_FILE"
+              echo "- **File size:** ${size_mb} MB" >> "$STATS_FILE"
+              echo "" >> "$STATS_FILE"
               continue
             fi
 
@@ -335,6 +358,20 @@ jobs:
                 -preset veryfast \
                 -crf 27 \
                 -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240 \
+                -c:a aac -b:a 80k \
+                "$output"
+
+            elif [[ "$MODE" == "x265-src-res-28-cap400" ]]; then
+
+              # Original resolution, CRF 28, video capped at ~400 kbps with a large VBV buffer
+              CRF_USED="28"
+              ffmpeg -y \
+                -i "$file" \
+                -c:v libx265 \
+                -pix_fmt yuv420p10le \
+                -preset veryfast \
+                -crf 28 \
+                -x265-params no-sao=1:aq-mode=3:bframes=4:keyint=240:vbv-maxrate=400:vbv-bufsize=8000 \
                 -c:a aac -b:a 80k \
                 "$output"
 
